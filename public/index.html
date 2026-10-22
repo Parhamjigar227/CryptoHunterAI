@@ -24,7 +24,8 @@
 </header>
 
 <nav>
-  <button class="navbtn active" data-page="dashboard">نمای کلی</button>
+  <button class="navbtn active" data-page="research">تحقیق هوشمند</button>
+  <button class="navbtn" data-page="dashboard">نمای کلی</button>
   <button class="navbtn" data-page="projects">شکار فرصت‌ها</button>
   <button class="navbtn" data-page="portfolio">سبد دارایی</button>
   <button class="navbtn" data-page="transactions">تراکنش‌ها</button>
@@ -33,8 +34,58 @@
 </nav>
 
 <main>
+<!-- RESEARCH -->
+<section class="page active" id="page-research">
+  <div class="section-head">
+    <div>
+      <h2>تحقیق هوشمند پروژه</h2>
+      <div class="muted">منابع واقعی را می‌خواند، با هوش مصنوعی تحلیل می‌کند و گزارش فارسی با لینک منابع می‌دهد.</div>
+    </div>
+  </div>
+  <div class="notice warning">
+    فقط تحقیق و تحلیل انجام می‌شود؛ هیچ تراکنشی اجرا نمی‌شود و هیچ‌وقت عبارت بازیابی یا کلید خصوصی وارد نکن.
+    نتیجه مشاورهٔ مالی نیست و نبودِ علامت هشدار به معنی امن بودن پروژه نیست.
+  </div>
+  <form id="researchForm" class="card section" onsubmit="startResearch(event)">
+    <div class="formgrid">
+      <div class="field"><label for="rName">نام پروژه یا توکن</label><input id="rName" maxlength="100" placeholder="مثلاً Uniswap"></div>
+      <div class="field"><label for="rUrl">وب‌سایت رسمی (https)</label><input id="rUrl" class="ltr" maxlength="2048" placeholder="https://..."></div>
+      <div class="field"><label for="rChain">شبکه</label>
+        <select id="rChain">
+          <option value="other">نامشخص / سایر</option><option value="ethereum">Ethereum</option><option value="bsc">BNB Chain</option>
+          <option value="polygon">Polygon</option><option value="arbitrum">Arbitrum</option><option value="optimism">Optimism</option>
+          <option value="base">Base</option><option value="avalanche">Avalanche</option><option value="solana">Solana</option>
+        </select>
+      </div>
+      <div class="field"><label for="rContract">آدرس قرارداد (اختیاری)</label><input id="rContract" class="ltr" maxlength="64" placeholder="0x..."></div>
+      <div class="field wide"><label for="rQuestion">سؤال یا موضوع مشخص (اختیاری)</label><textarea id="rQuestion" maxlength="500" placeholder="مثلاً: آیا ایردراپ رسمی دارد و برای شرکت باید پولی پرداخت شود؟"></textarea></div>
+      <div class="field wide hidden" id="tokenField"><label for="rToken">توکن دسترسی (این سرور آن را لازم دارد)</label><input id="rToken" type="password" autocomplete="off"></div>
+    </div>
+    <div class="actions"><button class="btn primary" id="researchBtn" type="submit">شروع تحقیق</button></div>
+    <div class="muted" style="margin-top:8px">حداقل یکی از نام، وب‌سایت یا قرارداد لازم است. تحقیق معمولاً کمتر از یک دقیقه طول می‌کشد.</div>
+  </form>
+  <div class="card section hidden" id="researchProgressCard" aria-live="polite">
+    <h3>وضعیت تحقیق</h3>
+    <div id="researchStage" class="muted"></div>
+    <ul id="researchSteps"></ul>
+  </div>
+  <div id="researchError" class="notice error hidden" role="alert"></div>
+  <div class="card section hidden" id="researchResultCard">
+    <div class="actions" style="margin-bottom:12px">
+      <button class="btn" onclick="downloadResearchMarkdown()">ذخیره Markdown</button>
+      <button class="btn" onclick="downloadResearchHtml()">ذخیره HTML</button>
+      <button class="btn" onclick="copyResearchMarkdown()">کپی گزارش</button>
+    </div>
+    <div id="researchReport" class="report"></div>
+  </div>
+  <div class="card section">
+    <h3>تاریخچهٔ تحقیق‌ها (فقط در این مرورگر)</h3>
+    <div id="researchHistory"></div>
+  </div>
+</section>
+
 <!-- DASHBOARD -->
-<section class="page active" id="page-dashboard">
+<section class="page" id="page-dashboard">
   <div class="section">
     <div class="section-head">
       <div>
@@ -348,6 +399,8 @@
 <script src="js/utils.js"></script>
 <script src="js/storage.js"></script>
 <script src="js/ui.js"></script>
+<script src="js/markdown.js"></script>
+<script src="js/research.js"></script>
 <script src="js/projects.js"></script>
 <script src="js/assets.js"></script>
 <script src="js/transactions.js"></script>

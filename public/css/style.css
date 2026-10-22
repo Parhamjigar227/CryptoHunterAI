@@ -125,6 +125,15 @@ footer{
 }
 .ltr{direction:ltr;unicode-bidi:plaintext;display:inline-block}
 .hidden{display:none!important}
+.report h1{font-size:19px;margin:0 0 10px}
+.report h2{font-size:16px;margin:20px 0 8px;padding-top:12px;border-top:1px solid var(--line)}
+.report h3{font-size:14px}
+.report ul{margin:6px 0;padding-inline-start:22px}
+.report a{color:var(--blue)}
+.report code{background:#101622;padding:1px 5px;border-radius:5px;font-size:12px}
+.report hr{border:0;border-top:1px solid var(--line);margin:18px 0}
+.report table{min-width:520px}
+#researchSteps{margin:8px 0 0;padding:0;list-style:none}
 @media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:520px){
   .app{padding:12px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}

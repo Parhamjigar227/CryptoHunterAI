@@ -1,0 +1,54 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import worker, { safeEqual, checkAccess } from "../src/worker.js";
+
+const env = { ASSETS: { fetch: async () => new Response("asset") }, AI_MODEL: "m" };
+const call = (path, init, e = env) => worker.fetch(new Request("https://x.test" + path, init), e, {});
+const post = (body, headers = {}, e = env) =>
+  call("/api/research", { method: "POST", headers: { "content-type": "application/json", ...headers }, body: typeof body === "string" ? body : JSON.stringify(body) }, e);
+
+test("health reports configuration without leaking secrets", async () => {
+  const r = await call("/api/health", {}, { ...env, ACCESS_TOKEN: "s3cret" });
+  const j = await r.json();
+  assert.equal(r.status, 200);
+  assert.equal(j.accessTokenRequired, true);
+  assert.equal(JSON.stringify(j).includes("s3cret"), false);
+});
+
+test("non-api paths go to static assets", async () => {
+  assert.equal(await (await call("/")).text(), "asset");
+});
+
+test("unknown api path is 404 json", async () => {
+  const r = await call("/api/nope");
+  assert.equal(r.status, 404);
+  assert.equal((await r.json()).ok, false);
+});
+
+test("research requires POST", async () => {
+  assert.equal((await call("/api/research")).status, 405);
+});
+
+test("research rejects bad content-type, bad json, oversize body and invalid input", async () => {
+  assert.equal((await call("/api/research", { method: "POST", headers: { "content-type": "text/plain" }, body: "x" })).status, 400);
+  assert.equal((await post("{not json")).status, 400);
+  assert.equal((await post({ name: "x", question: "q".repeat(20000) })).status, 400);
+  const r = await post({ name: "x", url: "https://127.0.0.1" });
+  const j = await r.json();
+  assert.equal(r.status, 400);
+  assert.equal(j.error.field, "url");
+});
+
+test("access token is enforced when configured", async () => {
+  const e = { ...env, ACCESS_TOKEN: "tok" };
+  assert.equal((await post({ name: "x" }, {}, e)).status, 401);
+  assert.equal((await post({ name: "x" }, { authorization: "Bearer wrong" }, e)).status, 401);
+  assert.notEqual((await post({ name: "x" }, { authorization: "Bearer tok" }, e)).status, 401);
+});
+
+test("safeEqual / checkAccess", () => {
+  assert.equal(safeEqual("a", "a"), true);
+  assert.equal(safeEqual("a", "b"), false);
+  assert.equal(safeEqual("a", "ab"), false);
+  assert.equal(checkAccess(new Request("https://x.test"), {}), true);
+});

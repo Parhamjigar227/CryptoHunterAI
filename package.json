@@ -1,0 +1,15 @@
+{
+  "name": "cryptohunterai",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Persian crypto research agent on Cloudflare Workers (Workers AI + public data sources)",
+  "scripts": {
+    "test": "node --test \"tests/*.test.js\"",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

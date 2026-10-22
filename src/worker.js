@@ -1,4 +1,7 @@
 import { LIMITS, ValidationError, parseResearchInput } from "./validate.js";
+import { runResearch } from "./research.js";
+import { analyzeResearch } from "./analyze.js";
+import { assembleReport, computeConfidence, computeRisk, splitSections } from "./report.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 
@@ -51,7 +54,51 @@ async function readJsonBody(request) {
   }
 }
 
-export async function handleRequest(request, env, ctx) {
+// Runs research -> analysis -> report and streams newline-delimited JSON events:
+// stage | source | result | error. The client renders them as they arrive.
+export function streamResearch(input, env, ctx, deps = {}) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const send = (event) => writer.write(encoder.encode(JSON.stringify(event) + "\n")).catch(() => {});
+
+  const job = (async () => {
+    try {
+      const research = await runResearch(input, { fetchImpl: deps.fetchImpl, githubToken: env.GITHUB_TOKEN, onProgress: send });
+      if (!research.usable) {
+        await send({ type: "error", error: { code: "no_evidence", message: "هیچ منبعی دریافت نشد؛ بدون شواهد، تحلیل انجام نمی‌شود." }, sources: research.sources, notes: research.notes });
+        return;
+      }
+      await send({ type: "stage", stage: "analysis", message: "در حال تحلیل شواهد با هوش مصنوعی…" });
+      const ai = await analyzeResearch(research, env, deps);
+      const risk = computeRisk(research);
+      const confidence = computeConfidence(research);
+      const generatedAt = new Date();
+      const markdown = assembleReport({
+        research, sections: ai.ok ? splitSections(ai.text) : {}, aiError: ai.ok ? null : ai.error,
+        risk, confidence, model: ai.ok ? ai.model : null, now: generatedAt,
+      });
+      await send({
+        type: "result",
+        report: {
+          markdown, risk, confidence, generatedAt: generatedAt.toISOString(),
+          model: ai.ok ? ai.model : null, aiError: ai.ok ? null : ai.error, usage: ai.ok ? ai.usage : null,
+          sources: research.sources.map(({ id, title, url, fetchedAt, ok, error, limitations }) => ({ id, title, url, fetchedAt, ok, error, limitations })),
+          input,
+        },
+      });
+    } catch (err) {
+      console.error("pipeline error", err && err.stack ? err.stack : String(err));
+      await send({ type: "error", error: { code: "internal_error", message: "خطای داخلی هنگام تحقیق." } });
+    } finally {
+      await writer.close().catch(() => {});
+    }
+  })();
+  ctx?.waitUntil?.(job);
+  return new Response(readable, { headers: { "content-type": "application/x-ndjson; charset=utf-8", "cache-control": "no-store" } });
+}
+
+export async function handleRequest(request, env, ctx, deps = {}) {
   const url = new URL(request.url);
 
   if (url.pathname === "/api/health") {
@@ -74,10 +121,7 @@ export async function handleRequest(request, env, ctx) {
       if (err instanceof ValidationError) return errorResponse(400, "invalid_input", err.message, err.field);
       throw err;
     }
-    // The research pipeline is wired in parts 2-3 (see STATUS.md); until then
-    // valid requests get an honest 501 rather than fake data.
-    console.log("research request accepted", { chain: input.chain, hasUrl: Boolean(input.url) });
-    return errorResponse(501, "not_implemented", "موتور تحقیق هنوز متصل نشده است.");
+    return streamResearch(input, env, ctx, deps);
   }
 
   if (url.pathname.startsWith("/api/")) return errorResponse(404, "not_found", "مسیر API وجود ندارد.");

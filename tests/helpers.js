@@ -16,3 +16,12 @@ export function mockFetch(routes, log = []) {
 }
 
 export const html = (body, extra = {}) => ({ headers: { "content-type": "text/html; charset=utf-8" }, body, ...extra });
+
+// Reads an NDJSON streaming Response into an array of events.
+export async function readEvents(response) {
+  const text = await response.text();
+  return text.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+}
+
+// Fake Workers AI binding for tests only (production uses the real binding).
+export const fakeAi = (impl) => ({ calls: [], async run(model, input) { this.calls.push({ model, input }); return impl(model, input); } });

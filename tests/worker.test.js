@@ -1,9 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import worker, { safeEqual, checkAccess } from "../src/worker.js";
+import worker, { handleRequest, safeEqual, checkAccess } from "../src/worker.js";
 
 const env = { ASSETS: { fetch: async () => new Response("asset") }, AI_MODEL: "m" };
-const call = (path, init, e = env) => worker.fetch(new Request("https://x.test" + path, init), e, {});
+// Any network attempt in these tests fails loudly instead of reaching the internet.
+const noNetwork = async (url) => { throw new Error(`unexpected network call: ${url}`); };
+const call = (path, init, e = env) => handleRequest(new Request("https://x.test" + path, init), e, {}, { fetchImpl: noNetwork });
 const post = (body, headers = {}, e = env) =>
   call("/api/research", { method: "POST", headers: { "content-type": "application/json", ...headers }, body: typeof body === "string" ? body : JSON.stringify(body) }, e);
 
@@ -13,6 +15,11 @@ test("health reports configuration without leaking secrets", async () => {
   assert.equal(r.status, 200);
   assert.equal(j.accessTokenRequired, true);
   assert.equal(JSON.stringify(j).includes("s3cret"), false);
+});
+
+test("default export handles errors and routes", async () => {
+  const r = await worker.fetch(new Request("https://x.test/api/health"), env, {});
+  assert.equal(r.status, 200);
 });
 
 test("non-api paths go to static assets", async () => {

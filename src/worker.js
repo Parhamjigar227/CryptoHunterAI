@@ -64,7 +64,7 @@ export function streamResearch(input, env, ctx, deps = {}) {
 
   const job = (async () => {
     try {
-      const research = await runResearch(input, { fetchImpl: deps.fetchImpl, githubToken: env.GITHUB_TOKEN, onProgress: send });
+      const research = await runResearch(input, { fetchImpl: deps.fetchImpl, githubToken: env.GITHUB_TOKEN, coingeckoKey: env.COINGECKO_API_KEY, onProgress: send });
       if (!research.usable) {
         await send({ type: "error", error: { code: "no_evidence", message: "هیچ منبعی دریافت نشد؛ بدون شواهد، تحلیل انجام نمی‌شود." }, sources: research.sources, notes: research.notes });
         return;

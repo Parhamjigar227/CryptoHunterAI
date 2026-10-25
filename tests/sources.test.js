@@ -163,3 +163,20 @@ test("runResearch is unusable when every source fails", async () => {
   assert.equal(r.usable, false);
   assert.match(r.notes.join(" "), /هیچ منبعی/);
 });
+
+test("coingecko: optional demo key is sent as header and never leaks into the record", async () => {
+  const log = [];
+  const s = await fetchCoinGecko({ name: "Uniswap", chain: "other", contract: null }, {
+    apiKey: "CG-SECRET",
+    fetchImpl: mockFetch({
+      [`${CG}/search?query=Uniswap`]: { body: { coins: [{ id: "uniswap", name: "Uniswap", symbol: "UNI" }] } },
+      [`${CG}/coins/uniswap?${QUERY}`]: { body: coinBody },
+    }, log),
+  });
+  assert.equal(s.ok, true);
+  assert.ok(log.every((c) => c.init.headers["x-cg-demo-api-key"] === "CG-SECRET"));
+  assert.equal(JSON.stringify(s).includes("CG-SECRET"), false);
+  const none = [];
+  await fetchCoinGecko({ name: "Uniswap", chain: "other", contract: null }, { fetchImpl: mockFetch({ [`${CG}/search?query=Uniswap`]: { status: 429 } }, none) });
+  assert.equal("x-cg-demo-api-key" in none[0].init.headers, false);
+});

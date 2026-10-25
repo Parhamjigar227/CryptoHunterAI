@@ -8,7 +8,8 @@ const PLATFORM_IDS = {
 const COIN_QUERY = "localization=false&tickers=false&community_data=false&developer_data=false&sparkline=false";
 
 async function getJson(path, deps) {
-  const r = await safeFetch(`${API}${path}`, { fetchImpl: deps.fetchImpl, accept: ["application/json"], timeoutMs: 8000 });
+  const headers = deps.apiKey ? { "x-cg-demo-api-key": deps.apiKey } : {};
+  const r = await safeFetch(`${API}${path}`, { fetchImpl: deps.fetchImpl, accept: ["application/json"], timeoutMs: 8000, headers });
   if (!r.ok) return { ok: false, error: r.error, status: r.status };
   try {
     return { ok: true, json: JSON.parse(r.text) };
@@ -48,7 +49,11 @@ export async function fetchCoinGecko({ name, chain, contract }, deps = {}) {
   const base = { id: "coingecko", title: "CoinGecko (داده‌های بازار و قرارداد)", url: "https://www.coingecko.com", fetchedAt };
   const failed = (error, limitations = []) => ({
     ...base, ok: false, data: null, error,
-    limitations: ["اطلاعات بازار دریافت نشد.", ...limitations],
+    limitations: [
+      "اطلاعات بازار دریافت نشد.",
+      ...(error.code === "rate_limited" || error.code === "http_error" ? ["اگر خطا تکرار شد، احتمالاً CoinGecko کلید می‌خواهد: Secret به نام COINGECKO_API_KEY (کلید رایگان Demo) تنظیم شود."] : []),
+      ...limitations,
+    ],
   });
 
   let coinJson = null;

@@ -4,7 +4,7 @@ import { fetchCoinGecko } from "./sources/coingecko.js";
 
 // Collects evidence from real sources. Returns plain data only; nothing here
 // is trusted as instructions downstream (see src/analyze.js).
-// deps: { fetchImpl?, githubToken?, onProgress?(event) }
+// deps: { fetchImpl?, githubToken?, coingeckoKey?, onProgress?(event) }
 export async function runResearch(input, deps = {}) {
   const emit = deps.onProgress || (() => {});
   const startedAt = new Date().toISOString();
@@ -15,7 +15,7 @@ export async function runResearch(input, deps = {}) {
 
   const [site, coin] = await Promise.all([
     input.url ? fetchWebsite(input.url, deps).then((s) => (emit({ type: "source", id: s.id, ok: s.ok }), s)) : null,
-    input.name || input.contract ? fetchCoinGecko(input, deps).then((s) => (emit({ type: "source", id: s.id, ok: s.ok }), s)) : null,
+    input.name || input.contract ? fetchCoinGecko(input, { fetchImpl: deps.fetchImpl, apiKey: deps.coingeckoKey }).then((s) => (emit({ type: "source", id: s.id, ok: s.ok }), s)) : null,
   ]);
   if (site) sources.push(site);
   if (coin) sources.push(coin);

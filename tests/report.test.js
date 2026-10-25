@@ -81,3 +81,38 @@ test("assembleReport without AI states it clearly and keeps deterministic parts"
   assert.match(md, /تحلیل هوش مصنوعی در دسترس نبود/);
   assert.match(md, /\(\+3\)/);
 });
+
+test("splitSections tolerates real-model formatting: fences, ###, bold, numbering, spaces vs ZWNJ, Arabic letters", () => {
+  const md = [
+    "```markdown",
+    "### خلاصه:",
+    "A",
+    "**یافته های تأییدشده**",
+    "B",
+    "3. ادعاهای تأییدنشده",
+    "C",
+    "## تناقض‌ها و هشدارهای امنیتی (Warnings)",
+    "D",
+    "## ريسک‌های فنی و اقتصادی",
+    "E",
+    "```",
+  ].join("\n");
+  const s = splitSections(md);
+  assert.equal(s["خلاصه"], "A");
+  assert.equal(s["یافته‌های تأییدشده"], "B");
+  assert.equal(s["ادعاهای تأییدنشده"], "C");
+  assert.equal(s["تناقض‌ها و هشدارهای امنیتی"], "D");
+  assert.equal(s["ریسک‌های فنی و اقتصادی"], "E");
+  assert.equal(Object.values(s).some((v) => v.includes("```")), false);
+});
+
+test("splitSections: a list item or sentence that merely starts with a number is not a heading", () => {
+  const s = splitSections("## خلاصه\n1. سایت رسمی دارد\n2. مخزن دارد\n**نکته:** مهم");
+  assert.equal(Object.keys(s).length, 1);
+  assert.match(s["خلاصه"], /1\. سایت رسمی دارد/);
+});
+
+test("splitSections: unstructured output is kept under the summary instead of being dropped", () => {
+  assert.deepEqual(splitSections("فقط یک متن آزاد بدون عنوان."), { "خلاصه": "فقط یک متن آزاد بدون عنوان." });
+  assert.deepEqual(splitSections(""), {});
+});

@@ -74,20 +74,39 @@ export function computeConfidence(research) {
   };
 }
 
-// Splits model markdown into { heading: body } for the expected "## " headings.
+// Normalises Persian text for heading comparison: ZWNJ -> space, Arabic ي/ك -> ی/ک.
+const norm = (t) => t.replace(/[\u200c\u200f]/g, " ").replace(/ي/g, "ی").replace(/ك/g, "ک").replace(/\s+/g, " ").trim();
+
+// Real models wrap output in code fences and style headings differently
+// ("### x", "**x**", "1. x", trailing colon). Returns the bare heading text or null.
+function headingText(line) {
+  const m = /^\s{0,3}(?:#{1,6}\s*|\*\*|\d+[.)]\s*)(.+?)\s*$/.exec(line);
+  if (!m) return null;
+  return norm(m[1].replace(/\*+/g, "").replace(/[:：]+\s*$/, ""));
+}
+
+// Splits model markdown into { heading: body } for the expected headings. If no
+// expected heading is found at all, the whole text is kept under "خلاصه".
 export function splitSections(markdown) {
+  const text = String(markdown || "").replace(/^\s*```[a-z]*\s*\n/i, "").replace(/\n\s*```\s*$/, "").trim();
+  const expected = SECTION_ORDER.map((h) => [h, norm(h)]);
   const out = {};
   let current = null;
-  for (const line of String(markdown || "").split("\n")) {
-    const m = /^##\s+(.+?)\s*$/.exec(line);
-    if (m) {
-      current = SECTION_ORDER.find((h) => m[1].replace(/[:：]$/, "") === h) || null;
-      if (current && !(current in out)) out[current] = [];
+  for (const line of text.split("\n")) {
+    const heading = headingText(line);
+    const hit = heading && expected.find(([, n]) => heading === n || heading.startsWith(n + " ") || heading.startsWith(n + "("));
+    if (hit) {
+      current = hit[0];
+      if (!(current in out)) out[current] = [];
       continue;
     }
+    // An unknown "#" heading ends the current section so its text cannot leak into another one.
+    if (/^\s{0,3}#{1,6}\s/.test(line)) { current = null; continue; }
     if (current) out[current].push(line);
   }
-  return Object.fromEntries(Object.entries(out).map(([k, v]) => [k, v.join("\n").trim()]));
+  const result = Object.fromEntries(Object.entries(out).map(([k, v]) => [k, v.join("\n").trim()]));
+  if (!Object.keys(result).length && text) return { "خلاصه": text };
+  return result;
 }
 
 const MISSING = "_مدل این بخش را تولید نکرد؛ اطلاعات نامعلوم است._";

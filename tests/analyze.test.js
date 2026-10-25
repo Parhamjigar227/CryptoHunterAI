@@ -40,6 +40,7 @@ test("sanitize: drops unknown urls, html tags and unknown source ids; keeps evid
 
 test("classifyAiError", () => {
   assert.equal(classifyAiError(new Error("4006: you have used up your daily free allocation of 10,000 neurons")).code, "quota_exhausted");
+  assert.equal(classifyAiError(new Error("5007: No such model @cf/google/gemma-3-12b-it")).code, "model_unavailable");
   assert.equal(classifyAiError(Object.assign(new Error("x"), { name: "AiTimeout" })).code, "ai_timeout");
   assert.equal(classifyAiError(new Error("boom")).code, "ai_unavailable");
 });

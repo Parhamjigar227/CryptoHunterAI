@@ -52,6 +52,9 @@ export function classifyAiError(err) {
   if (/neurons|daily free allocation|4006|quota|rate.?limit|429/i.test(msg)) {
     return { code: "quota_exhausted", message: "سهمیهٔ رایگان روزانهٔ هوش مصنوعی تمام شده است (ریست ساعت ۰۰:۰۰ UTC). بعداً دوباره تلاش کنید." };
   }
+  if (/no such model|model.*(not found|deprecated|unavailable|does not exist)|5007/i.test(msg)) {
+    return { code: "model_unavailable", message: "مدل تنظیم‌شده (AI_MODEL) در Workers AI وجود ندارد یا منسوخ شده است؛ مدل را در wrangler.jsonc عوض کنید." };
+  }
   if (err?.name === "AiTimeout") return { code: "ai_timeout", message: "مدل هوش مصنوعی در زمان مجاز پاسخ نداد." };
   return { code: "ai_unavailable", message: "سرویس هوش مصنوعی در دسترس نیست یا خطا داد." };
 }

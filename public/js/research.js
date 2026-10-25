@@ -204,6 +204,7 @@ async function checkApiHealth(){
     const h = await res.json();
     $("tokenField").classList.toggle("hidden", !h.accessTokenRequired);
     $("publicWarning").classList.toggle("hidden", Boolean(h.accessTokenRequired));
+    $("tokenMissing").classList.toggle("hidden", !(h.accessTokenRequired && !h.tokenConfigured));
     badge.textContent = h.aiBinding ? "هوش مصنوعی متصل" : "نیازمند تنظیم هوش مصنوعی";
     badge.className = "status " + (h.aiBinding ? "good" : "warn");
   }catch(e){

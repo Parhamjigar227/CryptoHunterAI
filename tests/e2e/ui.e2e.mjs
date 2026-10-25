@@ -157,3 +157,13 @@ test("existing local tracker pages still work", async () => {
   assert.equal(await page.isVisible("#page-research"), true);
   assert.deepEqual(errors, []);
 });
+
+test("fail closed: with no ACCESS_TOKEN secret the page says research is disabled and the server refuses", async () => {
+  const { page } = await open({ env: { AI: fakeAi(() => ({ response: "x" })), AI_MODEL: "m", REQUIRE_ACCESS_TOKEN: "true" }, fetchImpl: goodFetch() });
+  await page.waitForSelector("#tokenMissing:not(.hidden)");
+  assert.equal(await page.isVisible("#publicWarning"), false);
+  await fill(page, { rName: "Foo", rUrl: "https://foo.org/" });
+  await page.click("#researchBtn");
+  await page.waitForSelector("#researchError:not(.hidden)");
+  assert.match(await page.textContent("#researchError"), /ACCESS_TOKEN/);
+});

@@ -59,3 +59,25 @@ test("safeEqual / checkAccess", () => {
   assert.equal(safeEqual("a", "ab"), false);
   assert.equal(checkAccess(new Request("https://x.test"), {}), true);
 });
+
+test("fail closed: REQUIRE_ACCESS_TOKEN without a configured token disables research and says so", async () => {
+  const e = { ...env, REQUIRE_ACCESS_TOKEN: "true" };
+  const r = await post({ name: "x" }, {}, e);
+  assert.equal(r.status, 503);
+  assert.equal((await r.json()).error.code, "token_not_configured");
+  const h = await (await call("/api/health", {}, e)).json();
+  assert.equal(h.accessTokenRequired, true);
+  assert.equal(h.tokenConfigured, false);
+});
+
+test("fail closed: once the token exists, requests need it (401 without, no 503)", async () => {
+  const e = { ...env, REQUIRE_ACCESS_TOKEN: "true", ACCESS_TOKEN: "tok" };
+  assert.equal((await post({ name: "x" }, {}, e)).status, 401);
+  const h = await (await call("/api/health", {}, e)).json();
+  assert.equal(h.tokenConfigured, true);
+});
+
+test("without REQUIRE_ACCESS_TOKEN and without a token the API stays open (local tests only)", async () => {
+  const h = await (await call("/api/health")).json();
+  assert.equal(h.accessTokenRequired, false);
+});

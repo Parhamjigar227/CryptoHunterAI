@@ -9,9 +9,11 @@
     "run_worker_first": ["/api/*"]
   },
   "ai": {
-    "binding": "AI"
+    "binding": "AI",
+    "remote": true
   },
   "vars": {
+    "REQUIRE_ACCESS_TOKEN": "true",
     "AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
   }
 }

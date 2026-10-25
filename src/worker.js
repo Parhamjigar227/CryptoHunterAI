@@ -99,6 +99,10 @@ export function streamResearch(input, env, ctx, deps = {}) {
   return new Response(readable, { headers: { "content-type": "application/x-ndjson; charset=utf-8", "cache-control": "no-store" } });
 }
 
+// REQUIRE_ACCESS_TOKEN="true" (set in wrangler.jsonc) makes the API fail closed:
+// until the ACCESS_TOKEN secret exists, research is disabled instead of public.
+const tokenRequired = (env) => Boolean(env.ACCESS_TOKEN) || env.REQUIRE_ACCESS_TOKEN === "true";
+
 export async function handleRequest(request, env, ctx, deps = {}) {
   const url = new URL(request.url);
 
@@ -108,12 +112,16 @@ export async function handleRequest(request, env, ctx, deps = {}) {
       ok: true,
       aiBinding: Boolean(env.AI),
       model: env.AI_MODEL || null,
-      accessTokenRequired: Boolean(env.ACCESS_TOKEN),
+      accessTokenRequired: tokenRequired(env),
+      tokenConfigured: Boolean(env.ACCESS_TOKEN),
     });
   }
 
   if (url.pathname === "/api/research") {
     if (request.method !== "POST") return errorResponse(405, "method_not_allowed", "فقط POST مجاز است.");
+    if (tokenRequired(env) && !env.ACCESS_TOKEN) {
+      return errorResponse(503, "token_not_configured", "رمز دسترسی (ACCESS_TOKEN) روی این سرور تنظیم نشده؛ برای جلوگیری از مصرف سهمیه، تحقیق غیرفعال است. راهنما: HANDOFF.md");
+    }
     if (!checkAccess(request, env)) return errorResponse(401, "unauthorized", "توکن دسترسی نامعتبر یا ارسال‌نشده است.");
     let input;
     try {

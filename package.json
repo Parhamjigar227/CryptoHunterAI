@@ -11,6 +11,6 @@
     "test:e2e": "node --test tests/e2e/ui.e2e.mjs"
   },
   "devDependencies": {
-    "wrangler": "^4.0.0"
+    "wrangler": "^4.37.0"
   }
 }

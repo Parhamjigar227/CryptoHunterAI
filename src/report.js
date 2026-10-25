@@ -14,6 +14,23 @@ export const SECTION_ORDER = [
 
 const DAY = 86_400_000;
 
+const hostOf = (u) => {
+  try { return new URL(u).hostname.replace(/^www\./, "").toLowerCase(); } catch { return null; }
+};
+
+// Compares the user-entered website with the homepage CoinGecko lists for the
+// matched token. Only meaningful when the CoinGecko match is reliable.
+function homepageRelation(research) {
+  const site = research.sources.find((s) => s.id === "website" && s.ok);
+  const cg = research.sources.find((s) => s.id === "coingecko" && s.ok);
+  if (!site || !cg || !["contract", "search-exact"].includes(cg.data.matchedBy)) return null;
+  const siteHost = hostOf(site.data.finalUrl);
+  const known = cg.data.homepage.map(hostOf).filter(Boolean);
+  if (!siteHost || !known.length) return null;
+  const same = known.some((h) => h === siteHost || siteHost.endsWith("." + h) || h.endsWith("." + siteHost));
+  return { same, siteHost, known };
+}
+
 // Each signal has a documented weight. This is a count of observed warning
 // signs, not a probability of fraud and not a safety guarantee.
 export function computeRisk(research, now = Date.now()) {
@@ -36,6 +53,11 @@ export function computeRisk(research, now = Date.now()) {
   }
   if (cg && !cg.ok && cg.error?.code === "not_found") {
     add("not_listed", 1, "پروژه/قرارداد در CoinGecko پیدا نشد (تأیید مستقل وجود ندارد).", "coingecko");
+  }
+
+  const rel = homepageRelation(research);
+  if (rel && !rel.same) {
+    add("domain_mismatch", 2, `دامنهٔ وب‌سایت واردشده (${rel.siteHost}) با صفحهٔ اصلی ثبت‌شده در CoinGecko (${rel.known.join("، ")}) نمی‌خواند؛ ممکن است سایت جعلی، اشتباه تایپی یا تطبیق نادرست توکن باشد.`, "website");
   }
 
   const gh = byId.github;
@@ -62,6 +84,26 @@ export function computeRisk(research, now = Date.now()) {
     signals,
     method: "جمع وزن‌دار علائم هشدار مشاهده‌شده: «سود تضمینی/اعتبارسنجی کیف پول» ۳، «عدم تطابق قرارداد» ۴، سایر علائم ۱ امتیاز. ≤۲ کم، ۳ تا ۵ متوسط، ≥۶ زیاد. این عدد احتمال کلاهبرداری نیست و فقط به منابع بررسی‌شده محدود است.",
   };
+}
+
+// Evidence in favour. These lower concern but never prove legitimacy, and they
+// do not change the score.
+export function computePositives(research, now = Date.now()) {
+  const out = [];
+  const add = (id, text, source) => out.push({ id, text, source });
+  const byId = Object.fromEntries(research.sources.map((s) => [s.id, s]));
+  const cg = byId.coingecko;
+  if (cg?.ok && cg.data.contractMatch === true) add("contract_match", "آدرس قراردادِ واردشده در فهرست قراردادهای این توکن در CoinGecko هست.", "coingecko");
+  if (cg?.ok && cg.data.marketCapRank != null) add("listed", `در CoinGecko فهرست شده (رتبهٔ ارزش بازار: ${cg.data.marketCapRank}).`, "coingecko");
+  const rel = homepageRelation(research);
+  if (rel?.same) add("homepage_match", `دامنهٔ وب‌سایت واردشده (${rel.siteHost}) با صفحهٔ اصلی ثبت‌شده در CoinGecko یکی است.`, "website");
+  const gh = byId.github;
+  if (gh?.ok) {
+    const linked = byId.website?.ok && (byId.website.data.links.github || []).some((l) => l.toLowerCase() === gh.url.toLowerCase());
+    if (linked) add("repo_linked", "مخزن GitHub از خود وب‌سایت لینک شده است.", "website");
+    if (!gh.data.archived && gh.data.pushedAt && now - Date.parse(gh.data.pushedAt) < 90 * DAY) add("repo_active", "مخزن GitHub در ۹۰ روز اخیر فعالیت داشته (به‌تنهایی نشانهٔ اعتبار نیست).", "github");
+  }
+  return out;
 }
 
 export function computeConfidence(research) {
@@ -128,7 +170,7 @@ function sourcesTable(sources) {
   ].join("\n");
 }
 
-export function assembleReport({ research, sections, aiError, risk, confidence, model, now = new Date() }) {
+export function assembleReport({ research, sections, aiError, risk, confidence, positives = [], model, now = new Date() }) {
   const inp = research.input;
   const get = (h) => (aiError ? NO_AI : sections[h] || MISSING);
 
@@ -159,10 +201,12 @@ export function assembleReport({ research, sections, aiError, risk, confidence, 
     "## تناقض‌ها و هشدارهای امنیتی\n\n" + get("تناقض‌ها و هشدارهای امنیتی"),
     "## وضعیت توکن و ایردراپ\n\n" + get("وضعیت توکن و ایردراپ"),
     "## ریسک‌های فنی و اقتصادی\n\n" + get("ریسک‌های فنی و اقتصادی"),
-    `## علائم هشدار و سطح ریسک\n\n**سطح علائم هشدار:** ${risk.level} (مجموع وزن: ${risk.score})\n\n${signals}\n\n**روش محاسبه:** ${risk.method}`,
+    "## شواهد موافق\n\n_این موارد نگرانی را کم می‌کنند ولی اعتبار پروژه را ثابت نمی‌کنند. شواهد مخالف در بخش بعد آمده است._\n\n" +
+      (positives.length ? positives.map((p) => `- ${p.text} [${p.source}]`).join("\n") : "- شاهد موافق مشخصی از منابع بررسی‌شده به‌دست نیامد."),
+    `## علائم هشدار و سطح ریسک (شواهد مخالف)\n\n**سطح علائم هشدار:** ${risk.level} (مجموع وزن: ${risk.score})\n\n${signals}\n\n**روش محاسبه:** ${risk.method}`,
     `## میزان اطمینان\n\n**${confidence.level}** — ${confidence.reason}`,
     "## اطلاعات نامعلوم\n\n" + get("اطلاعات نامعلوم"),
     "## پیشنهاد برای بررسی بعدی\n\n" + get("پیشنهاد برای بررسی بعدی"),
-    "---\n_این گزارش ابزار کمکی تحقیق است، نه مشاوره مالی. هیچ سود یا امنیتی تضمین نمی‌شود و هیچ تراکنشی انجام نشده است._",
+    "---\n_این گزارش ابزار کمکی تحقیق است، نه مشاوره مالی. هیچ سود یا امنیتی تضمین نمی‌شود و هیچ تراکنشی انجام نشده است._\n\n_در این نسخه پیاده‌سازی نشده‌اند: جست‌وجوی عمومی وب، بررسی کاوشگر بلاکچین، بررسی آزادسازی/وستینگ توکن و محدودسازی مستقل نرخ درخواست. نبودِ علامت هشدار به معنی امن بودن پروژه نیست._",
   ].join("\n\n");
 }

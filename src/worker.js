@@ -1,7 +1,7 @@
 import { LIMITS, ValidationError, parseResearchInput } from "./validate.js";
 import { runResearch } from "./research.js";
 import { analyzeResearch } from "./analyze.js";
-import { assembleReport, computeConfidence, computeRisk, splitSections } from "./report.js";
+import { assembleReport, computeConfidence, computePositives, computeRisk, splitSections } from "./report.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 
@@ -73,15 +73,16 @@ export function streamResearch(input, env, ctx, deps = {}) {
       const ai = await analyzeResearch(research, env, deps);
       const risk = computeRisk(research);
       const confidence = computeConfidence(research);
+      const positives = computePositives(research);
       const generatedAt = new Date();
       const markdown = assembleReport({
         research, sections: ai.ok ? splitSections(ai.text) : {}, aiError: ai.ok ? null : ai.error,
-        risk, confidence, model: ai.ok ? ai.model : null, now: generatedAt,
+        risk, confidence, positives, model: ai.ok ? ai.model : null, now: generatedAt,
       });
       await send({
         type: "result",
         report: {
-          markdown, risk, confidence, generatedAt: generatedAt.toISOString(),
+          markdown, risk, confidence, positives, generatedAt: generatedAt.toISOString(),
           model: ai.ok ? ai.model : null, aiError: ai.ok ? null : ai.error, usage: ai.ok ? ai.usage : null,
           sources: research.sources.map(({ id, title, url, fetchedAt, ok, error, limitations }) => ({ id, title, url, fetchedAt, ok, error, limitations })),
           input,

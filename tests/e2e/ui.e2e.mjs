@@ -54,6 +54,7 @@ test("happy path: form -> stream -> report, XSS neutralised, history, downloads"
   const { page, errors } = await open({ env: { AI: ai, AI_MODEL: "@cf/test/model" }, fetchImpl: goodFetch() });
 
   await page.waitForSelector("#connectionStatus.good");
+  assert.equal(await page.isVisible("#publicWarning"), true, "public API warning must show when ACCESS_TOKEN is not set");
   assert.equal(await page.textContent("#connectionStatus"), "هوش مصنوعی متصل");
 
   await fill(page, { rName: "Foo", rUrl: "https://foo.org/" });
@@ -104,6 +105,7 @@ test("server-side validation error is shown (SSRF url rejected)", async () => {
 test("access token: field appears, 401 without it, success with it", async () => {
   const { page } = await open({ env: { AI: fakeAi(() => ({ response: AI_TEXT })), AI_MODEL: "m", ACCESS_TOKEN: "tok123" }, fetchImpl: goodFetch() });
   await page.waitForSelector("#tokenField:not(.hidden)");
+  assert.equal(await page.isVisible("#publicWarning"), false);
   await fill(page, { rName: "Foo", rUrl: "https://foo.org/" });
   await page.click("#researchBtn");
   await page.waitForSelector("#researchError:not(.hidden)");

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { computeRisk, computeConfidence, splitSections, assembleReport, SECTION_ORDER } from "../src/report.js";
+import { computeRisk, computeConfidence, computePositives, splitSections, assembleReport, SECTION_ORDER } from "../src/report.js";
 
 const NOW = Date.parse("2026-10-23T00:00:00Z");
 const src = (id, ok, data = null, extra = {}) => ({ id, title: id + " title", url: `https://${id}.example.org/`, fetchedAt: "2026-10-23T00:00:00.000Z", ok, data, error: ok ? null : { code: "http_error", message: "boom" }, limitations: ["lim " + id], ...extra });
@@ -115,4 +115,49 @@ test("splitSections: a list item or sentence that merely starts with a number is
 test("splitSections: unstructured output is kept under the summary instead of being dropped", () => {
   assert.deepEqual(splitSections("فقط یک متن آزاد بدون عنوان."), { "خلاصه": "فقط یک متن آزاد بدون عنوان." });
   assert.deepEqual(splitSections(""), {});
+});
+
+const cgData = (extra = {}) => ({ matchedBy: "contract", contractMatch: true, marketCapRank: 40, homepage: ["https://uniswap.org/"], githubRepos: [], ...extra });
+const siteData = (finalUrl, github = []) => ({ finalUrl, riskMentions: [], links: { github } });
+
+test("domain check: lookalike site vs CoinGecko homepage is a risk signal; matching/subdomain is a positive", () => {
+  const bad = research([src("website", true, siteData("https://uniswap-airdrop.xyz/")), src("coingecko", true, cgData())]);
+  const r = computeRisk(bad, NOW);
+  assert.deepEqual(r.signals.map((x) => x.id), ["domain_mismatch"]);
+  assert.equal(r.score, 2);
+  assert.equal(computePositives(bad, NOW).some((p) => p.id === "homepage_match"), false);
+
+  for (const url of ["https://uniswap.org/", "https://www.uniswap.org/x", "https://app.uniswap.org/"]) {
+    const ok = research([src("website", true, siteData(url)), src("coingecko", true, cgData())]);
+    assert.equal(computeRisk(ok, NOW).signals.some((x) => x.id === "domain_mismatch"), false, url);
+    assert.equal(computePositives(ok, NOW).some((p) => p.id === "homepage_match"), true, url);
+  }
+});
+
+test("domain check is skipped when the CoinGecko match is unreliable or has no homepage", () => {
+  const unverified = research([src("website", true, siteData("https://other.example/")), src("coingecko", true, cgData({ matchedBy: "search-top-unverified" }))]);
+  assert.equal(computeRisk(unverified, NOW).score, 0);
+  const noHome = research([src("website", true, siteData("https://other.example/")), src("coingecko", true, cgData({ homepage: [] }))]);
+  assert.equal(computeRisk(noHome, NOW).score, 0);
+});
+
+test("positives: contract match, listing, repo linked from site, recent activity; none do change the score", () => {
+  const rs = research([
+    src("website", true, siteData("https://uniswap.org/", ["https://github.com/Uniswap/v3-core"])),
+    src("coingecko", true, cgData()),
+    src("github", true, { archived: false, pushedAt: "2026-10-01T00:00:00Z", createdAt: "2020-01-01T00:00:00Z" }, { url: "https://github.com/Uniswap/v3-core" }),
+  ]);
+  assert.deepEqual(computePositives(rs, NOW).map((p) => p.id).sort(), ["contract_match", "homepage_match", "listed", "repo_active", "repo_linked"]);
+  assert.equal(computeRisk(rs, NOW).score, 0);
+});
+
+test("report shows positives, opposing evidence section and the not-implemented list", () => {
+  const rs = research([src("website", true, siteData("https://uniswap.org/")), src("coingecko", true, cgData())]);
+  const md = assembleReport({ research: rs, sections: {}, aiError: null, risk: computeRisk(rs, NOW), confidence: computeConfidence(rs), positives: computePositives(rs, NOW), now: new Date(NOW) });
+  assert.match(md, /## شواهد موافق/);
+  assert.match(md, /در فهرست قراردادهای این توکن در CoinGecko هست/);
+  assert.match(md, /## علائم هشدار و سطح ریسک \(شواهد مخالف\)/);
+  assert.match(md, /جست‌وجوی عمومی وب، بررسی کاوشگر بلاکچین، بررسی آزادسازی\/وستینگ توکن و محدودسازی مستقل نرخ درخواست/);
+  const none = assembleReport({ research: rs, sections: {}, aiError: null, risk: computeRisk(rs, NOW), confidence: computeConfidence(rs), positives: [], now: new Date(NOW) });
+  assert.match(none, /شاهد موافق مشخصی/);
 });

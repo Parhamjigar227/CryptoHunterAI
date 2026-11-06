@@ -74,10 +74,25 @@ function decodeParticipant(body, prefix) {
   if (identitySignature.length < LIMITS.minSignatureBytes || identitySignature.length > LIMITS.maxSignatureBytes) {
     throw new ProtocolError('malformed_payload', `${prefix}.identitySignature must be a DER ECDSA signature`);
   }
+  // SPK self-signature. The server relays these three fields verbatim and NEVER verifies the signature:
+  // it has no authority to attest a client's signed pre-key, and claiming otherwise would be a lie.
+  if (!Number.isInteger(source.spkId) || source.spkId < 1) {
+    throw new ProtocolError('malformed_payload', `${prefix}.spkId must be a positive integer`);
+  }
+  if (!Number.isInteger(source.spkCreatedAtEpochSec) || source.spkCreatedAtEpochSec < 0) {
+    throw new ProtocolError('malformed_payload', `${prefix}.spkCreatedAtEpochSec must be a non-negative integer`);
+  }
+  const spkSignature = fromB64uStrict(source.spkSignature, `${prefix}.spkSignature`);
+  if (spkSignature.length < LIMITS.minSignatureBytes || spkSignature.length > LIMITS.maxSignatureBytes) {
+    throw new ProtocolError('malformed_payload', `${prefix}.spkSignature must be a DER ECDSA signature`);
+  }
   return {
     deviceId,
     nonce,
     identitySignature,
+    spkId: source.spkId,
+    spkCreatedAtEpochSec: source.spkCreatedAtEpochSec,
+    spkSignature,
     identitySpki: parseP256PublicKeyB64u(source.identitySpki, `${prefix}.identitySpki`).export({
       format: 'der',
       type: 'spki',
@@ -177,6 +192,10 @@ export function createApp({ store, serverKeys, clock = () => Date.now(), limits 
             decryptsCommitCiphertext: false,
             storesPlaintextActivationCode: false,
             storesPrivateKeys: false,
+            // Relay-only: the server forwards each device's signed-pre-key self-signature so the *peer*
+            // can verify it. It does not and cannot attest it itself.
+            relaysSpkSignatureWithoutVerification: true,
+            verifiesSpkSignature: false,
           },
         });
       }
@@ -188,7 +207,13 @@ export function createApp({ store, serverKeys, clock = () => Date.now(), limits 
         const invitationId = request.body.invitationId
           ? String(request.body.invitationId)
           : generateInvitationId();
-        const activationCode = generateActivationCode();
+        // The activation code is normally chosen by the owner, because the owner's invitation
+        // transcript binds its salted hash and that signature must be produced before the upload. The
+        // server still validates the format strictly (16 symbols from the shared alphabet) and falls back
+        // to generating one for clients that do not supply it (the CLI/simulated flow).
+        const activationCode = request.body.activationCode
+          ? normaliseActivationCode(request.body.activationCode)
+          : generateActivationCode();
         const ownerToken = generateBearerToken();
         const created = store.createInvitation({
           invitationId,
@@ -257,6 +282,9 @@ export function createApp({ store, serverKeys, clock = () => Date.now(), limits 
                   ephemeralSpkiB64u: view.peer.ephemeralSpki ? b64u(view.peer.ephemeralSpki) : null,
                   nonceB64u: view.peer.nonce ? b64u(view.peer.nonce) : null,
                   identitySignatureB64u: view.peer.identitySignature ? b64u(view.peer.identitySignature) : null,
+                  spkId: view.peer.spkId ?? null,
+                  spkCreatedAtEpochSec: view.peer.spkCreatedAtEpochSec ?? null,
+                  spkSignatureB64u: view.peer.spkSignature ? b64u(view.peer.spkSignature) : null,
                 }
               : null,
             acks: {

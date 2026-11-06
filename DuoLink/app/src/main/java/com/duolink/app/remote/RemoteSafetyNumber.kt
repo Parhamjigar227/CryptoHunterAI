@@ -2,6 +2,8 @@ package com.duolink.app.remote
 
 import com.duolink.app.crypto.ByteEncoding
 import com.duolink.app.crypto.EcP256Crypto
+import com.duolink.app.crypto.TranscriptBuilder
+import com.duolink.app.crypto.zeroize
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.Locale

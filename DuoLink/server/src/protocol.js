@@ -99,6 +99,9 @@ export function invitationTranscript({
   invitationId,
   activationCodeHash,
   deviceId,
+  spkId,
+  spkCreatedAtEpochSec,
+  spkSignature,
   identitySpki,
   ackSpki,
   spkSpki,
@@ -111,6 +114,9 @@ export function invitationTranscript({
     lp(utf8(invitationId)),
     lp(activationCodeHash),
     lp(deviceId),
+    i32(spkId),
+    i64(spkCreatedAtEpochSec),
+    lp(spkSignature),
     lp(identitySpki),
     lp(ackSpki),
     lp(spkSpki),
@@ -130,6 +136,9 @@ export function invitationTranscript({
 export function redeemTranscript({
   invitationId,
   deviceId,
+  spkId,
+  spkCreatedAtEpochSec,
+  spkSignature,
   identitySpki,
   ackSpki,
   spkSpki,
@@ -140,11 +149,38 @@ export function redeemTranscript({
     i32(PROTOCOL_VERSION),
     lp(utf8(invitationId)),
     lp(deviceId),
+    i32(spkId),
+    i64(spkCreatedAtEpochSec),
+    lp(spkSignature),
     lp(identitySpki),
     lp(ackSpki),
     lp(spkSpki),
     lp(ephemeralSpki),
     lp(nonce),
+  ]);
+}
+
+/**
+ * Canonical Signed Pre-Key self-signature transcript.
+ *
+ * MUST stay byte-identical to `EcP256Crypto.buildSpkTranscript()` in
+ * `DuoLink/app/src/main/java/com/duolink/app/crypto/DeviceKeyVault.kt`, because the Android client
+ * already signs/verifies this exact layout in production (Method A). Reusing it unchanged is what lets
+ * the *existing, unmodified* `PeerTrustStore` strict decoder accept a remote peer's `SPK_dh`.
+ *
+ * Layout: domain(17) || deviceId(16) || spkId(int32_be) || createdAt(int64_be) || len(spki) || spki
+ * NOTE: unlike the other transcripts here, the two numeric fields are NOT length-prefixed. That is
+ * deliberate: this is the pre-existing Method A format and may not be altered.
+ */
+export function spkTranscript({ deviceId, spkId, spkCreatedAtEpochSec, spkPublicKeySpki }) {
+  if (deviceId.length !== LIMITS.deviceIdBytes) throw new Error('invalid deviceId');
+  if (spkPublicKeySpki.length !== LIMITS.publicKeySpkiBytes) throw new Error('invalid spkPublicKeySpki');
+  return Buffer.concat([
+    Buffer.from('DuoLink-SPK-v1', 'utf8'),
+    Buffer.from(deviceId),
+    i32(spkId),
+    i64(spkCreatedAtEpochSec),
+    lp(spkPublicKeySpki),
   ]);
 }
 
@@ -240,16 +276,27 @@ export function parityVectors() {
   const commitDigestRecipient = Buffer.alloc(32, 0x22);
   const ackDigest = Buffer.alloc(32, 0x33);
   const codeHash = Buffer.alloc(32, 0x44);
-  const identitySpki = Buffer.concat([Buffer.from('3059301306072a8648ce3d020106082a8648ce3d03010703420004', 'hex'), Buffer.alloc(64, 0x55)]);
-  const ackSpki = Buffer.concat([Buffer.from('3059301306072a8648ce3d020106082a8648ce3d03010703420004', 'hex'), Buffer.alloc(64, 0x66)]);
-  const spkSpki = Buffer.concat([Buffer.from('3059301306072a8648ce3d020106082a8648ce3d03010703420004', 'hex'), Buffer.alloc(64, 0x77)]);
-  const ephemeralSpki = Buffer.concat([Buffer.from('3059301306072a8648ce3d020106082a8648ce3d03010703420004', 'hex'), Buffer.alloc(64, 0x88)]);
+  const spkiPrefix = Buffer.from('3059301306072a8648ce3d020106082a8648ce3d03010703420004', 'hex');
+  const identitySpki = Buffer.concat([spkiPrefix, Buffer.alloc(64, 0x55)]);
+  const ackSpki = Buffer.concat([spkiPrefix, Buffer.alloc(64, 0x66)]);
+  const spkSpki = Buffer.concat([spkiPrefix, Buffer.alloc(64, 0x77)]);
+  const ephemeralSpki = Buffer.concat([spkiPrefix, Buffer.alloc(64, 0x88)]);
   const nonce = Buffer.alloc(16, 0x99);
+  const spkSignature = Buffer.concat([Buffer.from('3045', 'hex'), Buffer.alloc(69, 0xAA)]);
+  const spkId = 7;
+  const spkCreatedAtEpochSec = 1700000000;
+
+  const spk = { input: { deviceId, spkId, spkCreatedAtEpochSec, spkPublicKeySpki: spkSpki } };
+  spk.hex = spkTranscript(spk.input).toString('hex');
+
   const invite = {
     input: {
       invitationId,
       activationCodeHash: codeHash,
       deviceId,
+      spkId,
+      spkCreatedAtEpochSec,
+      spkSignature,
       identitySpki,
       ackSpki,
       spkSpki,
@@ -259,12 +306,31 @@ export function parityVectors() {
     },
   };
   invite.hex = invitationTranscript(invite.input).toString('hex');
+
   const redeem = {
-    input: { invitationId, deviceId, identitySpki, ackSpki, spkSpki, ephemeralSpki, nonce },
+    input: { invitationId, deviceId, spkId, spkCreatedAtEpochSec, spkSignature, identitySpki, ackSpki, spkSpki, ephemeralSpki, nonce },
   };
   redeem.hex = redeemTranscript(redeem.input).toString('hex');
+
   return {
     protocolVersion: PROTOCOL_VERSION,
+    constants: {
+      spkId,
+      spkCreatedAtEpochSec,
+      invitationId,
+      deviceIdHex: deviceId.toString('hex'),
+      codeHashHex: codeHash.toString('hex'),
+      nonceHex: nonce.toString('hex'),
+      identitySpkiHex: identitySpki.toString('hex'),
+      ackSpkiHex: ackSpki.toString('hex'),
+      spkSpkiHex: spkSpki.toString('hex'),
+      ephemeralSpkiHex: ephemeralSpki.toString('hex'),
+      spkSignatureHex: spkSignature.toString('hex'),
+      commitDigestOwnerHex: commitDigestOwner.toString('hex'),
+      commitDigestRecipientHex: commitDigestRecipient.toString('hex'),
+      ackDigestHex: ackDigest.toString('hex'),
+    },
+    spk,
     invite,
     redeem,
     ack: {

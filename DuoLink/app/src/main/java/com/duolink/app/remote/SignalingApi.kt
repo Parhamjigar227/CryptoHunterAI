@@ -27,19 +27,42 @@ class SignalingApi(private val client: SignalingHttpClient) {
     )
 
     /** Public key material a participant registers for one pairing attempt. */
+    /**
+     * Public material one device publishes for a pairing.
+     *
+     * [identitySignature] is an ECDSA signature by [identitySpki] over the canonical invitation (owner)
+     * or redeem (recipient) transcript. [spkSignature] is an ECDSA signature by [identitySpki] over the
+     * canonical SPK transcript (Decision A). Neither is verifiable by the server; both are verified by
+     * the peer. [nonce] is the role's 128-bit contribution to the handshake binding.
+     */
     data class ParticipantMaterial(
         val deviceId: ByteArray,
         val identitySpki: ByteArray,
         val ackSpki: ByteArray,
         val spkSpki: ByteArray,
-        val ephemeralSpki: ByteArray
+        val ephemeralSpki: ByteArray,
+        val nonce: ByteArray,
+        val identitySignature: ByteArray,
+        val spkId: Int,
+        val spkCreatedAtEpochSec: Long,
+        val spkSignature: ByteArray
     )
 
+    /**
+     * Peer material as relayed by the signalling server. Values here are *claims*: nothing may be trusted
+     * until [identitySignature] and [spkSignature] have been verified against [identitySpki].
+     */
     data class PeerMaterial(
         val deviceId: ByteArray,
         val identitySpki: ByteArray,
+        val ackSpki: ByteArray,
         val spkSpki: ByteArray,
-        val ephemeralSpki: ByteArray?
+        val ephemeralSpki: ByteArray?,
+        val nonce: ByteArray?,
+        val identitySignature: ByteArray?,
+        val spkId: Int?,
+        val spkCreatedAtEpochSec: Long?,
+        val spkSignature: ByteArray?
     )
 
     data class CommitAck(
@@ -100,8 +123,23 @@ class SignalingApi(private val client: SignalingHttpClient) {
         val invitationTtlSeconds: Long
     )
 
-    fun createInvitation(baseUrl: String, owner: ParticipantMaterial, ttlSeconds: Long? = null): CreatedInvitation {
+    /**
+     * Creates an invitation.
+     *
+     * [invitationId] is assigned by the client because the owner's invitation transcript binds it — the
+     * signature must exist before anything is uploaded, and the recipient must be able to bind the same
+     * id from the QR code alone (so it travels in the QR as well).
+     */
+    fun createInvitation(
+        baseUrl: String,
+        invitationId: String,
+        owner: ParticipantMaterial,
+        activationCode: String,
+        ttlSeconds: Long? = null
+    ): CreatedInvitation {
         val body = SignalingHttpClient.jsonObject(
+            "invitationId" to SignalingHttpClient.jsonString(invitationId),
+            "activationCode" to SignalingHttpClient.jsonString(activationCode),
             "owner" to participantJson(owner),
             "ttlSeconds" to (ttlSeconds?.toString() ?: "null")
         )
@@ -158,8 +196,14 @@ class SignalingApi(private val client: SignalingHttpClient) {
                 PeerMaterial(
                     deviceId = SignalingJson.requireBytes(peer, "deviceIdB64u"),
                     identitySpki = SignalingJson.requireBytes(peer, "identitySpkiB64u"),
+                    ackSpki = SignalingJson.requireBytes(peer, "ackSpkiB64u"),
                     spkSpki = SignalingJson.requireBytes(peer, "spkSpkiB64u"),
-                    ephemeralSpki = SignalingJson.optionalBytes(peer, "ephemeralSpkiB64u")
+                    ephemeralSpki = SignalingJson.optionalBytes(peer, "ephemeralSpkiB64u"),
+                    nonce = SignalingJson.optionalBytes(peer, "nonceB64u"),
+                    identitySignature = SignalingJson.optionalBytes(peer, "identitySignatureB64u"),
+                    spkId = SignalingJson.optionalLong(peer, "spkId")?.toInt(),
+                    spkCreatedAtEpochSec = SignalingJson.optionalLong(peer, "spkCreatedAtEpochSec"),
+                    spkSignature = SignalingJson.optionalBytes(peer, "spkSignatureB64u")
                 )
             },
             ownerAckRecorded = acks?.let { SignalingJson.optionalBool(it, "ownerRecorded") } ?: false,
@@ -250,7 +294,12 @@ class SignalingApi(private val client: SignalingHttpClient) {
         "identitySpki" to SignalingHttpClient.b64u(material.identitySpki),
         "ackSpki" to SignalingHttpClient.b64u(material.ackSpki),
         "spkSpki" to SignalingHttpClient.b64u(material.spkSpki),
-        "ephemeralSpki" to SignalingHttpClient.b64u(material.ephemeralSpki)
+        "ephemeralSpki" to SignalingHttpClient.b64u(material.ephemeralSpki),
+        "nonce" to SignalingHttpClient.b64u(material.nonce),
+        "identitySignature" to SignalingHttpClient.b64u(material.identitySignature),
+        "spkId" to material.spkId.toString(),
+        "spkCreatedAtEpochSec" to material.spkCreatedAtEpochSec.toString(),
+        "spkSignature" to SignalingHttpClient.b64u(material.spkSignature)
     )
 
     /** Path segments are validated, never interpolated blindly (defence against path traversal). */

@@ -3,6 +3,8 @@ package com.duolink.app.remote
 import com.duolink.app.crypto.ByteEncoding
 import com.duolink.app.crypto.EcP256Crypto
 import com.duolink.app.crypto.HkdfSha256
+import com.duolink.app.crypto.TranscriptBuilder
+import com.duolink.app.crypto.zeroize
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.GeneralSecurityException
@@ -16,34 +18,31 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 /**
- * Method B key schedule: a symmetric three-DH between two devices, followed by HKDF-SHA256 expansion
- * into domain-separated, direction-scoped keys.
+ * Method B key schedule — CORRECTED (Stage 1).
  *
- * The three DH contributions (which is what "three-DH" means here):
+ * Two DH contributions, combined in a **fixed order** and expanded with HKDF-SHA256:
  *
- *   DH1 = ECDH(EK_initiator,  SPK_responder)   ephemeral x signed pre-key  -> forward secrecy
- *   DH2 = ECDH(IK_initiator,  EK_responder)    identity  x ephemeral       -> initiator authenticity
- *   DH3 = ECDH(EK_initiator,  EK_responder)    ephemeral x ephemeral       -> fresh session entropy
+ *   DH1 = ECDH(EK_owner, SPK_recipient)   asymmetric: owner contributes EK_owner, recipient contributes
+ *                                         its *published* Signed Pre-Key private half. This is the
+ *                                         forward-secrecy / long-term-binding contribution.
+ *   DH2 = ECDH(EK_owner, EK_recipient)    symmetric: both sides compute the same value from their own
+ *                                         ephemeral secret and the peer's ephemeral public key.
  *
- * All three enter a single HKDF-Extract whose salt binds the public wire context (invitation id,
- * protocol version, both device ids, all four public keys, and both nonces). Both devices can compute
- * DH1..DH3 because each needs one private key per line and possesses exactly one of the pair:
+ * Why DH1 looks "asymmetric" in code and still agrees: each device uses a **different private key**.
+ * The owner uses its ephemeral secret against the recipient's SPK public key; the recipient uses its SPK
+ * secret against the owner's ephemeral public key. `ECDH(a, B) == ECDH(b, A)` is what makes them equal.
+ * A previous revision of this file computed both contributions from the local ephemeral key, which
+ * produced different secrets on each side and could never agree — see the Stage 1 remediation report.
  *
- *   initiator: EK_init private,     IK_init is its own signing key (see note)
- *   responder: SPK_resp private,    EK_resp private
+ * The responder's long-term identity is bound by an **ECDSA signature** (`IK_sig`) over the invitation
+ * transcript, whose bytes are mixed into the HKDF salt, instead of by a third DH. `IK_sig` lives
+ * non-exportably in AndroidKeyStore and cannot perform `KeyAgreement`; adding a second long-term DH key
+ * would have meant introducing a weaker long-term secret. [IDENTITY_BINDING_MODE] records this so no
+ * document ever describes the construction as a textbook three-DH.
  *
- * Note on DH2: `IK_sig` in DuoLink is an ECDSA key held non-exportably inside AndroidKeyStore and
- * cannot perform `KeyAgreement`. Rather than weaken that guarantee by generating a second, weaker
- * "identity DH" key, this implementation replaces DH2's contribution with an **ECDSA signature**
- * from the responder's `IK_sig` over the full handshake transcript; the signature bytes (not the
- * key) are then mixed into the HKDF salt. The security property is preserved and is arguably
- * stronger: the responder's long-term identity is bound by signature (non-repudiable, verifiable by
- * the peer) instead of by a DH secret, and no additional long-term private key is introduced.
- * [handshakeBinding] documents exactly which bytes enter the KDF so this substitution is explicit,
- * never implicit.
- *
- * The material difference is documented as `IDENTITY_BINDING_MODE` and surfaced in the UI's technical
- * details screen. It is NOT described as a textbook 3-DH anywhere in user-facing text.
+ * Source material to implement above: the AndroidKeystoreVault surface
+ *   - `agreeWithSignedPreKey(localSpkId, peerEphemeralSpki)`  -> DH1 on the recipient
+ *   - `EcP256Crypto.ecdhSharedSecret(ephemeralPrivate, peerSpkSpki)` -> DH1 on the owner
  */
 object RemoteKeySchedule {
 
@@ -105,6 +104,32 @@ object RemoteKeySchedule {
     }
 
     /**
+     * The two DH outputs a device computed, tagged with the role that produced them.
+     *
+     * The tag exists because the *same* pair of operations yields different bytes per role: computing
+     * DH1 with the wrong key (e.g. ephemeral against the peer's ephemeral on both sides) produces a
+     * silently mismatched session instead of an error. Tagging makes that mistake impossible to ship.
+     */
+    class DhContributions(
+        val role: String,
+        val dh1WithPeerSignedPreKey: ByteArray,
+        val dh2EphemeralToEphemeral: ByteArray
+    ) {
+        init {
+            require(role == RemoteTranscripts.Role.OWNER || role == RemoteTranscripts.Role.RECIPIENT) {
+                "invalid role"
+            }
+            require(dh1WithPeerSignedPreKey.size == HASH_LEN) { "DH1 must be 32 bytes" }
+            require(dh2EphemeralToEphemeral.size == HASH_LEN) { "DH2 must be 32 bytes" }
+        }
+
+        fun destroy() {
+            dh1WithPeerSignedPreKey.zeroize()
+            dh2EphemeralToEphemeral.zeroize()
+        }
+    }
+
+    /**
      * The full derived key set for one device. Directional envelope keys mean each device has an
      * `encryptKey` used only for messages it sends and a `decryptKey` used only for messages it
      * receives, so a compromised direction cannot forge the opposite direction.
@@ -142,18 +167,27 @@ object RemoteKeySchedule {
      * @param peerIdentitySignature the responder's ECDSA signature over the handshake transcript,
      *   verified by the caller **before** this function is called.
      */
+    /**
+     * Derives the full key set from the caller's two DH contributions.
+     *
+     * [contributions] MUST be built through [DhContributions] so the order (DH1 then DH2) and the role
+     * semantics are explicit at every call site. Passing a raw list is rejected by construction.
+     */
     fun deriveKeys(
         role: String,
         binding: HandshakeBinding,
-        localEcdhSecrets: List<ByteArray>
+        contributions: DhContributions
     ): RemoteKeySet {
         require(role == RemoteTranscripts.Role.OWNER || role == RemoteTranscripts.Role.RECIPIENT) {
             "invalid role"
         }
-        require(localEcdhSecrets.size == 2) { "expected exactly two ECDH contributions" }
+        require(contributions.role == role) {
+            "DH contributions were computed for role ${contributions.role} but keys are derived for $role"
+        }
+        val localEcdhSecrets = listOf(contributions.dh1WithPeerSignedPreKey, contributions.dh2EphemeralToEphemeral)
         localEcdhSecrets.forEach { require(it.size == HASH_LEN) { "ECDH secrets must be 32 bytes" } }
 
-        val ikm = ByteBuffer.allocate(HASH_LEN * localEcdhSecrets.size)
+        val ikm = ByteBuffer.allocate(HASH_LEN * 2)
         localEcdhSecrets.forEach { ikm.put(it) }
         val ikmBytes = ikm.array()
 

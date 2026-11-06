@@ -1,5 +1,6 @@
 package com.duolink.app.remote
 
+import com.duolink.app.crypto.EcP256Crypto
 import com.duolink.app.crypto.TranscriptBuilder
 import java.nio.charset.StandardCharsets
 
@@ -30,6 +31,9 @@ object RemoteTranscripts {
     const val DOMAIN_COMMIT = "DUOLINK-REMOTE-COMMIT-V1"
     const val DOMAIN_REDEEM = "DUOLINK-REMOTE-REDEEM-V1"
     const val DOMAIN_INVITATION_QR = "DUOLINK-REMOTE-INVITE-QR-V1"
+
+    /** SPK self-signature domain. Shared verbatim with Method A — do not rename. */
+    const val DOMAIN_SPK = "DuoLink-SPK-v1"
 
     /** Role strings are part of signed bytes: an owner ACK can never be replayed as a recipient ACK. */
     object Role {
@@ -129,52 +133,114 @@ object RemoteTranscripts {
     }
 
     /**
-     * Redemption transcript, signed with `IK_sig` and sent inside the redeem request.
+     * Canonical Signed Pre-Key self-signature transcript.
      *
-     * Purpose: prove to the *peer* (not to the server, which cannot check it) that the device that
-     * redeemed the code holds the identity key it claims. The signature is verified by the owner
-     * client once the server relays the recipient's public material.
+     * FROZEN CONTRACT — byte-identical to `EcP256Crypto.buildSpkTranscript()` in the Method A crypto
+     * layer and to `spkTranscript()` in `DuoLink/server/src/protocol.js`. It deliberately reuses the
+     * pre-existing Method A layout (no length prefixes on the numeric fields) so the *unmodified*
+     * `PeerTrustStore` decoder can validate a remote peer's SPK. Changing this breaks Method A.
+     *
+     * Layout: `"DuoLink-SPK-v1" || deviceId(16) || spkId(int32_be) || createdAt(int64_be) ||
+     *          uint32_be(len) || spki`
      */
-    fun redeemTranscript(
-        invitationId: String,
+    fun spkTranscript(
         deviceId: ByteArray,
-        identityPublicSpki: ByteArray,
-        ackPublicSpki: ByteArray,
-        spkPublicSpki: ByteArray,
-        ephemeralPublicSpki: ByteArray
-    ): ByteArray = TranscriptBuilder()
-        .putUtf8(DOMAIN_REDEEM)
-        .putInt32(PROTOCOL_VERSION)
-        .putUtf8(invitationId)
-        .putBytes(deviceId)
-        .putBytes(identityPublicSpki)
-        .putBytes(ackPublicSpki)
-        .putBytes(spkPublicSpki)
-        .putBytes(ephemeralPublicSpki)
-        .build()
+        spkId: Int,
+        spkCreatedAtEpochSec: Long,
+        spkPublicKeySpki: ByteArray
+    ): ByteArray {
+        require(deviceId.size == 16) { "deviceId must be 16 bytes" }
+        require(spkPublicKeySpki.size == 91) { "SPK must be an uncompressed P-256 SPKI key" }
+        // Delegated on purpose: re-implementing the layout here is how the two encodings would drift.
+        return EcP256Crypto.buildSpkTranscript(deviceId, spkId, spkPublicKeySpki, spkCreatedAtEpochSec)
+    }
 
-    /** Owner-side invitation QR transcript: binds the activation code to the owner's public material. */
-    fun invitationQrTranscript(
+    /**
+     * Owner-side invitation transcript, signed with `IK_sig`.
+     *
+     * FROZEN CONTRACT — byte-identical to `invitationTranscript()` in `DuoLink/server/src/protocol.js`,
+     * pinned by the cross-language parity test.
+     *
+     * Decision B: binds the **activation code hash**, never the plaintext activation code. The hash is
+     * the SHA-256 of the canonical code — the same value the server stores — so the recipient can
+     * re-derive and verify the transcript from the code it was given, while the plaintext code never
+     * enters a signature, a log, or the server database.
+     *
+     * Decision A: also binds the SPK self-signature, so one signature covers both "this identity claims
+     * this signed pre-key" and "this invitation belongs to this identity".
+     */
+    fun invitationTranscript(
         invitationId: String,
-        activationCodeCompact: String,
+        activationCodeHash: ByteArray,
         deviceId: ByteArray,
+        spkId: Int,
+        spkCreatedAtEpochSec: Long,
+        spkSignature: ByteArray,
         identityPublicSpki: ByteArray,
         ackPublicSpki: ByteArray,
         spkPublicSpki: ByteArray,
         ephemeralPublicSpki: ByteArray,
+        nonce: ByteArray,
         expiresAtEpochSec: Long
-    ): ByteArray = TranscriptBuilder()
-        .putUtf8(DOMAIN_INVITATION_QR)
-        .putInt32(PROTOCOL_VERSION)
-        .putUtf8(invitationId)
-        .putUtf8(activationCodeCompact)
-        .putBytes(deviceId)
-        .putBytes(identityPublicSpki)
-        .putBytes(ackPublicSpki)
-        .putBytes(spkPublicSpki)
-        .putBytes(ephemeralPublicSpki)
-        .putInt64(expiresAtEpochSec)
-        .build()
+    ): ByteArray {
+        require(activationCodeHash.size == 32) { "activation code hash must be 32 bytes" }
+        require(deviceId.size == 16) { "deviceId must be 16 bytes" }
+        require(nonce.size == NONCE_BYTES) { "nonce must be $NONCE_BYTES bytes" }
+        return TranscriptBuilder()
+            .putUtf8(DOMAIN_INVITATION_QR)
+            .putInt32(PROTOCOL_VERSION)
+            .putUtf8(invitationId)
+            .putBytes(activationCodeHash)
+            .putBytes(deviceId)
+            .putInt32(spkId)
+            .putInt64(spkCreatedAtEpochSec)
+            .putBytes(spkSignature)
+            .putBytes(identityPublicSpki)
+            .putBytes(ackPublicSpki)
+            .putBytes(spkPublicSpki)
+            .putBytes(ephemeralPublicSpki)
+            .putBytes(nonce)
+            .putInt64(expiresAtEpochSec)
+            .build()
+    }
+
+    /**
+     * Redemption transcript, signed with the recipient's `IK_sig` and verified by the owner client.
+     *
+     * FROZEN CONTRACT — byte-identical to `redeemTranscript()` in `server/src/protocol.js`.
+     * Binds the invitation id, the recipient's identity, its signed pre-key (plus the SPK
+     * self-signature) and its nonce, proving to the owner that the relayed material belongs to the
+     * device that redeemed the code. The server can never check this signature.
+     */
+    fun redeemTranscript(
+        invitationId: String,
+        deviceId: ByteArray,
+        spkId: Int,
+        spkCreatedAtEpochSec: Long,
+        spkSignature: ByteArray,
+        identityPublicSpki: ByteArray,
+        ackPublicSpki: ByteArray,
+        spkPublicSpki: ByteArray,
+        ephemeralPublicSpki: ByteArray,
+        nonce: ByteArray
+    ): ByteArray {
+        require(deviceId.size == 16) { "deviceId must be 16 bytes" }
+        require(nonce.size == NONCE_BYTES) { "nonce must be $NONCE_BYTES bytes" }
+        return TranscriptBuilder()
+            .putUtf8(DOMAIN_REDEEM)
+            .putInt32(PROTOCOL_VERSION)
+            .putUtf8(invitationId)
+            .putBytes(deviceId)
+            .putInt32(spkId)
+            .putInt64(spkCreatedAtEpochSec)
+            .putBytes(spkSignature)
+            .putBytes(identityPublicSpki)
+            .putBytes(ackPublicSpki)
+            .putBytes(spkPublicSpki)
+            .putBytes(ephemeralPublicSpki)
+            .putBytes(nonce)
+            .build()
+    }
 
     /**
      * Normalises a 60-digit Safety Number to single-space-separated groups before it enters a signed
@@ -183,6 +249,9 @@ object RemoteTranscripts {
      */
     fun normaliseSafetyNumber(safetyNumber: String): String =
         safetyNumber.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }.joinToString(" ")
+
+    /** Nonce length in bytes for both roles (128-bit). */
+    const val NONCE_BYTES = 16
 
     /** Number of digit groups in a full Safety Number (12 groups x 5 digits = 60 digits). */
     const val SAFETY_NUMBER_GROUPS = 12

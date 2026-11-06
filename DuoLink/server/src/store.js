@@ -69,6 +69,9 @@ CREATE TABLE IF NOT EXISTS invitations (
   owner_ephemeral_spki     BLOB,
   owner_nonce              BLOB,
   owner_identity_signature BLOB,
+  owner_spk_id             INTEGER,
+  owner_spk_created_at     INTEGER,
+  owner_spk_signature      BLOB,
 
   recipient_device_id      BLOB,
   recipient_identity_spki  BLOB,
@@ -77,6 +80,9 @@ CREATE TABLE IF NOT EXISTS invitations (
   recipient_ephemeral_spki BLOB,
   recipient_nonce          BLOB,
   recipient_identity_signature BLOB,
+  recipient_spk_id         INTEGER,
+  recipient_spk_created_at INTEGER,
+  recipient_spk_signature  BLOB,
 
   owner_commit             BLOB,
   owner_commit_digest      BLOB,
@@ -336,6 +342,11 @@ export class InvitationStore {
       ackSpki: owner.ackSpki,
       spkSpki: owner.spkSpki,
       ephemeralSpki: owner.ephemeralSpki,
+      nonce: owner.nonce,
+      identitySignature: owner.identitySignature,
+      spkId: owner.spkId,
+      spkCreatedAtEpochSec: owner.spkCreatedAtEpochSec,
+      spkSignature: owner.spkSignature,
     };
     for (const [name, key] of [
       ['identitySpki', 'identitySpki'],
@@ -365,6 +376,15 @@ export class InvitationStore {
     if (!Buffer.isBuffer(owner.identitySignature) || owner.identitySignature.length < 64 || owner.identitySignature.length > 80) {
       throw new ProtocolError('invalid_signature', 'owner.identitySignature must be a DER ECDSA signature');
     }
+    if (!Number.isInteger(owner.spkId) || owner.spkId < 1) {
+      throw new ProtocolError('invalid_spk', 'owner.spkId must be a positive integer');
+    }
+    if (!Number.isInteger(owner.spkCreatedAtEpochSec) || owner.spkCreatedAtEpochSec < 0) {
+      throw new ProtocolError('invalid_spk', 'owner.spkCreatedAtEpochSec must be a non-negative integer');
+    }
+    if (!Buffer.isBuffer(owner.spkSignature) || owner.spkSignature.length < 64 || owner.spkSignature.length > 80) {
+      throw new ProtocolError('invalid_spk', 'owner.spkSignature must be a DER ECDSA signature');
+    }
 
     return this.#transaction(() => {
       this.#db
@@ -373,8 +393,9 @@ export class InvitationStore {
              invitation_id, protocol_version, state, created_at, expires_at,
              code_hash, owner_token_hash,
              owner_device_id, owner_identity_spki, owner_ack_spki, owner_spk_spki, owner_ephemeral_spki,
-             owner_nonce, owner_identity_signature
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+             owner_nonce, owner_identity_signature,
+             owner_spk_id, owner_spk_created_at, owner_spk_signature
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           invitationId,
@@ -390,7 +411,10 @@ export class InvitationStore {
           normalised.spkSpki,
           normalised.ephemeralSpki,
           owner.nonce,
-          owner.identitySignature
+          owner.identitySignature,
+          owner.spkId,
+          owner.spkCreatedAtEpochSec,
+          owner.spkSignature
         );
       return { invitationId, createdAt, expiresAt };
     });
@@ -456,6 +480,15 @@ export class InvitationStore {
       if (!Buffer.isBuffer(recipient.identitySignature) || recipient.identitySignature.length < 64 || recipient.identitySignature.length > 80) {
         throw new ProtocolError('invalid_signature', 'recipient.identitySignature must be a DER ECDSA signature');
       }
+      if (!Number.isInteger(recipient.spkId) || recipient.spkId < 1) {
+        throw new ProtocolError('invalid_spk', 'recipient.spkId must be a positive integer');
+      }
+      if (!Number.isInteger(recipient.spkCreatedAtEpochSec) || recipient.spkCreatedAtEpochSec < 0) {
+        throw new ProtocolError('invalid_spk', 'recipient.spkCreatedAtEpochSec must be a non-negative integer');
+      }
+      if (!Buffer.isBuffer(recipient.spkSignature) || recipient.spkSignature.length < 64 || recipient.spkSignature.length > 80) {
+        throw new ProtocolError('invalid_spk', 'recipient.spkSignature must be a DER ECDSA signature');
+      }
       this.#setState(row, InvitationState.REDEEMED, {
         redeemed_at: redeemedAt,
         recipient_token_hash: hashBearerToken(recipientToken),
@@ -466,6 +499,9 @@ export class InvitationStore {
         recipient_ephemeral_spki: recipient.ephemeralSpki,
         recipient_nonce: recipient.nonce,
         recipient_identity_signature: recipient.identitySignature,
+        recipient_spk_id: recipient.spkId,
+        recipient_spk_created_at: recipient.spkCreatedAtEpochSec,
+        recipient_spk_signature: recipient.spkSignature,
       });
       return { invitationId: row.invitation_id, redeemedAt, expiresAt: row.expires_at };
     });
@@ -651,6 +687,8 @@ export class InvitationStore {
         recipient_nonce: null,
         owner_identity_signature: null,
         recipient_identity_signature: null,
+        owner_spk_signature: null,
+        recipient_spk_signature: null,
         purged_at: nowSec(this.#clock),
       });
       return { invitationId: row.invitation_id, state: InvitationState.REVOKED, reason };
@@ -677,6 +715,8 @@ export class InvitationStore {
         recipient_nonce: null,
         owner_identity_signature: null,
         recipient_identity_signature: null,
+        owner_spk_signature: null,
+        recipient_spk_signature: null,
         purged_at: nowSec(this.#clock),
       });
       return { invitationId: row.invitation_id, state: InvitationState.REJECTED, reason };
@@ -745,6 +785,11 @@ export class InvitationStore {
               ephemeralSpki: peerEphemeral ? Buffer.from(peerEphemeral) : null,
               nonce: peerNonce ? Buffer.from(peerNonce) : null,
               identitySignature: peerIdentitySignature ? Buffer.from(peerIdentitySignature) : null,
+              spkId: isOwner ? row.recipient_spk_id : row.owner_spk_id,
+              spkCreatedAtEpochSec: isOwner ? row.recipient_spk_created_at : row.owner_spk_created_at,
+              spkSignature: (isOwner ? row.recipient_spk_signature : row.owner_spk_signature)
+                ? Buffer.from(isOwner ? row.recipient_spk_signature : row.owner_spk_signature)
+                : null,
             }
           : null,
         acks: {

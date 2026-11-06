@@ -38,7 +38,16 @@ import {
   timingSafeEqual,
   verify,
 } from 'node:crypto';
-import { PROTOCOL_VERSION, MAX_CIPHERTEXT_BYTES } from './constants.js';
+import {
+  PROTOCOL_VERSION,
+  LIMITS,
+  spkTranscript,
+  invitationTranscript,
+  redeemTranscript,
+  ackTranscript,
+} from '../src/protocol.js';
+
+const MAX_CIPHERTEXT_BYTES = LIMITS.maxCiphertextBytes;
 
 const HASH_LEN = 32;
 const GCM_NONCE_LEN = 12;
@@ -135,26 +144,10 @@ export function createEcdhKey() {
 // Transcripts (must match RemoteTranscripts.kt byte for byte)
 // ---------------------------------------------------------------------------------------------
 
-export function inviteTranscript({ invitationId, activationCodeHash, deviceId, identitySpki, ackSpki, spkSpki, ephemeralSpki, nonce, expiresAtEpochSec }) {
-  return transcript('DUOLINK-REMOTE-INVITE-QR-V1', [
-    i32(PROTOCOL_VERSION), lp(utf8(invitationId)), lp(activationCodeHash), lp(deviceId),
-    lp(identitySpki), lp(ackSpki), lp(spkSpki), lp(ephemeralSpki), lp(nonce), i64(expiresAtEpochSec),
-  ]);
-}
-
-export function redeemTranscript({ invitationId, deviceId, identitySpki, ackSpki, spkSpki, ephemeralSpki, nonce }) {
-  return transcript('DUOLINK-REMOTE-REDEEM-V1', [
-    i32(PROTOCOL_VERSION), lp(utf8(invitationId)), lp(deviceId), lp(identitySpki), lp(ackSpki),
-    lp(spkSpki), lp(ephemeralSpki), lp(nonce),
-  ]);
-}
-
-export function ackTranscript({ invitationId, role, deviceId, commitDigestOwner, commitDigestRecipient }) {
-  return transcript('DUOLINK-REMOTE-ACK-V1', [
-    i32(PROTOCOL_VERSION), lp(utf8(invitationId)), lp(utf8(role)), lp(deviceId),
-    lp(commitDigestOwner), lp(commitDigestRecipient),
-  ]);
-}
+// Canonical transcripts come from the single source of truth (src/protocol.js). `inviteTranscript` is
+// kept as an alias so call sites read naturally.
+const inviteTranscript = invitationTranscript;
+export { inviteTranscript, redeemTranscript, ackTranscript, spkTranscript };
 
 export function commitPlaintextTranscript({ invitationId, role, deviceId, peerDeviceId, rootKey, ephemeralPublicSpki, spkPublicSpki, safetyNumber, issuedAtEpochSec }) {
   return transcript('DUOLINK-REMOTE-COMMIT-V1', [
@@ -315,6 +308,15 @@ function decodeCommitPlaintext(plaintext) {
 
 /**
  * One device participating in a Method B pairing. Holds only its own secrets.
+ *
+ * Key schedule — CORRECTED (Stage 1). DH1 is asymmetric by design and is computed from *different
+ * private keys* on each side, which is exactly what makes the two secrets equal:
+ *
+ *   DH1 = ECDH(EK_owner,     SPK_recipient)     owner uses EK_owner ; recipient uses SPK_recipient
+ *   DH2 = ECDH(EK_owner,     EK_recipient)      symmetric: ECDH(EK_o, EK_r) == ECDH(EK_r, EK_o)
+ *
+ * A third "identity DH" is intentionally absent: the responder's long-term identity is bound by an
+ * ECDSA signature mixed into the HKDF salt instead (see RemoteKeySchedule.IDENTITY_BINDING_MODE).
  */
 export class Device {
   /**
@@ -325,26 +327,53 @@ export class Device {
     this.identity = createIdentity();
     this.spk = createEcdhKey();
     this.ackKey = createEcdhKey();
+    this.spkId = 1;
+    this.spkCreatedAtEpochSec = 1_700_000_000;
+    this.expiresAtEpochSec = 1_700_000_900;
     this.persistedPeer = null;
     this.derived = null;
     this.safetyNumberVerified = false;
+    this.invitationId = null;
+    this.ephemeral = null;
+    this.nonce = null;
+    this.commit = null;
   }
 
-  proposeOwnerMaterial(ackSpki) {
-    return {
-      deviceId: b64u(this.identity.deviceId),
-      identitySpki: b64u(this.identity.spki),
-      ackSpki: b64u(ackSpki),
-      spkSpki: b64u(this.spk.spki),
-      ephemeralSpki: b64u(this.ephemeral.spki),
-    };
+  /** Canonical Signed Pre-Key self-signature, verifiable by the peer with this device's IK_sig. */
+  spkSignature() {
+    return this.identity.sign(
+      spkTranscript({
+        deviceId: this.identity.deviceId,
+        spkId: this.spkId,
+        spkCreatedAtEpochSec: this.spkCreatedAtEpochSec,
+        spkPublicKeySpki: this.spk.spki,
+      })
+    );
   }
 
-  /** Owner: registers the invitation payload with the server. */
-  prepareAsOwner(activationCodeHash, nonce) {
+  /** Public material for the create/redeem payload. Signature covers the full invitation binding. */
+  ownerPayload({ invitationId, activationCodeHash, expiresAtEpochSec = 1_700_000_900 }) {
+    this.expiresAtEpochSec = expiresAtEpochSec;
+    this.invitationId = invitationId;
     this.ephemeral = createEcdhKey();
-    this.ownerNonce = nonce;
-    this.activationCodeHash = activationCodeHash;
+    this.nonce = randomBytes(LIMITS.nonceBytes);
+    const spkSignature = this.spkSignature();
+    const identitySignature = this.identity.sign(
+      inviteTranscript({
+        invitationId,
+        activationCodeHash,
+        deviceId: this.identity.deviceId,
+        spkId: this.spkId,
+        spkCreatedAtEpochSec: this.spkCreatedAtEpochSec,
+        spkSignature,
+        identitySpki: this.identity.spki,
+        ackSpki: this.ackKey.spki,
+        spkSpki: this.spk.spki,
+        ephemeralSpki: this.ephemeral.spki,
+        nonce: this.nonce,
+        expiresAtEpochSec: this.expiresAtEpochSec,
+      })
+    );
     return {
       wire: {
         deviceId: b64u(this.identity.deviceId),
@@ -352,15 +381,34 @@ export class Device {
         ackSpki: b64u(this.ackKey.spki),
         spkSpki: b64u(this.spk.spki),
         ephemeralSpki: b64u(this.ephemeral.spki),
+        nonce: b64u(this.nonce),
+        identitySignature: b64u(identitySignature),
+        spkId: this.spkId,
+        spkCreatedAtEpochSec: this.spkCreatedAtEpochSec,
+        spkSignature: b64u(spkSignature),
       },
-      nonce,
     };
   }
 
-  /** Recipient: material registered at redemption, including its own nonce. */
-  prepareAsRecipient() {
+  recipientPayload({ invitationId }) {
+    this.invitationId = invitationId;
     this.ephemeral = createEcdhKey();
-    this.recipientNonce = randomBytes(16);
+    this.nonce = randomBytes(LIMITS.nonceBytes);
+    const spkSignature = this.spkSignature();
+    const identitySignature = this.identity.sign(
+      redeemTranscript({
+        invitationId,
+        deviceId: this.identity.deviceId,
+        spkId: this.spkId,
+        spkCreatedAtEpochSec: this.spkCreatedAtEpochSec,
+        spkSignature,
+        identitySpki: this.identity.spki,
+        ackSpki: this.ackKey.spki,
+        spkSpki: this.spk.spki,
+        ephemeralSpki: this.ephemeral.spki,
+        nonce: this.nonce,
+      })
+    );
     return {
       wire: {
         deviceId: b64u(this.identity.deviceId),
@@ -368,23 +416,17 @@ export class Device {
         ackSpki: b64u(this.ackKey.spki),
         spkSpki: b64u(this.spk.spki),
         ephemeralSpki: b64u(this.ephemeral.spki),
+        nonce: b64u(this.nonce),
+        identitySignature: b64u(identitySignature),
+        spkId: this.spkId,
+        spkCreatedAtEpochSec: this.spkCreatedAtEpochSec,
+        spkSignature: b64u(spkSignature),
       },
-      redeemSignature: this.identity.sign(
-        redeemTranscript({
-          invitationId: this.invitationId,
-          deviceId: this.identity.deviceId,
-          identitySpki: this.identity.spki,
-          ackSpki: this.ackKey.spki,
-          spkSpki: this.spk.spki,
-          ephemeralSpki: this.ephemeral.spki,
-          nonce: this.recipientNonce,
-        })
-      ),
     };
   }
 
-  /** Builds the shared binding from the owner's view. */
-  buildBinding({ invitationId, owner, recipient, recipientIdentitySignature }) {
+  /** Builds the shared binding from public material only — identical on both sides by construction. */
+  static buildBinding({ invitationId, owner, recipient }) {
     return {
       protocolVersion: PROTOCOL_VERSION,
       invitationId,
@@ -398,25 +440,33 @@ export class Device {
       recipientEphemeralSpki: recipient.ephemeralSpki,
       ownerNonce: owner.nonce,
       recipientNonce: recipient.nonce,
-      recipientIdentitySignature,
+      recipientIdentitySignature: recipient.identitySignature,
     };
   }
 
-  /** Derives keys from the two DH contributions this device can compute. */
+  /**
+   * Derives keys using the CORRECTED schedule for this device's role.
+   * @param {'owner'|'recipient'} role
+   */
   derive(role, binding) {
     const isOwner = role === 'owner';
-    const dhA = isOwner ? this.ephemeral.agree(binding.recipientSpkSpki) : this.ephemeral.agree(binding.ownerSpkSpki);
-    const dhB = this.ephemeral.agree(binding.recipientEphemeralSpki);
-    this.derived = deriveKeySet(role, binding, [dhA, dhB]);
+    // DH1: owner uses its ephemeral against the peer's SPK; recipient uses its SPK against the peer's
+    // ephemeral. Both sides therefore compute ECDH(EK_owner, SPK_recipient).
+    const dh1 = isOwner
+      ? this.ephemeral.agree(binding.recipientSpkSpki)
+      : this.spk.agree(binding.ownerEphemeralSpki);
+    // DH2: ephemeral x ephemeral — symmetric, but each side must use the *peer's* ephemeral.
+    const dh2 = this.ephemeral.agree(
+      isOwner ? binding.recipientEphemeralSpki : binding.ownerEphemeralSpki
+    );
+    this.derived = deriveKeySet(role, binding, [dh1, dh2]);
     return this.derived;
   }
 
-  buildCommit({ invitationId, role }) {
+  buildCommit({ invitationId, role, peerDeviceId }) {
     const isOwner = role === 'owner';
-    const bindingId = invitationId;
-    const peerDeviceId = isOwner ? this.peer.deviceId : this.peer.deviceId;
     const t = commitPlaintextTranscript({
-      invitationId: bindingId,
+      invitationId,
       role,
       deviceId: this.identity.deviceId,
       peerDeviceId,
@@ -429,15 +479,14 @@ export class Device {
     const hmac = createHmac('sha256', this.derived.ownConfirmKey).update(t).digest();
     const certificate = this.identity.sign(Buffer.concat([t, hmac]));
     const plaintext = encodeCommitPlaintext(t, hmac, certificate);
-    const aad = envelopeAad(bindingId, role, 'commit');
+    const aad = envelopeAad(invitationId, role, 'commit');
     this.commit = sealEnvelope(this.derived.encryptKey, plaintext, aad);
-    this.commitIssuedAt = Number(plaintext.length) >= 0 ? t.readBigInt64BE(t.length - 8) : 0n;
     return this.commit;
   }
 
   /**
    * Verifies the peer commit exactly as the Android code does: digest → AEAD → transcript → HMAC →
-   * ECDSA certificate → deviceId binding. Returns a structured record of what was proven.
+   * ECDSA certificate.
    */
   verifyPeerCommit({ invitationId, peerRole, sealed, advertisedDigest, peerIdentitySpki, peer }) {
     const digest = sha256(sealed);
@@ -468,39 +517,45 @@ export class Device {
       certificate
     );
     if (!signatureOk) throw new Error('identity certificate invalid');
-    return {
-      peerDeviceId: peer.deviceId,
-      digest,
-      issuedAtEpochSec: issuedAt,
-      hmacVerified: true,
-      certificateVerified: true,
-    };
+    return { peerDeviceId: peer.deviceId, digest, issuedAtEpochSec: issuedAt, hmacVerified: true, certificateVerified: true };
   }
 
-  /** Persists a peer record (in-memory; the server-side retention test inspects the real DB). */
+  /** Verifies the peer's SPK self-signature before trusting/persisting it. */
+  verifyPeerSpk({ peerIdentitySpki, spkId, spkCreatedAtEpochSec, spkPublicKeySpki, spkSignature }) {
+    const key = createPublicKey({ key: peerIdentitySpki, format: 'der', type: 'spki' });
+    return verify(
+      'sha256',
+      spkTranscript({ deviceId: sha256(Buffer.concat([Buffer.from('DuoLink-DeviceId-v1'), peerIdentitySpki])).subarray(0, 16), spkId, spkCreatedAtEpochSec, spkPublicKeySpki }),
+      { key, dsaEncoding: 'der' },
+      spkSignature
+    );
+  }
+
+  /** Persists a peer record (in-memory; server-side retention is inspected via the real DB). */
   persistPeer({ peerDeviceId, peerIdentitySpki, rootKey, safetyNumber }) {
     if (this.persistedPeer && !timingSafeEqual(this.persistedPeer.peerIdentitySpki, peerIdentitySpki)) {
       throw new Error('refusing to overwrite an existing trusted peer with a different identity');
     }
-    this.persistedPeer = {
-      peerDeviceId,
-      peerIdentitySpki,
-      rootKey,
-      safetyNumber,
-      pairedAtEpochSec: Math.floor(Date.now() / 1000),
-    };
+    this.persistedPeer = { peerDeviceId, peerIdentitySpki, rootKey, safetyNumber, pairedAtEpochSec: Math.floor(Date.now() / 1000) };
     return this.persistedPeer;
   }
 
+  /**
+   * Persistence ACK: ECDSA signature by the device's *session ACK key* over the canonical ACK
+   * transcript. This is the only signature the server can verify, because it is the only one made with
+   * a public key the client registered for exactly this purpose (`ackSpki`). The long-term identity key
+   * `IK_sig` is never handed to the server.
+   */
   buildAck({ invitationId, role, commitDigestOwner, commitDigestRecipient }) {
-    const t = ackTranscript({
+    const transcript = ackTranscript({
       invitationId,
       role,
       deviceId: this.identity.deviceId,
       commitDigestOwner,
       commitDigestRecipient,
     });
-    return this.ackKey.identitySignature(t)}
+    return sign('sha256', transcript, { key: this.ackKey.privateKey, dsaEncoding: 'der' });
+  }
 }
 
 export { MAX_CIPHERTEXT_BYTES };

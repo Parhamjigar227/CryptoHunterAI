@@ -29,6 +29,8 @@ enum class RemoteFailure(val persianMessage: String, val isRetryable: Boolean, v
 
     INVALID_PEER_PUBLIC_KEY("کلید عمومی دستگاه مقابل نامعتبر است", false, true),
     INVALID_PEER_IDENTITY_SIGNATURE("امضای هویت دستگاه مقابل نامعتبر است (احتمال جعل یا دستکاری)", false, true),
+    PEER_MATERIAL_INVALID("اطلاعات عمومی دستگاه مقابل ناقص یا نامعتبر است و قابل اعتماد نیست", false, true),
+    INVALID_PEER_SPK_SIGNATURE("امضای کلید پیش‌اعزامی دستگاه مقابل با هویت اعلام‌شده مطابقت ندارد (احتمال جعل یا دستکاری)", false, true),
     TRANSCRIPT_MISMATCH("اطلاعات دست‌دادن دو دستگاه با هم مطابقت ندارد (احتمال دستکاری در میانه)", false, true),
     DEVICE_ID_MISMATCH("شناسه دستگاه مقابل با کلید هویت او هم‌خوانی ندارد", false, true),
     SELF_PAIRING_FORBIDDEN("جفت‌سازی دستگاه با خودش مجاز نیست", false, false),

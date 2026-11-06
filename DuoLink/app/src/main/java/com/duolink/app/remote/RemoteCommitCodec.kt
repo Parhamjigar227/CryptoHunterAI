@@ -2,6 +2,7 @@ package com.duolink.app.remote
 
 import com.duolink.app.crypto.ByteEncoding
 import com.duolink.app.crypto.TranscriptBuilder
+import com.duolink.app.crypto.zeroize
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.SecureRandom
@@ -39,10 +40,18 @@ object RemoteCommitCodec {
     private const val MIN_PLAINTEXT = 1 + 4 + 32 + 4 + 32 + 4 + 1
     private const val MAX_PLAINTEXT = 4096
 
+    /**
+     * Decoded commit plaintext.
+     *
+     * [issuedAtEpochSec] is the trailing timestamp of [transcript]. It is carried explicitly because the
+     * verifier must rebuild the transcript with the *peer's* timestamp; without it every peer commit
+     * failed verification (and the previous code referenced this field without ever declaring it).
+     */
     data class CommitContents(
         val transcript: ByteArray,
         val hmac: ByteArray,
-        val certificate: ByteArray
+        val certificate: ByteArray,
+        val issuedAtEpochSec: Long
     )
 
     /** Result of a successful peer-commit verification, including what was actually proven. */
@@ -245,10 +254,11 @@ object RemoteCommitCodec {
             throw RemotePairingException(RemoteFailure.CIPHERTEXT_MALFORMED, "داده اضافی در پیام تأیید")
         }
         val issuedAt = extractIssuedAt(transcript)
-        return CommitContents(transcript, hmac, certificate).also {
-            // Parsed eagerly so a malformed transcript tail fails here rather than in a caller.
-            require(issuedAt != null) { "commit transcript missing timestamp" }
-        }
+            ?: throw RemotePairingException(
+                RemoteFailure.CIPHERTEXT_MALFORMED,
+                "زمان صدور پیام تأیید در محتوا موجود نیست"
+            )
+        return CommitContents(transcript, hmac, certificate, issuedAt)
     }
 
     /** Extracts the trailing `issuedAtEpochSec` so the receiver can rebuild the transcript exactly. */
@@ -290,8 +300,4 @@ object RemoteCommitCodec {
     /** UTF-8 length of a canonical safety number, used only for sanity checks in tests. */
     fun canonicalSafetyBytes(safetyNumber: String): ByteArray =
         RemoteTranscripts.normaliseSafetyNumber(safetyNumber).toByteArray(StandardCharsets.UTF_8)
-}
-
-internal fun ByteArray.zeroize() {
-    java.util.Arrays.fill(this, 0.toByte())
 }

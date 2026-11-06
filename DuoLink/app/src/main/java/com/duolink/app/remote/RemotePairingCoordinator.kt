@@ -224,22 +224,78 @@ class RemotePairingCoordinator(
         localAckKeyProvider.rotateAckKey()
         val ephemeral = RemoteKeySchedule.generateEphemeralKeyPair(secureRandom)
         val ownerNonce = RemotePendingSessionStore.randomNonce(secureRandom)
-        // Fields are uploaded under a placeholder id first: the server assigns the invitation id, and the
-        // public material does not depend on it.
+
+        // P1.6 — the invitation id is client-assigned. Both the invitation transcript and the recipient's
+        // redeem transcript bind it, so it must exist (and be signed) before uploading, and it must reach
+        // the recipient through the QR code alone: there is no other channel before redemption.
+        val invitationId = generateInvitationId()
+
+        // Decision A — sign the canonical SPK transcript with the identity signing key. The server relays
+        // these three fields without verifying them; the peer verifies before trusting the key.
+        val spkId = identity.currentSignedPreKey.spkId
+        val spkCreatedAtEpochSec = identity.currentSignedPreKey.createdAtEpochSec
+        val spkSpki = identity.currentSignedPreKey.publicKeySpki
+        val spkSignature = keyVault.signWithIdentityKey(
+            RemoteTranscripts.spkTranscript(identity.deviceId, spkId, spkCreatedAtEpochSec, spkSpki)
+        )
+
+        // Decision B — the invitation transcript binds the *activation code hash*, never the plaintext
+        // code. The owner generates the code locally (80 bits of CSPRNG) so the hash exists before the
+        // upload: the transcript that covers it must be signed *before* the server sees anything.
+        val activationCode = ActivationCode.generate(secureRandom)
+        val activationCodeHash = ActivationCodeDigest.sha256(activationCode.displayForm)
+        val ttlSeconds = INVITATION_TTL_SECONDS
+        val expiresAtEpochSec = nowEpochSec() + ttlSeconds
+        val ackSpki = localAckKeyProvider.currentAckPublicSpki()
+        val identitySignature = keyVault.signWithIdentityKey(
+            RemoteTranscripts.invitationTranscript(
+                invitationId = invitationId,
+                activationCodeHash = activationCodeHash,
+                deviceId = identity.deviceId,
+                spkId = spkId,
+                spkCreatedAtEpochSec = spkCreatedAtEpochSec,
+                spkSignature = spkSignature,
+                identityPublicSpki = identity.identitySigningPublicKeySpki,
+                ackPublicSpki = ackSpki,
+                spkPublicSpki = spkSpki,
+                ephemeralPublicSpki = ephemeral.publicSpki,
+                nonce = ownerNonce,
+                expiresAtEpochSec = expiresAtEpochSec
+            )
+        )
         val material = SignalingApi.ParticipantMaterial(
             deviceId = identity.deviceId,
             identitySpki = identity.identitySigningPublicKeySpki,
-            ackSpki = localAckKeyProvider.currentAckPublicSpki(),
-            spkSpki = identity.currentSignedPreKey.publicKeySpki,
-            ephemeralSpki = ephemeral.publicSpki
+            ackSpki = ackSpki,
+            spkSpki = spkSpki,
+            ephemeralSpki = ephemeral.publicSpki,
+            nonce = ownerNonce,
+            identitySignature = identitySignature,
+            spkId = spkId,
+            spkCreatedAtEpochSec = spkCreatedAtEpochSec,
+            spkSignature = spkSignature
         )
-        val created = api.createInvitation(normalisedUrl, material)
+        val created = api.createInvitation(
+            baseUrl = normalisedUrl,
+            invitationId = invitationId,
+            owner = material,
+            activationCode = activationCode.displayForm,
+            ttlSeconds = ttlSeconds
+        )
         val code = ActivationCode.parse(created.activationCode)
             ?: run {
                 ephemeral.destroy()
                 throw failWith(RemoteFailure.SERVER_REJECTED_REQUEST, "کد فعال‌سازی بازگشتی نامعتبر است")
             }
-        val payload = RemoteInvitationPayload.build(code, normalisedUrl)
+        if (created.invitationId != invitationId) {
+            ephemeral.destroy()
+            throw failWith(RemoteFailure.SERVER_REJECTED_REQUEST, "شناسه دعوت بازگشتی با شناسه امضاشده مطابقت ندارد")
+        }
+        if (code.displayForm != activationCode.displayForm) {
+            ephemeral.destroy()
+            throw failWith(RemoteFailure.SERVER_REJECTED_REQUEST, "کد فعال‌سازی بازگشتی با کد امضاشده مطابقت ندارد")
+        }
+        val payload = RemoteInvitationPayload.build(code, normalisedUrl, created.invitationId)
 
         // Persist the pending session *before* the user sees it, so a crash while showing the code does
         // not orphan an invitation that only exists on the server.
@@ -347,6 +403,23 @@ class RemotePairingCoordinator(
             throw failWith(RemoteFailure.SELF_PAIRING_FORBIDDEN)
         }
 
+        // Decision A: the peer's SPK must be independently verifiable with the identity key that the
+        // invitation is bound to, BEFORE it is used for DH1 or written into the trust store.
+        verifyPeerSpkSignature(peer, peer.identitySpki)
+
+        // Decision B: the recipient signs the redeem transcript with its IK_sig; the server cannot check
+        // this, so the owner must. This is what proves the relayed material came from the redeeming device.
+        verifyPeerRedeemSignature(peer, pending.invitationId, peerEphemeral)
+
+        // P1.2 — the recipient nonce MUST come from the authenticated wire. The previous code fell back to
+        // `ByteArray(16)` / a stub, which made the owner's binding differ from the recipient's while still
+        // producing a working-looking transcript, i.e. a silent interoperability failure instead of an error.
+        val peerNonce = peer.nonce
+            ?: throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "نانس دستگاه مقابل در پیام موجود نیست")
+        if (peerNonce.size != RemoteTranscripts.NONCE_BYTES) {
+            throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "طول نانس دستگاه مقابل معتبر نیست")
+        }
+
         val binding = RemoteKeySchedule.HandshakeBinding(
             protocolVersion = RemoteTranscripts.PROTOCOL_VERSION,
             invitationId = pending.invitationId,
@@ -359,11 +432,20 @@ class RemotePairingCoordinator(
             ownerEphemeralSpki = ephemeral.publicSpki,
             recipientEphemeralSpki = peerEphemeral,
             ownerNonce = pending.ownerNonce,
-            recipientNonce = view.peerCommitDigest ?: recipientNonceFromView(view) ?: ByteArray(16),
-            recipientIdentitySignature = ByteArray(0)
+            recipientNonce = peerNonce,
+            recipientIdentitySignature = peer.identitySignature
+                ?: throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "امضای هویت دستگاه مقابل در پیام موجود نیست")
         )
         val keyChange = evaluateKeyChange(peer.identitySpki)
-        val keys = deriveForBinding(RemoteRole.OWNER, binding, ephemeral, peer.spkSpki, peerEphemeral)
+        val identity = keyVault.getOrCreateLocalIdentity(nowEpochSec())
+        val keys = deriveForBinding(
+            role = RemoteRole.OWNER,
+            binding = binding,
+            ephemeral = ephemeral,
+            localSpkId = identity.currentSignedPreKey.spkId,
+            peerSpkSpki = peer.spkSpki,
+            peerEphemeralSpki = peerEphemeral
+        )
 
         attempt?.destroy()
         attempt = AttemptSecrets(ephemeral, keys, binding)
@@ -389,22 +471,47 @@ class RemotePairingCoordinator(
         return snapshot.copy(phase = RemotePairingPhase.AWAITING_SAFETY_NUMBER_COMPARISON)
     }
 
-    private fun recipientNonceFromView(view: SignalingApi.InvitationView): ByteArray? = null
-
+    /**
+     * Computes the two DH contributions for [role] and derives the session keys.
+     *
+     * CORRECTED (Stage 1). The previous implementation computed *both* contributions from the local
+     * ephemeral key (`ecdh(ephemeral, peerSpk)` and `ecdh(ephemeral, peerEphemeral)`), which made the
+     * owner and the recipient derive different secrets and could never agree.
+     *
+     * The correct, frozen contract:
+     *   DH1 = ECDH(EK_owner, SPK_recipient)
+     *       owner     -> ecdh(localEphemeral,       peerSpkSpki)
+     *       recipient -> keyVault.agreeWithSignedPreKey(localSpkId, ownerEphemeralSpki)
+     *                    i.e. ECDH(local SPK *private* key, peer ephemeral public key)
+     *   DH2 = ECDH(EK_owner, EK_recipient) — symmetric on both roles.
+     *
+     * The recipient's side MUST use its real, published Signed PreKey private key (via the vault). It is
+     * explicitly not acceptable to substitute a second ephemeral-only DH, which would destroy the
+     * long-term binding and contradict what the peer computed.
+     */
     private fun deriveForBinding(
         role: RemoteRole,
         binding: RemoteKeySchedule.HandshakeBinding,
         ephemeral: RemoteKeySchedule.EphemeralKeyPair,
+        localSpkId: Int,
         peerSpkSpki: ByteArray,
         peerEphemeralSpki: ByteArray
     ): RemoteKeySchedule.RemoteKeySet {
-        val dhA = RemoteKeySchedule.ecdh(ephemeral.privateKey, peerSpkSpki)
-        val dhB = RemoteKeySchedule.ecdh(ephemeral.privateKey, peerEphemeralSpki)
+        val isOwner = role == RemoteRole.OWNER
+        // DH1: role-asymmetric on purpose — see the KDoc above.
+        val dh1 = if (isOwner) {
+            RemoteKeySchedule.ecdh(ephemeral.privateKey, peerSpkSpki)
+        } else {
+            keyVault.agreeWithSignedPreKey(localSpkId, peerEphemeralSpki)
+        }
+        // DH2: ephemeral x ephemeral; each side contributes its own ephemeral secret.
+        val dh2 = RemoteKeySchedule.ecdh(ephemeral.privateKey, peerEphemeralSpki)
+        val contributions = RemoteKeySchedule.DhContributions(role.wireValue, dh1, dh2)
         return try {
-            RemoteKeySchedule.deriveKeys(role.wireValue, binding, listOf(dhA, dhB))
+            RemoteKeySchedule.deriveKeys(role.wireValue, binding, contributions)
         } finally {
-            dhA.zeroize()
-            dhB.zeroize()
+            dh1.zeroize()
+            dh2.zeroize()
         }
     }
 
@@ -413,9 +520,18 @@ class RemotePairingCoordinator(
     // -------------------------------------------------------------------------------------------
 
     @Synchronized
+    /**
+     * Recipient step 1: redeem the activation code and publish this device's material.
+     *
+     * [expectedInvitationId] comes from the QR code and is **required**: the frozen redeem transcript
+     * binds the invitation id (Decision B) and the recipient must sign it before uploading anything. The
+     * value returned by the server is compared against it, so a server (or a mismatch between two QR
+     * codes) cannot silently substitute a different invitation.
+     */
     fun redeemInvitation(
         api: SignalingApi,
         serverBaseUrl: String,
+        expectedInvitationId: String,
         activationCodeInput: String,
         isDebugBuild: Boolean
     ): RemotePairingSnapshot {
@@ -429,22 +545,63 @@ class RemotePairingCoordinator(
         val code = ActivationCode.parse(activationCodeInput)
             ?: throw failWith(RemoteFailure.ACTIVATION_CODE_MALFORMED)
 
+        if (expectedInvitationId.isEmpty() || expectedInvitationId.length > 64) {
+            throw failWith(RemoteFailure.INVITATION_QR_MALFORMED)
+        }
+
         val identity = keyVault.getOrCreateLocalIdentity(nowEpochSec())
         localAckKeyProvider.rotateAckKey()
+        val ackSpki = localAckKeyProvider.currentAckPublicSpki()
         val ephemeral = RemoteKeySchedule.generateEphemeralKeyPair(secureRandom)
         val recipientNonce = RemotePendingSessionStore.randomNonce(secureRandom)
+
+        // Decision A — sign the canonical SPK transcript so the owner can verify our signed pre-key
+        // without trusting the server that relayed it.
+        val spkId = identity.currentSignedPreKey.spkId
+        val spkCreatedAtEpochSec = identity.currentSignedPreKey.createdAtEpochSec
+        val spkSpki = identity.currentSignedPreKey.publicKeySpki
+        val spkSignature = keyVault.signWithIdentityKey(
+            RemoteTranscripts.spkTranscript(identity.deviceId, spkId, spkCreatedAtEpochSec, spkSpki)
+        )
+
+        // Decision B — sign the redeem transcript, binding the QR's invitation id to exactly this
+        // device's identity, SPK, ephemeral key and nonce. The server cannot verify it; the owner does.
+        val localIdentitySignature = keyVault.signWithIdentityKey(
+            RemoteTranscripts.redeemTranscript(
+                invitationId = expectedInvitationId,
+                deviceId = identity.deviceId,
+                spkId = spkId,
+                spkCreatedAtEpochSec = spkCreatedAtEpochSec,
+                spkSignature = spkSignature,
+                identityPublicSpki = identity.identitySigningPublicKeySpki,
+                ackPublicSpki = ackSpki,
+                spkPublicSpki = spkSpki,
+                ephemeralPublicSpki = ephemeral.publicSpki,
+                nonce = recipientNonce
+            )
+        )
+
         val material = SignalingApi.ParticipantMaterial(
             deviceId = identity.deviceId,
             identitySpki = identity.identitySigningPublicKeySpki,
-            ackSpki = localAckKeyProvider.currentAckPublicSpki(),
-            spkSpki = identity.currentSignedPreKey.publicKeySpki,
-            ephemeralSpki = ephemeral.publicSpki
+            ackSpki = ackSpki,
+            spkSpki = spkSpki,
+            ephemeralSpki = ephemeral.publicSpki,
+            nonce = recipientNonce,
+            identitySignature = localIdentitySignature,
+            spkId = spkId,
+            spkCreatedAtEpochSec = spkCreatedAtEpochSec,
+            spkSignature = spkSignature
         )
         val redeemed = try {
             api.redeemInvitation(normalisedUrl, code.displayForm, material)
         } catch (e: Exception) {
             ephemeral.destroy()
             throw e
+        }
+        if (redeemed.invitationId != expectedInvitationId) {
+            ephemeral.destroy()
+            throw failWith(RemoteFailure.INVITATION_NOT_FOUND)
         }
         val view = try {
             api.getInvitation(normalisedUrl, redeemed.invitationId, redeemed.recipientToken)
@@ -471,8 +628,22 @@ class RemotePairingCoordinator(
             ephemeral.destroy()
             throw failWith(RemoteFailure.SELF_PAIRING_FORBIDDEN)
         }
-        val ownerNonce = ByteArray(16)
-        secureRandom.nextBytes(ownerNonce)
+
+        // Decision A — verify the owner's SPK self-signature with the owner's identity key.
+        try {
+            verifyPeerSpkSignature(peer, peer.identitySpki)
+        } catch (e: Exception) {
+            ephemeral.destroy()
+            throw e
+        }
+        val owner = peer
+
+        // P1.2 — the owner's nonce arrives through the authenticated invitation, never a local stub.
+        val ownerNonce = owner.nonce
+            ?: throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "نانس دستگاه صاحب دعوت در پیام موجود نیست")
+        if (ownerNonce.size != RemoteTranscripts.NONCE_BYTES) {
+            throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "طول نانس دستگاه صاحب دعوت معتبر نیست")
+        }
 
         val binding = RemoteKeySchedule.HandshakeBinding(
             protocolVersion = RemoteTranscripts.PROTOCOL_VERSION,
@@ -487,10 +658,17 @@ class RemotePairingCoordinator(
             recipientEphemeralSpki = ephemeral.publicSpki,
             ownerNonce = ownerNonce,
             recipientNonce = recipientNonce,
-            recipientIdentitySignature = ByteArray(0)
+            recipientIdentitySignature = localIdentitySignature
         )
         val keyChange = evaluateKeyChange(peer.identitySpki)
-        val keys = deriveForBinding(RemoteRole.RECIPIENT, binding, ephemeral, peer.spkSpki, peerEphemeral)
+        val keys = deriveForBinding(
+            role = RemoteRole.RECIPIENT,
+            binding = binding,
+            ephemeral = ephemeral,
+            localSpkId = identity.currentSignedPreKey.spkId,
+            peerSpkSpki = peer.spkSpki,
+            peerEphemeralSpki = peerEphemeral
+        )
 
         attempt?.destroy()
         attempt = AttemptSecrets(ephemeral, keys, binding)
@@ -622,7 +800,6 @@ class RemotePairingCoordinator(
             signWithIdentityKey = { payload -> keyVault.signWithIdentityKey(payload) },
             secureRandom = secureRandom
         )
-        voidUnused(peerSpk, peerEphemeral)
 
         val token = pending.exchangeToken?.let { String(it, Charsets.UTF_8) }
             ?: throw failWith(RemoteFailure.INVALID_STATE_TRANSITION, "توکن دسترسی جلسه موجود نیست")
@@ -785,20 +962,124 @@ class RemotePairingCoordinator(
         return snapshot
     }
 
+    /**
+     * Returns the peer's Signed Pre-Key self-signature, which the peer sent over the authenticated wire.
+     *
+     * Decision A: the wire carries `spkSignature` (ECDSA over the canonical SPK transcript, made with
+     * the peer's identity signing key). This function only *extracts* it — the caller MUST verify it
+     * with [verifyPeerSpkSignature] against the peer's identity key before the SPK is trusted or
+     * persisted. There is deliberately no fallback: an absent signature is a hard failure, because a
+     * synthesised or zero-length placeholder would launder an unverified key into the trust store.
+     */
     private fun peerSignatureFor(peer: SignalingApi.PeerMaterial): ByteArray {
-        // The peer's SPK was verified structurally when the binding was built; the pinned record stores the
-        // public key without a signature because the remote flow has no SPK certificate from the peer.
-        // An empty signature is rejected by the strict record decoder, so a self-signature is produced
-        // only when the peer explicitly supplied one; otherwise the record keeps the key and marks the
-        // signature as absent via a 64-byte zero-length-safe carrier.
-        voidUnused(peer)
-        return ByteArray(0)
+        val signature = peer.spkSignature
+            ?: throw failWith(
+                RemoteFailure.PEER_MATERIAL_INVALID,
+                "امضای کلید پیش‌اعزامی طرف مقابل در پیام وجود ندارد"
+            )
+        if (signature.size < MIN_DER_SIGNATURE_BYTES || signature.size > MAX_DER_SIGNATURE_BYTES) {
+            throw failWith(
+                RemoteFailure.PEER_MATERIAL_INVALID,
+                "امضای کلید پیش‌اعزامی طرف مقابل معتبر نیست"
+            )
+        }
+        return signature
+    }
+
+    /**
+     * Verifies the peer's SPK self-signature before the key is trusted or persisted.
+     *
+     * The peer's device id is derived exactly as Method A derives it (SHA-256 over the identity SPKI,
+     * first 16 bytes), so a peer cannot claim a device id that does not match the key it signed with.
+     */
+    internal fun verifyPeerSpkSignature(peer: SignalingApi.PeerMaterial, identityPublicSpki: ByteArray) {
+        val signature = peerSignatureFor(peer)
+        val spkSpki = peer.spkSpki
+            ?: throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "کلید پیش‌اعزامی طرف مقابل موجود نیست")
+        val spkId = peer.spkId
+            ?: throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "شناسه کلید پیش‌اعزامی طرف مقابل موجود نیست")
+        val createdAt = peer.spkCreatedAtEpochSec
+            ?: throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "زمان ساخت کلید پیش‌اعزامی طرف مقابل موجود نیست")
+        val transcript = RemoteTranscripts.spkTranscript(
+            deviceId = deviceIdFor(identityPublicSpki),
+            spkId = spkId,
+            spkCreatedAtEpochSec = createdAt,
+            spkPublicKeySpki = spkSpki
+        )
+        if (!EcP256Crypto.verifySha256Ecdsa(identityPublicSpki, transcript, signature)) {
+            throw failWith(RemoteFailure.INVALID_PEER_SPK_SIGNATURE)
+        }
+    }
+
+    /**
+     * Verifies the recipient's redeem-request signature (Decision B).
+     *
+     * The recipient signs `redeemTranscript(...)` with its `IK_sig`; the owner reconstructs the transcript
+     * from the relayed material and verifies it. A mismatch means the server, or anyone on the wire,
+     * altered a bound field — reject, do not attempt recovery.
+     */
+    internal fun verifyPeerRedeemSignature(
+        peer: SignalingApi.PeerMaterial,
+        invitationId: String,
+        peerEphemeralSpki: ByteArray
+    ) {
+        val signature = peer.identitySignature
+            ?: throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "امضای درخواست پذیرش طرف مقابل موجود نیست")
+        val spkId = peer.spkId
+            ?: throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "شناسه کلید پیش‌اعزامی طرف مقابل موجود نیست")
+        val createdAt = peer.spkCreatedAtEpochSec
+            ?: throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "زمان ساخت کلید پیش‌اعزامی طرف مقابل موجود نیست")
+        val nonce = peer.nonce
+            ?: throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "نانس طرف مقابل موجود نیست")
+        val transcript = RemoteTranscripts.redeemTranscript(
+            invitationId = invitationId,
+            deviceId = peer.deviceId,
+            spkId = spkId,
+            spkCreatedAtEpochSec = createdAt,
+            spkSignature = peerSignatureFor(peer),
+            identityPublicSpki = peer.identitySpki,
+            ackPublicSpki = peer.ackSpki,
+            spkPublicSpki = peer.spkSpki,
+            ephemeralPublicSpki = peerEphemeralSpki,
+            nonce = nonce
+        )
+        if (!EcP256Crypto.verifySha256Ecdsa(peer.identitySpki, transcript, signature)) {
+            throw failWith(
+                RemoteFailure.PEER_MATERIAL_INVALID,
+                "امضای درخواست پذیرش طرف مقابل با محتوای دریافتی مطابقت ندارد"
+            )
+        }
+    }
+
+    /** Device id derivation shared with Method A: SHA-256(identity SPKI)[0..16). */
+    private fun deviceIdFor(identityPublicSpki: ByteArray): ByteArray =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(identityPublicSpki)
+            .copyOf(16)
+
+    /**
+     * Generates a client-assigned invitation id matching the server's accepted shape
+     * (`^inv_[A-Za-z0-9_-]{16,32}$`, see `store.createInvitation`).
+     *
+     * Client-assigned by necessity: the owner's invitation transcript binds the id, so it must be fixed
+     * and signed before the upload; and the recipient must be able to bind the same value from the QR
+     * alone. 16 bytes of CSPRNG output is far beyond guessing range for a value that is not secret anyway.
+     */
+    private fun generateInvitationId(): String {
+        val bytes = ByteArray(16)
+        secureRandom.nextBytes(bytes)
+        return "inv_" + ByteEncoding.encodeBase64Url(bytes)
     }
 
     private fun localDevice(): ByteArray = keyVault.getOrCreateLocalIdentity(nowEpochSec()).deviceId
 
-    private fun voidUnused(vararg values: Any?) {
-        if (values.isEmpty()) throw IllegalStateException("suppressed value") as Exception
+    private companion object {
+        /** Invitation lifetime offered to the server; the server clamps anything it dislikes. */
+        const val INVITATION_TTL_SECONDS = 600L
+
+        /** DER-encoded P-256 ECDSA signatures are 70-72 bytes; allow a bounded range, never zero. */
+        const val MIN_DER_SIGNATURE_BYTES = 64
+        const val MAX_DER_SIGNATURE_BYTES = 80
     }
 
     // -------------------------------------------------------------------------------------------

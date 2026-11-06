@@ -14,7 +14,7 @@ jobs:
   gradle-build-and-unit-tests:
     name: Gradle 8.9 (JDK 17, SDK 35) + testDebugUnitTest + assembleDebug
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -30,13 +30,12 @@ jobs:
         id: build_step
         shell: bash
         run: |
+          cat << 'EOS' > /tmp/run_build.sh
           set -euo pipefail
-          exec > >(tee -a /tmp/job1.log) 2>&1
-
-          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_HOME="/usr/local/lib/android/sdk"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
           mkdir -p "$ANDROID_HOME"
           if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
-            echo "Installing Android commandlinetools..."
             curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdtools.zip
             mkdir -p /tmp/cmdtools-unpack "$ANDROID_HOME/cmdline-tools"
             unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools-unpack
@@ -45,8 +44,8 @@ jobs:
           fi
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
 
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/tmp/sdk1.log 2>&1 || { cat /tmp/sdk1.log; exit 1; }
 
           echo "=== Environment & Preserved Archive Checksums ==="
           java -version
@@ -59,9 +58,7 @@ jobs:
           ./gradlew --version
 
           echo "=== Gate 2: ./gradlew testDebugUnitTest ==="
-          ./gradlew testDebugUnitTest --info --stacktrace
-          echo "=== Gate 2 JUnit XML Report ==="
-          cat app/build/test-results/testDebugUnitTest/TEST-*.xml
+          ./gradlew testDebugUnitTest --stacktrace
 
           echo "=== Gate 4: ./gradlew assembleDebug assembleDebugAndroidTest ==="
           ./gradlew assembleDebug assembleDebugAndroidTest --stacktrace
@@ -72,7 +69,10 @@ jobs:
           sha256sum "$APK_PATH" | tee app/build/outputs/apk/debug/app-debug.apk.sha256
           sha256sum "$TEST_APK_PATH"
           echo "=== Debug APK Badging Metadata (aapt2) ==="
-          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK_PATH" | head -n 30
+          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK_PATH" | head -n 25
+          EOS
+          bash /tmp/run_build.sh 2>&1 | tee /tmp/job1.log
+          exit "${PIPESTATUS[0]}"
 
       - name: Upload Debug APK, SHA-256 & Unit Test Reports
         if: always()
@@ -108,8 +108,7 @@ jobs:
           xml_block = "\n".join(xml_texts)
 
           summary = f"Outcome: `{conclusion}`\nDebug APK SHA-256: `{sha_line}`\n\n### Unit Test XML\n```xml\n{xml_block[:25000]}\n```"
-          tail_log = raw[-55000:] if len(raw) > 55000 else raw
-          text = f"```text\n{tail_log}\n```"
+          text = f"```text\n{raw[-55000:]}\n```"
 
           payload = {
               "name": "Report: Gradle 8.9 + testDebugUnitTest + Debug APK",
@@ -134,7 +133,7 @@ jobs:
     name: connectedDebugAndroidTest (API ${{ matrix.api }})
     runs-on: ubuntu-24.04
     needs: gradle-build-and-unit-tests
-    timeout-minutes: 40
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -146,6 +145,13 @@ jobs:
             sysimg: "system-images;android-34;google_apis;x86_64"
             label: "API34-Android14"
     steps:
+      - name: Free Runner Disk & Enable KVM
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc || true
+          sudo chmod 666 /dev/kvm
+          df -h /
+          ls -la /dev/kvm
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -158,16 +164,18 @@ jobs:
 
       - name: Boot Emulator & Run connectedDebugAndroidTest (API ${{ matrix.api }})
         id: instr_step
+        env:
+          TARGET_API: ${{ matrix.api }}
+          TARGET_SYSIMG: ${{ matrix.sysimg }}
         shell: bash
         run: |
+          cat << 'EOS' > /tmp/run_instr.sh
           set -euo pipefail
-          exec > >(tee -a /tmp/instr.log) 2>&1
+          export ANDROID_HOME="/usr/local/lib/android/sdk"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_HOME" "$ANDROID_AVD_HOME"
 
-          sudo chmod 666 /dev/kvm
-          ls -la /dev/kvm
-
-          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          mkdir -p "$ANDROID_HOME"
           if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
             curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdtools.zip
             mkdir -p /tmp/cmdtools-unpack "$ANDROID_HOME/cmdline-tools"
@@ -177,56 +185,77 @@ jobs:
           fi
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
 
-          yes | sdkmanager --licenses > /dev/null || true
+          echo "Installing SDK packages & system image ($TARGET_SYSIMG)..."
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager "platform-tools" "emulator" "platforms;android-35" "build-tools;35.0.0" \
-            "platforms;android-${{ matrix.api }}" "${{ matrix.sysimg }}"
+            "platforms;android-${TARGET_API}" "${TARGET_SYSIMG}" >/tmp/sdk_emu.log 2>&1 || { cat /tmp/sdk_emu.log; exit 1; }
 
-          echo "no" | avdmanager create avd --force --name "duolink_avd_${{ matrix.api }}" \
-            --package "${{ matrix.sysimg }}" --abi "x86_64" --device "pixel_6"
+          echo "Creating AVD duolink_avd_${TARGET_API}..."
+          echo "no" | avdmanager create avd --force --name "duolink_avd_${TARGET_API}" \
+            --package "${TARGET_SYSIMG}" --abi "x86_64" --device "pixel"
 
-          nohup "$ANDROID_HOME/emulator/emulator" -avd "duolink_avd_${{ matrix.api }}" \
+          adb start-server </dev/null >/dev/null 2>&1 || true
+
+          "$ANDROID_HOME/emulator/emulator" -avd "duolink_avd_${TARGET_API}" \
             -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim -no-snapshot \
-            -camera-back emulated -memory 3072 > /tmp/emulator.log 2>&1 &
+            -partition-size 2048 -memory 2048 </dev/null >/tmp/emulator.log 2>&1 &
+          EMU_PID=$!
 
-          adb wait-for-device
+          cleanup() {
+            timeout 5 adb emu kill >/dev/null 2>&1 || true
+            kill -9 "$EMU_PID" >/dev/null 2>&1 || true
+            adb kill-server >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
           BOOTED=0
-          for i in $(seq 1 180); do
-            BC=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
-            if [ "$BC" = "1" ] && adb shell pm path android >/dev/null 2>&1; then
-              echo "Emulator API ${{ matrix.api }} booted cleanly in $((i*2)) seconds."
-              BOOTED=1
-              break
+          for i in $(seq 1 150); do
+            if ! kill -0 "$EMU_PID" 2>/dev/null; then
+              echo "ERROR: Emulator process exited prematurely! Emulator log:"
+              cat /tmp/emulator.log || true
+              exit 1
+            fi
+            STATE=$(timeout 5 adb get-state 2>/dev/null || true)
+            if [ "$STATE" = "device" ]; then
+              BC=$(timeout 5 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+              if [ "$BC" = "1" ] && timeout 5 adb shell pm path android >/dev/null 2>&1; then
+                echo "Emulator API ${TARGET_API} booted cleanly in $((i*2)) seconds."
+                BOOTED=1
+                break
+              fi
             fi
             sleep 2
           done
+
           if [ "$BOOTED" -ne 1 ]; then
-            echo "Emulator failed to boot within timeout; emulator log:"
-            cat /tmp/emulator.log || true
+            echo "ERROR: Emulator did not finish booting in 300s. Emulator log:"
+            tail -n 120 /tmp/emulator.log || true
             exit 1
           fi
 
-          sleep 5
-          adb shell settings put global window_animation_scale 0 || true
-          adb shell settings put global transition_animation_scale 0 || true
-          adb shell settings put global animator_duration_scale 0 || true
-          adb shell input keyevent 82 || true
+          sleep 4
+          timeout 10 adb shell settings put global window_animation_scale 0 || true
+          timeout 10 adb shell settings put global transition_animation_scale 0 || true
+          timeout 10 adb shell settings put global animator_duration_scale 0 || true
+          timeout 10 adb shell input keyevent 82 || true
 
           echo "=== Connected Android Runtime Properties ==="
-          echo "ro.build.version.sdk=$(adb shell getprop ro.build.version.sdk | tr -d '\r')"
-          echo "ro.build.version.release=$(adb shell getprop ro.build.version.release | tr -d '\r')"
-          echo "ro.product.model=$(adb shell getprop ro.product.model | tr -d '\r')"
+          echo "ro.build.version.sdk=$(timeout 5 adb shell getprop ro.build.version.sdk | tr -d '\r')"
+          echo "ro.build.version.release=$(timeout 5 adb shell getprop ro.build.version.release | tr -d '\r')"
+          echo "ro.product.model=$(timeout 5 adb shell getprop ro.product.model | tr -d '\r')"
 
           cd DuoLink
           echo "=== Executing ./gradlew connectedDebugAndroidTest ==="
-          ./gradlew connectedDebugAndroidTest --info --stacktrace
+          ./gradlew connectedDebugAndroidTest --stacktrace
+
+          echo "=== Direct AndroidJUnitRunner Status Stream Verification ==="
+          timeout 180 adb shell am instrument -w -r com.duolink.app.test/androidx.test.runner.AndroidJUnitRunner
 
           echo "=== Connected AndroidTest JUnit XML ==="
           find app/build/outputs/androidTest-results/connected -name "TEST-*.xml" -exec cat {} +
-
-          echo "=== Direct AndroidJUnitRunner Status Stream Verification ==="
-          adb shell am instrument -w -r com.duolink.app.test/androidx.test.runner.AndroidJUnitRunner
-
-          adb emu kill || true
+          EOS
+          bash /tmp/run_instr.sh 2>&1 | tee /tmp/instr.log
+          exit "${PIPESTATUS[0]}"
 
       - name: Upload Instrumentation Reports (${{ matrix.label }})
         if: always()
@@ -257,8 +286,7 @@ jobs:
           xml_block = "\n".join(xml_texts)
 
           summary = f"Outcome: `{conclusion}` (`{label}`)\n\n### Connected AndroidTest XML\n```xml\n{xml_block[:28000]}\n```"
-          tail_log = raw[-55000:] if len(raw) > 55000 else raw
-          text = f"```text\n{tail_log}\n```"
+          text = f"```text\n{raw[-55000:]}\n```"
 
           payload = {
               "name": f"Report: connectedDebugAndroidTest ({label})",

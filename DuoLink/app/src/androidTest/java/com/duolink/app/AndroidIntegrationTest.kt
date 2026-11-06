@@ -169,6 +169,87 @@ class AndroidIntegrationTest {
     }
 
     @Test
+    fun naturalApi26To30DefaultVaultUsesSoftwareWrappedSpkAndCompletesPairing() {
+        assumeTrue(
+            "Natural API 26-30 default vault test applies only to Android 8.0-11 (API 26-30)",
+            Build.VERSION.SDK_INT in Build.VERSION_CODES.O..30
+        )
+
+        val storeA = DirectoryFileByteStore(testDirA)
+        val storeB = DirectoryFileByteStore(testDirB)
+        // Default constructor (forceSoftwareSpkFallback = false) on real API 26-30 OS
+        val vaultA = AndroidKeystoreVault(appContext.packageManager, sealerA, storeA, aliasPrefix = prefixVaultA)
+        val vaultB = AndroidKeystoreVault(appContext.packageManager, sealerB, storeB, aliasPrefix = prefixVaultB)
+        val coordA = PairingCoordinator(vaultA, PeerTrustStore(storeA, sealerA))
+        val coordB = PairingCoordinator(vaultB, PeerTrustStore(storeB, sealerB))
+
+        val t0 = 1_735_000_050L
+        val reportA = vaultA.getKeyProtectionReport(t0)
+        assertTrue(reportA.identitySigningKey.isKeystoreNonExportable)
+        assertTrue(reportA.storageWrappingKey.isKeystoreNonExportable)
+        assertEquals(KeyProtectionTier.SOFTWARE_WRAPPED_AT_REST, reportA.activeSignedPreKey.tier)
+        assertFalse(reportA.activeSignedPreKey.isHardwareBacked)
+        assertFalse(reportA.activeSignedPreKey.isKeystoreNonExportable)
+
+        val offer = coordA.startInitiatorOffer(t0).getOrThrow()
+        val resp = coordB.processScannedQr(offer.qrString, t0 + 1)
+                as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+        coordA.processScannedQr(resp.acceptQrToDisplay, t0 + 2)
+        val recA = coordA.confirmSafetyFingerprint(true, t0 + 3).getOrThrow()
+        val recB = coordB.confirmSafetyFingerprint(true, t0 + 3).getOrThrow()
+        assertArrayEquals(recA.rootPairingKey, recB.rootPairingKey)
+    }
+
+    @Test
+    fun peerIdentityChangeWarningBlocksUnacknowledgedConfirmAndRequiresExplicitAck() {
+        val storeA = DirectoryFileByteStore(testDirA)
+        val storeB = DirectoryFileByteStore(testDirB)
+        val vaultA = AndroidKeystoreVault(appContext.packageManager, sealerA, storeA, aliasPrefix = prefixVaultA)
+        val vaultB = AndroidKeystoreVault(appContext.packageManager, sealerB, storeB, aliasPrefix = prefixVaultB)
+        val coordA = PairingCoordinator(vaultA, PeerTrustStore(storeA, sealerA))
+        val coordB = PairingCoordinator(vaultB, PeerTrustStore(storeB, sealerB))
+
+        val t0 = 1_735_002_000L
+        val offer1 = coordA.startInitiatorOffer(t0).getOrThrow()
+        val resp1 = coordB.processScannedQr(offer1.qrString, t0 + 1)
+                as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+        coordA.processScannedQr(resp1.acceptQrToDisplay, t0 + 2)
+        coordA.confirmSafetyFingerprint(true, t0 + 3).getOrThrow()
+        coordB.confirmSafetyFingerprint(true, t0 + 3).getOrThrow()
+
+        // Device A keeps identity (archives B's old identity); Device B rotates identity key in AndroidKeyStore
+        assertTrue(coordA.unpairForSecureRePairing(rotateDeviceIdentity = false, nowEpochSec = t0 + 10).isSuccess)
+        assertTrue(coordB.unpairForSecureRePairing(rotateDeviceIdentity = true, nowEpochSec = t0 + 10).isSuccess)
+
+        val offer2 = coordA.startInitiatorOffer(t0 + 20).getOrThrow()
+        val resp2 = coordB.processScannedQr(offer2.qrString, t0 + 21)
+                as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+        val init2 = coordA.processScannedQr(resp2.acceptQrToDisplay, t0 + 22)
+                as PairingCoordinator.QrProcessResult.InitiatorReadyToConfirm
+
+        assertTrue("Device A must detect peer identity key rotation", init2.previousPeerChanged)
+        assertFalse("Device B must see Device A kept its identity key", resp2.previousPeerChanged)
+
+        // Confirming on Device A without acknowledging key change MUST fail closed
+        assertTrue(
+            coordA.confirmSafetyFingerprint(
+                fullSafetyNumberComparedViaTrustedChannel = true,
+                nowEpochSec = t0 + 23,
+                acknowledgeKeyChange = false
+            ).isFailure
+        )
+
+        // Confirming with explicit key-change acknowledgement succeeds
+        assertTrue(
+            coordA.confirmSafetyFingerprint(
+                fullSafetyNumberComparedViaTrustedChannel = true,
+                nowEpochSec = t0 + 24,
+                acknowledgeKeyChange = true
+            ).isSuccess
+        )
+    }
+
+    @Test
     fun ecdhOnApi31PlusAndAccurateProtectionReporting() {
         assumeTrue("Hardware/Keystore ECDH requires Android 12 (API 31+)", Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
 

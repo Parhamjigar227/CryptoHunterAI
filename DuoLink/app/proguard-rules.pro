@@ -1,6 +1,2 @@
-# DuoLink R8 / ProGuard rules
--dontwarn com.google.errorprone.annotations.**
--dontwarn javax.annotation.**
--keepclassmembers class * extends com.google.crypto.tink.shaded.protobuf.GeneratedMessageLite {
-    <fields>;
-}
+# DuoLink R8 / ProGuard configuration (Milestone 2)
+# ZXing Core 3.5.4 and Jetpack Compose / CameraX carry consumer ProGuard rules in their AAR/JAR artifacts.

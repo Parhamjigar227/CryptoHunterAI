@@ -12,6 +12,7 @@ import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.qrcode.QRCodeReader
 import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
+import java.nio.ByteBuffer
 import java.util.EnumMap
 
 /**
@@ -74,8 +75,8 @@ object QrBitmapCodec {
         return decodeLuminance(yPlane, width, height)
     }
 
-    private fun extractContiguousLuminance(
-        buffer: java.nio.ByteBuffer,
+    internal fun extractContiguousLuminance(
+        buffer: ByteBuffer,
         width: Int,
         height: Int,
         rowStride: Int,
@@ -112,7 +113,7 @@ object QrBitmapCodec {
         return out
     }
 
-    private fun decodeLuminance(luminance: ByteArray, width: Int, height: Int): String? {
+    internal fun decodeLuminance(luminance: ByteArray, width: Int, height: Int): String? {
         val reader = QRCodeReader()
         try {
             val source = PlanarYUVLuminanceSource(
@@ -131,7 +132,6 @@ object QrBitmapCodec {
             reader.reset()
         }
 
-        // Fallback: try inverted luminance (e.g., if scanning inverted display)
         return try {
             val inverted = ByteArray(luminance.size) { idx -> (255 - (luminance[idx].toInt() and 0xFF)).toByte() }
             val source = PlanarYUVLuminanceSource(

@@ -1,646 +1,660 @@
 package com.duolink.app
 
 import com.duolink.app.crypto.ByteEncoding
+import com.duolink.app.crypto.DirectoryFileByteStore
 import com.duolink.app.crypto.EcP256Crypto
 import com.duolink.app.crypto.HkdfSha256
+import com.duolink.app.crypto.InMemoryByteStore
 import com.duolink.app.crypto.JcaAesGcmSealer
+import com.duolink.app.crypto.KeyProtectionTier
+import com.duolink.app.crypto.KeyVaultStorageCorruptedException
+import com.duolink.app.crypto.RawStoreRead
 import com.duolink.app.crypto.SafetyFingerprint
 import com.duolink.app.crypto.SealedSoftwareKeyVault
-import com.duolink.app.pairing.InMemoryByteStore
+import com.duolink.app.crypto.VaultHealth
+import com.duolink.app.pairing.ArchivedPeerReadResult
 import com.duolink.app.pairing.PairingCoordinator
 import com.duolink.app.pairing.PairingRejectionReason
 import com.duolink.app.pairing.PairingStateSnapshot
+import com.duolink.app.pairing.PairingValidationException
 import com.duolink.app.pairing.PeerTrustStore
+import com.duolink.app.pairing.PinnedPeerReadResult
 import com.duolink.app.pairing.QrPairingCodec
-import com.duolink.app.pairing.QrProcessResult
+import com.duolink.app.pairing.ReplayLedgerReadResult
+import com.duolink.app.pairing.TrustStoreComponent
 import org.junit.Test
+import java.io.File
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.security.GeneralSecurityException
-import java.security.KeyPairGenerator
-import java.security.spec.ECGenParameterSpec
-import kotlin.test.assertContentEquals
-import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
-import kotlin.test.assertFalse
-import kotlin.test.assertIs
-import kotlin.test.assertNotEquals
-import kotlin.test.assertNotNull
-import kotlin.test.assertNull
-import kotlin.test.assertTrue
 
 class PairingAndCryptoTest {
 
-    private class TestDevice(
-        val nowEpochSec: Long = 1_762_000_000L,
-        val byteStore: InMemoryByteStore = InMemoryByteStore(),
-        val sealer: JcaAesGcmSealer = JcaAesGcmSealer()
-    ) {
-        val vault = SealedSoftwareKeyVault(sealer = sealer, initialNowEpochSec = nowEpochSec)
-        val trustStore = PeerTrustStore(byteStore = byteStore, sealer = sealer)
-        val coordinator = PairingCoordinator(keyVault = vault, trustStore = trustStore)
-    }
+    // -------------------------------------------------------------------------
+    // 1. RFC 5869 Official HKDF-SHA256 Test Vectors
+    // -------------------------------------------------------------------------
 
     @Test
-    fun rfc5869_hkdfSha256_officialTestVectors_matchBitForBit() {
-        // RFC 5869 Appendix A.1 (SHA-256)
-        val ikm1 = ByteEncoding.fromHexStrict("0b".repeat(22))
-        val salt1 = ByteEncoding.fromHexStrict("000102030405060708090a0b0c")
-        val info1 = ByteEncoding.fromHexStrict("f0f1f2f3f4f5f6f7f8f9")
-        val expectedPrk1 = "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
-        val expectedOkm1 =
+    fun rfc5869TestVector1() {
+        val ikm = hexToBytes("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")
+        val salt = hexToBytes("000102030405060708090a0b0c")
+        val info = hexToBytes("f0f1f2f3f4f5f6f7f8f9")
+        val expectedPrk = "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
+        val expectedOkm =
             "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
 
-        val prk1 = HkdfSha256.extract(salt1, ikm1)
-        assertEquals(expectedPrk1, ByteEncoding.toHexLower(prk1))
-        val okm1 = HkdfSha256.deriveKey(ikm1, salt1, info1, 42)
-        assertEquals(expectedOkm1, ByteEncoding.toHexLower(okm1))
+        val prk = HkdfSha256.extract(salt, ikm)
+        val okm = HkdfSha256.deriveKey(ikm, salt, info, 42)
+        check(ByteEncoding.toHexLower(prk) == expectedPrk) { "RFC 5869 Case 1 PRK mismatch" }
+        check(ByteEncoding.toHexLower(okm) == expectedOkm) { "RFC 5869 Case 1 OKM mismatch" }
+    }
 
-        // RFC 5869 Appendix A.3 (SHA-256, zero-length salt & info)
-        val expectedPrk3 = "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04"
-        val expectedOkm3 =
+    @Test
+    fun rfc5869TestVector2LongInputs() {
+        val ikm = ByteArray(80) { it.toByte() }
+        val salt = ByteArray(80) { (0x60 + it).toByte() }
+        val info = ByteArray(80) { (0xb0 + it).toByte() }
+        val expectedOkm =
+            "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c" +
+                "59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71" +
+                "cc30c58179ec3e87c14c01d5c1f3434f1d87"
+        val okm = HkdfSha256.deriveKey(ikm, salt, info, 82)
+        check(ByteEncoding.toHexLower(okm) == expectedOkm) { "RFC 5869 Case 2 OKM mismatch" }
+    }
+
+    @Test
+    fun rfc5869TestVector3EmptySaltAndInfo() {
+        val ikm = hexToBytes("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")
+        val expectedOkm =
             "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"
-        val prk3 = HkdfSha256.extract(ByteArray(0), ikm1)
-        assertEquals(expectedPrk3, ByteEncoding.toHexLower(prk3))
-        val okm3 = HkdfSha256.deriveKey(ikm1, null, ByteArray(0), 42)
-        assertEquals(expectedOkm3, ByteEncoding.toHexLower(okm3))
+        val okm = HkdfSha256.deriveKey(ikm, ByteArray(0), ByteArray(0), 42)
+        check(ByteEncoding.toHexLower(okm) == expectedOkm) { "RFC 5869 Case 3 OKM mismatch" }
     }
 
+    // -------------------------------------------------------------------------
+    // 2. StorageSealer (AES-256-GCM + AAD)
+    // -------------------------------------------------------------------------
+
     @Test
-    fun aes256GcmSealer_usesFreshRandomIvAndRejectsCiphertextOrAadTampering() {
+    fun storageSealerRoundTripAndTamperRejection() {
         val sealer = JcaAesGcmSealer()
-        val plaintext = "نسرین خانم — داده محرمانه جفت‌سازی".toByteArray(StandardCharsets.UTF_8)
-        val aad = "duolink:test:v1".toByteArray(StandardCharsets.UTF_8)
+        val aad = "duolink:test:aad".toByteArray(StandardCharsets.UTF_8)
+        val secret = "نسرین خانم — تست رمزنگاری محلی".toByteArray(StandardCharsets.UTF_8)
 
-        val c1 = sealer.seal(plaintext, aad)
-        val c2 = sealer.seal(plaintext, aad)
-        assertFalse(c1.contentEquals(c2), "Repeated AES-GCM seals must never reuse IVs")
+        val sealed1 = sealer.seal(secret, aad)
+        val sealed2 = sealer.seal(secret, aad)
+        check(!sealed1.contentEquals(sealed2)) { "Random IV must make repeated seals distinct" }
+        check(sealer.unseal(sealed1, aad).contentEquals(secret)) { "Unseal failed" }
 
-        assertContentEquals(plaintext, sealer.unseal(c1, aad))
-        assertContentEquals(plaintext, sealer.unseal(c2, aad))
-
-        // Tamper 1 bit in ciphertext/tag
-        val tampered = c1.copyOf()
-        tampered[tampered.lastIndex] = (tampered.last().toInt() xor 0x01).toByte()
-        assertFailsWith<GeneralSecurityException> {
-            sealer.unseal(tampered, aad)
+        expectThrows<GeneralSecurityException>("Wrong AAD must fail GCM tag verification") {
+            sealer.unseal(sealed1, "duolink:wrong:aad".toByteArray(StandardCharsets.UTF_8))
         }
 
-        // Wrong AAD context
-        val wrongAad = "duolink:other_context:v1".toByteArray(StandardCharsets.UTF_8)
-        assertFailsWith<GeneralSecurityException> {
-            sealer.unseal(c1, wrongAad)
+        val flipped = sealed1.copyOf()
+        flipped[flipped.lastIndex] = (flipped.last().toInt() xor 0x01).toByte()
+        expectThrows<GeneralSecurityException>("Bit flip in ciphertext/tag must fail GCM") {
+            sealer.unseal(flipped, aad)
         }
     }
 
-    @Test
-    fun ecP256Validation_rejectsWrongCurveAndEnforcesDeterministicDeviceId() {
-        val device = TestDevice()
-        val spki = device.vault.getIdentityPublicKeySpki()
-        val id1 = EcP256Crypto.computeDeviceId(spki)
-        val id2 = device.vault.getDeviceId()
-        assertEquals(32, id1.length)
-        assertEquals(id1, id2)
+    // -------------------------------------------------------------------------
+    // 3. DeviceKeyVault, ECDSA-P256, ECDH-P256 & Pre-Key Rotation
+    // -------------------------------------------------------------------------
 
-        // secp384r1 key must be rejected by strict P-256 curve validator
-        val kpg384 = KeyPairGenerator.getInstance("EC")
-        kpg384.initialize(ECGenParameterSpec("secp384r1"))
-        val wrongCurveSpki = kpg384.generateKeyPair().public.encoded
-        assertFailsWith<GeneralSecurityException> {
-            EcP256Crypto.validateAndParsePublicKey(wrongCurveSpki)
+    @Test
+    fun ecdhSharedSecretSymmetryAndPreKeyRotation() {
+        val vaultA = SealedSoftwareKeyVault()
+        val vaultB = SealedSoftwareKeyVault()
+        val idA = vaultA.getOrCreateLocalIdentity(1_700_000_000L)
+        val idB = vaultB.getOrCreateLocalIdentity(1_700_000_000L)
+
+        check(EcP256Crypto.verifySignedPreKey(idA.deviceId, idA.identitySigningPublicKeySpki, idA.currentSignedPreKey))
+        check(EcP256Crypto.verifySignedPreKey(idB.deviceId, idB.identitySigningPublicKeySpki, idB.currentSignedPreKey))
+
+        val sharedAB = vaultA.agreeWithSignedPreKey(
+            localSpkId = idA.currentSignedPreKey.spkId,
+            peerPublicKeySpki = idB.currentSignedPreKey.publicKeySpki
+        )
+        val sharedBA = vaultB.agreeWithSignedPreKey(
+            localSpkId = idB.currentSignedPreKey.spkId,
+            peerPublicKeySpki = idA.currentSignedPreKey.publicKeySpki
+        )
+        check(sharedAB.contentEquals(sharedBA)) { "ECDH shared secrets must match identically" }
+
+        val spk2 = vaultA.rotateSignedPreKey(1_700_000_100L)
+        check(spk2.spkId == 2) { "Expected rotated SPK id 2" }
+        val sharedOld = vaultA.agreeWithSignedPreKey(1, idB.currentSignedPreKey.publicKeySpki)
+        check(sharedOld.contentEquals(sharedBA)) { "Retained previous SPK must still work" }
+
+        vaultA.rotateSignedPreKey(1_700_000_200L) // spk 3
+        vaultA.rotateSignedPreKey(1_700_000_300L) // spk 4 -> evicts spk 1
+        expectThrows<GeneralSecurityException>("Evicted SPK #1 must be purged") {
+            vaultA.agreeWithSignedPreKey(1, idB.currentSignedPreKey.publicKeySpki)
         }
     }
 
+    // -------------------------------------------------------------------------
+    // 4. Safety Number Symmetry & Sensitivity
+    // -------------------------------------------------------------------------
+
     @Test
-    fun happyPath_twoDeviceMutualQrPairing_derivesIdenticalSafetyNumberAndRootKey() {
-        val now = 1_762_000_000L
-        val phoneA = TestDevice(now)
-        val phoneNasrin = TestDevice(now)
+    fun safetyFingerprintIsOrderIndependentAndCollisionSensitive() {
+        val vaultA = SealedSoftwareKeyVault()
+        val vaultB = SealedSoftwareKeyVault()
+        val vaultMallory = SealedSoftwareKeyVault()
+        val idA = vaultA.getOrCreateLocalIdentity(1_700_000_000L)
+        val idB = vaultB.getOrCreateLocalIdentity(1_700_000_000L)
+        val idM = vaultMallory.getOrCreateLocalIdentity(1_700_000_000L)
 
-        // Step 1: Phone A creates OFFER QR
-        val offerSnap = phoneA.coordinator.startInitiatorOffer(now).getOrThrow()
-        assertFalse(phoneA.coordinator.isPaired())
+        val snAB = SafetyFingerprint.computeSafetyNumber(
+            idA.deviceId,
+            idA.identitySigningPublicKeySpki,
+            idB.deviceId,
+            idB.identitySigningPublicKeySpki
+        )
+        val snBA = SafetyFingerprint.computeSafetyNumber(
+            idB.deviceId,
+            idB.identitySigningPublicKeySpki,
+            idA.deviceId,
+            idA.identitySigningPublicKeySpki
+        )
+        check(snAB == snBA) { "Safety Number must be identical regardless of initiator/responder order" }
 
-        // Step 2: Nasrin's phone scans OFFER QR and creates ACCEPT QR
-        val respResult = phoneNasrin.coordinator.processScannedQr(offerSnap.offerQrUri, now + 5)
-        val responderReady = assertIs<QrProcessResult.ResponderReadyToConfirm>(respResult)
-        assertEquals(phoneA.coordinator.getLocalDeviceId(), responderReady.peerDeviceId)
-        assertFalse(phoneNasrin.coordinator.isPaired(), "Responder must NOT be paired before explicit confirmation")
+        val digitsOnly = snAB.filter { it.isDigit() }
+        check(digitsOnly.length == 60) { "Safety Number must contain exactly 60 digits, got ${digitsOnly.length}" }
 
-        // Step 3: Phone A scans Nasrin's ACCEPT QR
-        val initResult = phoneA.coordinator.processScannedQr(responderReady.acceptQrUri, now + 10)
-        val initiatorReady = assertIs<QrProcessResult.InitiatorReadyToConfirm>(initResult)
-        assertEquals(phoneNasrin.coordinator.getLocalDeviceId(), initiatorReady.peerDeviceId)
-        assertFalse(phoneA.coordinator.isPaired(), "Initiator must NOT be paired before explicit confirmation")
-
-        // Both devices must display the exact same 60-digit Safety Number & Session Verification Code
-        assertEquals(responderReady.safetyNumber, initiatorReady.safetyNumber)
-        assertEquals(12, responderReady.safetyNumber.split(" ").size)
-        assertEquals(responderReady.sessionVerificationCode, initiatorReady.sessionVerificationCode)
-
-        // Step 4: Explicit confirmation on BOTH devices
-        val recordOnA = phoneA.coordinator.confirmSafetyFingerprint(now + 15).getOrThrow()
-        assertTrue(phoneA.coordinator.isPaired())
-        assertFalse(phoneNasrin.coordinator.isPaired(), "Peer remains unpaired until its own user confirms")
-
-        val recordOnNasrin = phoneNasrin.coordinator.confirmSafetyFingerprint(now + 18).getOrThrow()
-        assertTrue(phoneNasrin.coordinator.isPaired())
-
-        // Derived 256-bit RootPairingKey must match bit-for-bit on both phones
-        assertEquals(32, recordOnA.rootPairingKey.size)
-        assertContentEquals(recordOnA.rootPairingKey, recordOnNasrin.rootPairingKey)
-        assertEquals(recordOnA.safetyNumber, recordOnNasrin.safetyNumber)
+        val snAM = SafetyFingerprint.computeSafetyNumber(
+            idA.deviceId,
+            idA.identitySigningPublicKeySpki,
+            idM.deviceId,
+            idM.identitySigningPublicKeySpki
+        )
+        check(snAB != snAM) { "MITM identity substitution must alter Safety Number" }
     }
 
-    @Test
-    fun qrTampering_modifyingPayloadOrSignatureInOfferOrAccept_isRejected() {
-        val now = 1_762_000_000L
-        val phoneA = TestDevice(now)
-        val phoneB = TestDevice(now)
-
-        val offerUri = phoneA.coordinator.startInitiatorOffer(now).getOrThrow().offerQrUri
-        val decodedOffer = (QrPairingCodec.decodeUri(offerUri) as QrPairingCodec.CodecResult.Ok).packet
-            as QrPairingCodec.DecodedQrPacket.Offer
-
-        // Tamper 1 byte in nonce while keeping original signature
-        val tamperedNonce = decodedOffer.nonce.copyOf()
-        tamperedNonce[0] = (tamperedNonce[0].toInt() xor 0xFF).toByte()
-        val forgedOfferUri = QrPairingCodec.encodeOfferUri(
-            sessionId = decodedOffer.sessionId,
-            senderDeviceId = decodedOffer.senderDeviceId,
-            senderIkSigSpki = decodedOffer.senderIkSigSpki,
-            senderSpk = decodedOffer.senderSpk,
-            nonce = tamperedNonce,
-            issuedAtEpochSec = decodedOffer.issuedAtEpochSec,
-            expiresAtEpochSec = decodedOffer.expiresAtEpochSec,
-            signature = decodedOffer.signature
-        )
-
-        val res1 = phoneB.coordinator.processScannedQr(forgedOfferUri, now + 2)
-        val rej1 = assertIs<QrProcessResult.Rejected>(res1)
-        assertEquals(PairingRejectionReason.TAMPERED_SIGNATURE, rej1.reason)
-
-        // Valid offer -> tamper signature on ACCEPT QR
-        val validResp = assertIs<QrProcessResult.ResponderReadyToConfirm>(
-            phoneB.coordinator.processScannedQr(offerUri, now + 3)
-        )
-        val decodedAccept = (QrPairingCodec.decodeUri(validResp.acceptQrUri) as QrPairingCodec.CodecResult.Ok).packet
-            as QrPairingCodec.DecodedQrPacket.Accept
-        val badSig = decodedAccept.signature.copyOf()
-        badSig[badSig.lastIndex] = (badSig.last().toInt() xor 0x01).toByte()
-        val forgedAcceptUri = QrPairingCodec.encodeAcceptUri(
-            sessionId = decodedAccept.sessionId,
-            targetPeerDeviceId = decodedAccept.targetPeerDeviceId,
-            offerTranscriptDigest = decodedAccept.offerTranscriptDigest,
-            senderDeviceId = decodedAccept.senderDeviceId,
-            senderIkSigSpki = decodedAccept.senderIkSigSpki,
-            senderSpk = decodedAccept.senderSpk,
-            nonce = decodedAccept.nonce,
-            issuedAtEpochSec = decodedAccept.issuedAtEpochSec,
-            expiresAtEpochSec = decodedAccept.expiresAtEpochSec,
-            signature = badSig
-        )
-
-        val res2 = phoneA.coordinator.processScannedQr(forgedAcceptUri, now + 5)
-        val rej2 = assertIs<QrProcessResult.Rejected>(res2)
-        assertEquals(PairingRejectionReason.TAMPERED_SIGNATURE, rej2.reason)
-    }
+    // -------------------------------------------------------------------------
+    // 5. Mutual QR Handshake Happy Path & Shared Key Equality
+    // -------------------------------------------------------------------------
 
     @Test
-    fun identitySubstitution_validAttackerKeyClaimingVictimDeviceId_isRejected() {
-        val now = 1_762_000_000L
-        val victim = TestDevice(now)
-        val attacker = TestDevice(now)
-        val responder = TestDevice(now)
+    fun mutualTwoStepQrPairingDerivesIdenticalRootKeyAndSafetyNumber() {
+        val envA = TestNode(1_700_010_000L)
+        val envB = TestNode(1_700_010_000L)
+        val t0 = 1_700_010_050L
 
-        val sessionBytes = ByteArray(16) { 0x42 }
-        val sessionId = ByteEncoding.toHexLower(sessionBytes)
-        val nonce = ByteArray(32) { 0x11 }
-        val attackerSpk = attacker.vault.getCurrentSignedPreKey(now)
+        val offer = envA.coordinator.startInitiatorOffer(t0).getOrThrow()
+        check(offer.qrString.startsWith(QrPairingCodec.URI_PREFIX))
 
-        // Attacker signs transcript claiming victim's deviceId with attacker's IK_sig
-        val fakeTranscript = QrPairingCodec.buildOfferSigningTranscript(
-            sessionId = sessionId,
-            senderDeviceId = victim.vault.getDeviceId(),
-            senderIkSigSpki = attacker.vault.getIdentityPublicKeySpki(),
-            senderSpk = attackerSpk,
-            nonce = nonce,
-            issuedAtEpochSec = now,
-            expiresAtEpochSec = now + 300
-        )
-        val sig = attacker.vault.signWithIdentity(fakeTranscript)
-        val fakeUri = QrPairingCodec.encodeOfferUri(
-            sessionId = sessionId,
-            senderDeviceId = victim.vault.getDeviceId(),
-            senderIkSigSpki = attacker.vault.getIdentityPublicKeySpki(),
-            senderSpk = attackerSpk,
-            nonce = nonce,
-            issuedAtEpochSec = now,
-            expiresAtEpochSec = now + 300,
-            signature = sig
-        )
+        val stepB = envB.coordinator.processScannedQr(offer.qrString, t0 + 5)
+        check(stepB is PairingCoordinator.QrProcessResult.ResponderReadyToConfirm)
+        check(!stepB.previousPeerChanged)
+        check(envB.trustStore.readPinnedPeer() is PinnedPeerReadResult.None) {
+            "Peer MUST NOT be persisted before explicit user Safety Number confirmation"
+        }
 
-        val res = responder.coordinator.processScannedQr(fakeUri, now + 1)
-        val rej = assertIs<QrProcessResult.Rejected>(res)
-        assertEquals(PairingRejectionReason.IDENTITY_SUBSTITUTION, rej.reason)
-    }
+        val stepA = envA.coordinator.processScannedQr(stepB.acceptQrToDisplay, t0 + 10)
+        check(stepA is PairingCoordinator.QrProcessResult.InitiatorReadyToConfirm)
+        check(stepA.safetyNumber == stepB.safetyNumber) { "Both devices must compute identical 60-digit Safety Number" }
+        check(stepA.publicHandshakeTranscriptId == stepB.publicHandshakeTranscriptId) {
+            "Both devices must compute identical public handshake transcript ID"
+        }
 
-    @Test
-    fun mitmAttacks_splicedAcceptIsRejected_andDualMitmExposesMismatchedSafetyNumbers() {
-        val now = 1_762_000_000L
-        val alice = TestDevice(now)
-        val nasrin = TestDevice(now)
-        val mallory = TestDevice(now)
-
-        // Case A: Mallory intercepts Alice's offer, creates Mallory's own offer to Nasrin,
-        // and tries to feed Nasrin's ACCEPT back to Alice -> rejected by targetPeerDeviceId / offerDigest!
-        alice.coordinator.startInitiatorOffer(now).getOrThrow()
-        val malloryOffer = mallory.coordinator.startInitiatorOffer(now).getOrThrow()
-        val nasrinAcceptToMallory = assertIs<QrProcessResult.ResponderReadyToConfirm>(
-            nasrin.coordinator.processScannedQr(malloryOffer.offerQrUri, now + 2)
-        )
-        val spliceAttempt = alice.coordinator.processScannedQr(nasrinAcceptToMallory.acceptQrUri, now + 4)
-        val spliceRej = assertIs<QrProcessResult.Rejected>(spliceAttempt)
-        assertEquals(PairingRejectionReason.WRONG_PEER_TARGET, spliceRej.reason)
-
-        // Case B: Full active dual-QR MITM (Alice <-> Mallory1 and Mallory2 <-> Nasrin)
-        val alice2 = TestDevice(now)
-        val nasrin2 = TestDevice(now)
-        val mallory2 = TestDevice(now)
-
-        val aliceOffer = alice2.coordinator.startInitiatorOffer(now).getOrThrow()
-        val malloryRespToAlice = assertIs<QrProcessResult.ResponderReadyToConfirm>(
-            mallory2.coordinator.processScannedQr(aliceOffer.offerQrUri, now + 1)
-        )
-        val aliceStage = assertIs<QrProcessResult.InitiatorReadyToConfirm>(
-            alice2.coordinator.processScannedQr(malloryRespToAlice.acceptQrUri, now + 2)
-        )
-
-        // Mallory separately initiates with Nasrin
-        val malloryFresh = TestDevice(now)
-        val malloryOffer2 = malloryFresh.coordinator.startInitiatorOffer(now + 3).getOrThrow()
-        val nasrinStage = assertIs<QrProcessResult.ResponderReadyToConfirm>(
-            nasrin2.coordinator.processScannedQr(malloryOffer2.offerQrUri, now + 4)
-        )
-
-        // Safety numbers displayed on Alice's phone and Nasrin's phone MUST strictly differ!
-        assertNotEquals(aliceStage.safetyNumber, nasrinStage.safetyNumber)
-        assertNotEquals(aliceStage.sessionVerificationCode, nasrinStage.sessionVerificationCode)
-    }
-
-    @Test
-    fun replayAttack_rescanningOfferOrAcceptEvenAfterRestart_isRejected() {
-        val now = 1_762_000_000L
-        val phoneA = TestDevice(now)
-        val sharedDisk = InMemoryByteStore()
-        val sharedSealer = JcaAesGcmSealer()
-        val phoneB = TestDevice(now, byteStore = sharedDisk, sealer = sharedSealer)
-
-        val offer = phoneA.coordinator.startInitiatorOffer(now).getOrThrow()
-        val firstScan = phoneB.coordinator.processScannedQr(offer.offerQrUri, now + 5)
-        val acceptReady = assertIs<QrProcessResult.ResponderReadyToConfirm>(firstScan)
-
-        // Immediate replay of same OFFER QR on Phone B -> rejected
-        val replay1 = phoneB.coordinator.processScannedQr(offer.offerQrUri, now + 6)
-        assertEquals(PairingRejectionReason.REPLAYED_NONCE, assertIs<QrProcessResult.Rejected>(replay1).reason)
-
-        // Simulate app process restart on Phone B (new coordinator reading sealed persistent store)
-        val phoneBRestarted = PairingCoordinator(
-            keyVault = phoneB.vault,
-            trustStore = PeerTrustStore(byteStore = sharedDisk, sealer = sharedSealer)
-        )
-        val replayAfterRestart = phoneBRestarted.processScannedQr(offer.offerQrUri, now + 10)
-        assertEquals(
-            PairingRejectionReason.REPLAYED_NONCE,
-            assertIs<QrProcessResult.Rejected>(replayAfterRestart).reason
-        )
-
-        // Initiator scans ACCEPT once -> succeeds, second scan of same ACCEPT -> REPLAYED_NONCE
-        assertIs<QrProcessResult.InitiatorReadyToConfirm>(
-            phoneA.coordinator.processScannedQr(acceptReady.acceptQrUri, now + 12)
-        )
-        val acceptReplay = phoneA.coordinator.processScannedQr(acceptReady.acceptQrUri, now + 13)
-        assertEquals(
-            PairingRejectionReason.REPLAYED_NONCE,
-            assertIs<QrProcessResult.Rejected>(acceptReplay).reason
-        )
-    }
-
-    @Test
-    fun expiredAndFutureSkewedQrPayloads_areRejected() {
-        val now = 1_762_000_000L
-        val phoneA = TestDevice(now)
-        val phoneB = TestDevice(now)
-
-        val offer = phoneA.coordinator.startInitiatorOffer(now).getOrThrow()
-
-        // Scan 10 minutes later (past 5-min TTL + 60s clock skew grace) -> EXPIRED_PAYLOAD
-        val expiredRes = phoneB.coordinator.processScannedQr(offer.offerQrUri, now + 600)
-        assertEquals(
-            PairingRejectionReason.EXPIRED_PAYLOAD,
-            assertIs<QrProcessResult.Rejected>(expiredRes).reason
-        )
-
-        // Scan when receiver clock is far behind (offer appears >60s in the future) -> EXPIRED_PAYLOAD
-        val futureSkewRes = phoneB.coordinator.processScannedQr(offer.offerQrUri, now - 120)
-        assertEquals(
-            PairingRejectionReason.EXPIRED_PAYLOAD,
-            assertIs<QrProcessResult.Rejected>(futureSkewRes).reason
-        )
-    }
-
-    @Test
-    fun selfPairingAndWrongPeerAccept_areRejected() {
-        val now = 1_762_000_000L
-        val phoneA = TestDevice(now)
-        val phoneB = TestDevice(now)
-        val phoneC = TestDevice(now)
-
-        val offerA = phoneA.coordinator.startInitiatorOffer(now).getOrThrow()
-
-        // Self-scan on Phone A -> SELF_PAIRING_ATTEMPT
-        val selfRes = phoneA.coordinator.processScannedQr(offerA.offerQrUri, now + 1)
-        assertEquals(
-            PairingRejectionReason.SELF_PAIRING_ATTEMPT,
-            assertIs<QrProcessResult.Rejected>(selfRes).reason
-        )
-
-        // Phone B creates ACCEPT addressed to Phone A; Phone C tries to scan it -> WRONG_PEER_TARGET
-        phoneC.coordinator.startInitiatorOffer(now).getOrThrow()
-        val acceptForA = assertIs<QrProcessResult.ResponderReadyToConfirm>(
-            phoneB.coordinator.processScannedQr(offerA.offerQrUri, now + 2)
-        )
-        val wrongPeerRes = phoneC.coordinator.processScannedQr(acceptForA.acceptQrUri, now + 3)
-        assertEquals(
-            PairingRejectionReason.WRONG_PEER_TARGET,
-            assertIs<QrProcessResult.Rejected>(wrongPeerRes).reason
-        )
-    }
-
-    @Test
-    fun unauthorizedThirdDevice_isStrictlyBlockedWhenAlreadyPaired() {
-        val now = 1_762_000_000L
-        val phoneA = TestDevice(now)
-        val phoneNasrin = TestDevice(now)
-        val intruder = TestDevice(now)
-
-        // Pair Phone A <-> Nasrin
-        val offer = phoneA.coordinator.startInitiatorOffer(now).getOrThrow()
-        val resp = assertIs<QrProcessResult.ResponderReadyToConfirm>(
-            phoneNasrin.coordinator.processScannedQr(offer.offerQrUri, now + 1)
-        )
-        assertIs<QrProcessResult.InitiatorReadyToConfirm>(
-            phoneA.coordinator.processScannedQr(resp.acceptQrUri, now + 2)
-        )
-        phoneA.coordinator.confirmSafetyFingerprint(now + 3).getOrThrow()
-        phoneNasrin.coordinator.confirmSafetyFingerprint(now + 3).getOrThrow()
-
-        // Phone A cannot even start a new initiator offer while paired
-        assertTrue(phoneA.coordinator.startInitiatorOffer(now + 10).isFailure)
-
-        // Intruder generates valid QR and scans on Nasrin's phone -> THIRD_DEVICE_BLOCKED
-        val intruderOffer = intruder.coordinator.startInitiatorOffer(now + 10).getOrThrow()
-        val joinAttempt = phoneNasrin.coordinator.processScannedQr(intruderOffer.offerQrUri, now + 11)
-        assertEquals(
-            PairingRejectionReason.THIRD_DEVICE_BLOCKED,
-            assertIs<QrProcessResult.Rejected>(joinAttempt).reason
-        )
-        // Original pairing remains untouched
-        assertEquals(phoneA.coordinator.getLocalDeviceId(), phoneNasrin.coordinator.getPinnedPeer()?.peerDeviceId)
-    }
-
-    @Test
-    fun keyChangeWarning_andSecureRePairingProcedure_enforceExplicitWarningAndAcknowledge() {
-        val now = 1_762_000_000L
-        val phoneA = TestDevice(now)
-        val phoneNasrinOld = TestDevice(now)
-
-        // Initial pairing: Phone A <-> Nasrin (old phone)
-        val offer1 = phoneA.coordinator.startInitiatorOffer(now).getOrThrow()
-        val resp1 = assertIs<QrProcessResult.ResponderReadyToConfirm>(
-            phoneNasrinOld.coordinator.processScannedQr(offer1.offerQrUri, now + 1)
-        )
-        assertIs<QrProcessResult.InitiatorReadyToConfirm>(
-            phoneA.coordinator.processScannedQr(resp1.acceptQrUri, now + 2)
-        )
-        val initialRecord = phoneA.coordinator.confirmSafetyFingerprint(now + 3).getOrThrow()
-        phoneNasrinOld.coordinator.confirmSafetyFingerprint(now + 3).getOrThrow()
-
-        // Nasrin gets a new phone (new identity keypair)
-        val phoneNasrinNew = TestDevice(now + 100)
-        val newNasrinOffer = phoneNasrinNew.coordinator.startInitiatorOffer(now + 100).getOrThrow()
-
-        // 1. Direct identity check surfaces KeyChangeAlert
-        assertNull(phoneA.coordinator.verifyPinnedPeerIdentityKey(phoneNasrinOld.vault.getIdentityPublicKeySpki()))
-        val directAlert = phoneA.coordinator.verifyPinnedPeerIdentityKey(
-            phoneNasrinNew.vault.getIdentityPublicKeySpki()
-        )
-        assertNotNull(directAlert)
-        assertEquals(initialRecord.safetyNumber, directAlert.previousSafetyNumber)
-        assertNotEquals(directAlert.previousSafetyNumber, directAlert.newSafetyNumber)
-
-        // 2. Scanning new phone's QR in verifyExistingPeerMode surfaces blocking PEER_KEY_CHANGED_WARNING
-        val verifyRes = phoneA.coordinator.processScannedQr(
-            rawQrText = newNasrinOffer.offerQrUri,
-            nowEpochSec = now + 105,
-            verifyExistingPeerMode = true
-        )
-        val warningRej = assertIs<QrProcessResult.Rejected>(verifyRes)
-        assertEquals(PairingRejectionReason.PEER_KEY_CHANGED_WARNING, warningRej.reason)
-        assertNotNull(warningRej.keyChangeAlert)
-        // Pinned key MUST NOT be silently overwritten!
-        assertEquals(phoneNasrinOld.vault.getDeviceId(), phoneA.coordinator.getPinnedPeer()?.peerDeviceId)
-
-        // 3. User executes Secure Re-Pairing Reset on Phone A
-        phoneA.coordinator.unpairForSecureRePairing(regenerateDeviceIdentity = false, nowEpochSec = now + 110)
-        assertIs<PairingStateSnapshot.Unpaired>(phoneA.coordinator.currentStateSnapshot(now + 110))
-
-        // 4. Phone A scans Nasrin's new phone Offer QR -> KeyChangeAlert from archived peer is attached!
-        val rePairResp = assertIs<QrProcessResult.ResponderReadyToConfirm>(
-            phoneA.coordinator.processScannedQr(newNasrinOffer.offerQrUri, now + 112)
-        )
-        assertNotNull(rePairResp.keyChangeFromPreviousPeer)
-        assertEquals(initialRecord.safetyNumber, rePairResp.keyChangeFromPreviousPeer?.previousSafetyNumber)
-
-        // Confirming WITHOUT acknowledgeKeyChange=true MUST fail!
-        assertTrue(phoneA.coordinator.confirmSafetyFingerprint(now + 115, acknowledgeKeyChange = false).isFailure)
-
-        // Confirming WITH explicit acknowledgeKeyChange=true succeeds, and Nasrin's new phone confirms too
-        val newRecordOnA = phoneA.coordinator.confirmSafetyFingerprint(
-            nowEpochSec = now + 116,
-            acknowledgeKeyChange = true
+        val recA = envA.coordinator.confirmSafetyFingerprint(
+            fullSafetyNumberComparedViaTrustedChannel = true,
+            nowEpochSec = t0 + 15
         ).getOrThrow()
-        assertIs<QrProcessResult.InitiatorReadyToConfirm>(
-            phoneNasrinNew.coordinator.processScannedQr(rePairResp.acceptQrUri, now + 117)
-        )
-        val newRecordOnNasrin = phoneNasrinNew.coordinator.confirmSafetyFingerprint(now + 118).getOrThrow()
+        val recB = envB.coordinator.confirmSafetyFingerprint(
+            fullSafetyNumberComparedViaTrustedChannel = true,
+            nowEpochSec = t0 + 15
+        ).getOrThrow()
 
-        assertEquals(phoneNasrinNew.vault.getDeviceId(), newRecordOnA.peerDeviceId)
-        assertContentEquals(newRecordOnA.rootPairingKey, newRecordOnNasrin.rootPairingKey)
-        assertNotEquals(initialRecord.rootPairingKey.toList(), newRecordOnA.rootPairingKey.toList())
+        check(recA.rootPairingKey.contentEquals(recB.rootPairingKey)) {
+            "Derived 256-bit K_pair_root must match bit-for-bit on both devices"
+        }
+        check(recA.safetyNumberVerified && recB.safetyNumberVerified)
+        check(recA.peerDeviceId.contentEquals(envB.localId.deviceId))
+        check(recB.peerDeviceId.contentEquals(envA.localId.deviceId))
+    }
+
+    // -------------------------------------------------------------------------
+    // 6. Security Rejection Tests: Tampering, Expiry, Skew, Replay, 3rd Device, MITM
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun tamperedQrPayloadIsRejected() {
+        val envA = TestNode(1_700_020_000L)
+        val envB = TestNode(1_700_020_000L)
+        val offer = envA.coordinator.startInitiatorOffer(1_700_020_010L).getOrThrow()
+
+        val rawBytes = ByteEncoding.decodeBase64UrlStrict(offer.qrString.removePrefix(QrPairingCodec.URI_PREFIX))
+        rawBytes[30] = (rawBytes[30].toInt() xor 0xFF).toByte()
+        val tamperedQr = QrPairingCodec.URI_PREFIX + ByteEncoding.encodeBase64Url(rawBytes)
+
+        val res = envB.coordinator.processScannedQr(tamperedQr, 1_700_020_015L)
+        check(res is PairingCoordinator.QrProcessResult.Rejected)
+        check(
+            res.reason == PairingRejectionReason.INVALID_IDENTITY_SIGNATURE ||
+                res.reason == PairingRejectionReason.INVALID_PUBLIC_KEY ||
+                res.reason == PairingRejectionReason.MALFORMED_PAYLOAD
+        ) { "Unexpected rejection reason for tampered QR: ${res.reason}" }
     }
 
     @Test
-    fun samePeerIdentityVerification_updatesRotatedSignedPreKeyWithoutBreakingPairing() {
-        val now = 1_762_000_000L
-        val phoneA = TestDevice(now)
-        val phoneNasrin = TestDevice(now)
+    fun expiredQrAndFutureClockSkewAreRejected() {
+        val envA = TestNode(1_700_030_000L)
+        val envB = TestNode(1_700_030_000L)
+        val t0 = 1_700_030_000L
+        val offer = envA.coordinator.startInitiatorOffer(t0).getOrThrow()
 
-        val offer = phoneA.coordinator.startInitiatorOffer(now).getOrThrow()
-        val resp = assertIs<QrProcessResult.ResponderReadyToConfirm>(
-            phoneNasrin.coordinator.processScannedQr(offer.offerQrUri, now + 1)
-        )
-        assertIs<QrProcessResult.InitiatorReadyToConfirm>(
-            phoneA.coordinator.processScannedQr(resp.acceptQrUri, now + 2)
-        )
-        phoneA.coordinator.confirmSafetyFingerprint(now + 3).getOrThrow()
-        phoneNasrin.coordinator.confirmSafetyFingerprint(now + 3).getOrThrow()
-        assertEquals(1, phoneA.coordinator.getPinnedPeer()?.peerSpkId)
+        val expiredRes = envB.coordinator.processScannedQr(offer.qrString, t0 + 301L)
+        check(expiredRes is PairingCoordinator.QrProcessResult.Rejected)
+        check(expiredRes.reason == PairingRejectionReason.EXPIRED_QR)
 
-        // Nasrin rotates her Signed Pre-Key (spkId = 2) while keeping same IK_sig
-        val rotatedSpk = phoneNasrin.coordinator.rotateSignedPreKey(now + 50)
-        assertEquals(2, rotatedSpk.spkId)
-        assertFalse(
-            phoneNasrin.vault.getIdentityPublicKeySpki().contentEquals(rotatedSpk.publicKeySpki),
-            "SPK_dh must remain distinct from IK_sig"
-        )
-
-        // Build a fresh signed verification QR carrying Nasrin's rotated SPK
-        val sessionId = ByteEncoding.toHexLower(ByteArray(16) { 0x24 })
-        val nonce = ByteArray(32) { 0x33 }
-        val transcript = QrPairingCodec.buildOfferSigningTranscript(
-            sessionId = sessionId,
-            senderDeviceId = phoneNasrin.vault.getDeviceId(),
-            senderIkSigSpki = phoneNasrin.vault.getIdentityPublicKeySpki(),
-            senderSpk = rotatedSpk,
-            nonce = nonce,
-            issuedAtEpochSec = now + 55,
-            expiresAtEpochSec = now + 355
-        )
-        val sig = phoneNasrin.vault.signWithIdentity(transcript)
-        val verifyQr = QrPairingCodec.encodeOfferUri(
-            sessionId = sessionId,
-            senderDeviceId = phoneNasrin.vault.getDeviceId(),
-            senderIkSigSpki = phoneNasrin.vault.getIdentityPublicKeySpki(),
-            senderSpk = rotatedSpk,
-            nonce = nonce,
-            issuedAtEpochSec = now + 55,
-            expiresAtEpochSec = now + 355,
-            signature = sig
-        )
-
-        val verified = assertIs<QrProcessResult.ExistingPeerVerified>(
-            phoneA.coordinator.processScannedQr(verifyQr, now + 60, verifyExistingPeerMode = true)
-        )
-        assertTrue(verified.preKeyUpdated)
-        assertEquals(2, phoneA.coordinator.getPinnedPeer()?.peerSpkId)
+        val skewRes = envB.coordinator.processScannedQr(offer.qrString, t0 - 120L)
+        check(skewRes is PairingCoordinator.QrProcessResult.Rejected)
+        check(skewRes.reason == PairingRejectionReason.FUTURE_TIMESTAMP_SKEW)
     }
 
     @Test
-    fun malformedOversizedWrongSchemeAndWrongVersionInputs_failClosedSafely() {
-        val device = TestDevice()
-        val invalidInputs = listOf(
+    fun replayedOfferAndAcceptPacketsAreRejected() {
+        val envA = TestNode(1_700_040_000L)
+        val envB = TestNode(1_700_040_000L)
+        val t0 = 1_700_040_000L
+        val offer = envA.coordinator.startInitiatorOffer(t0).getOrThrow()
+
+        val firstScan = envB.coordinator.processScannedQr(offer.qrString, t0 + 2)
+        check(firstScan is PairingCoordinator.QrProcessResult.ResponderReadyToConfirm)
+
+        envB.coordinator.cancelPendingPairing()
+        val replayScan = envB.coordinator.processScannedQr(offer.qrString, t0 + 5)
+        check(replayScan is PairingCoordinator.QrProcessResult.Rejected)
+        check(replayScan.reason == PairingRejectionReason.REPLAYED_SESSION)
+    }
+
+    @Test
+    fun selfPairingIsRejected() {
+        val envA = TestNode(1_700_050_000L)
+        val t0 = 1_700_050_000L
+        val offer = envA.coordinator.startInitiatorOffer(t0).getOrThrow()
+        val selfRes = envA.coordinator.processScannedQr(offer.qrString, t0 + 1)
+        check(selfRes is PairingCoordinator.QrProcessResult.Rejected)
+        check(selfRes.reason == PairingRejectionReason.SELF_PAIRING_FORBIDDEN)
+    }
+
+    @Test
+    fun thirdDevicePairingAttemptIsBlockedOncePaired() {
+        val envA = TestNode(1_700_060_000L)
+        val envB = TestNode(1_700_060_000L)
+        val envIntruder = TestNode(1_700_060_000L)
+        val t0 = 1_700_060_000L
+
+        val offer = envA.coordinator.startInitiatorOffer(t0).getOrThrow()
+        val resp = envB.coordinator.processScannedQr(offer.qrString, t0 + 1)
+                as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+        envA.coordinator.processScannedQr(resp.acceptQrToDisplay, t0 + 2)
+        envA.coordinator.confirmSafetyFingerprint(true, t0 + 3).getOrThrow()
+        envB.coordinator.confirmSafetyFingerprint(true, t0 + 3).getOrThrow()
+
+        val intruderOffer = envIntruder.coordinator.startInitiatorOffer(t0 + 10).getOrThrow()
+        val blockedScan = envA.coordinator.processScannedQr(intruderOffer.qrString, t0 + 11)
+        check(blockedScan is PairingCoordinator.QrProcessResult.Rejected)
+        check(blockedScan.reason == PairingRejectionReason.THIRD_DEVICE_BLOCKED)
+
+        val blockedNewOffer = envA.coordinator.startInitiatorOffer(t0 + 12)
+        check(blockedNewOffer.isFailure)
+    }
+
+    @Test
+    fun acceptPacketBoundToDifferentOfferIsRejected() {
+        val envA1 = TestNode(1_700_070_000L)
+        val envA2 = TestNode(1_700_070_000L)
+        val envB = TestNode(1_700_070_000L)
+        val t0 = 1_700_070_000L
+
+        val offer1 = envA1.coordinator.startInitiatorOffer(t0).getOrThrow()
+        envA2.coordinator.startInitiatorOffer(t0).getOrThrow()
+
+        val respTo1 = envB.coordinator.processScannedQr(offer1.qrString, t0 + 1)
+                as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+
+        val wrongTarget = envA2.coordinator.processScannedQr(respTo1.acceptQrToDisplay, t0 + 2)
+        check(wrongTarget is PairingCoordinator.QrProcessResult.Rejected)
+        check(wrongTarget.reason == PairingRejectionReason.SESSION_MISMATCH)
+    }
+
+    @Test
+    fun activeMitmQrSubstitutionProducesDivergentSafetyNumbers() {
+        val alice = TestNode(1_700_080_000L)
+        val bob = TestNode(1_700_080_000L)
+        val malloryToAlice = TestNode(1_700_080_000L)
+        val malloryToBob = TestNode(1_700_080_000L)
+        val t0 = 1_700_080_000L
+
+        val aliceOffer = alice.coordinator.startInitiatorOffer(t0).getOrThrow()
+        val mAcceptForAlice = malloryToAlice.coordinator.processScannedQr(aliceOffer.qrString, t0 + 1)
+                as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+        val aliceConfirmStage = alice.coordinator.processScannedQr(mAcceptForAlice.acceptQrToDisplay, t0 + 2)
+                as PairingCoordinator.QrProcessResult.InitiatorReadyToConfirm
+
+        val mOfferForBob = malloryToBob.coordinator.startInitiatorOffer(t0 + 1).getOrThrow()
+        val bobConfirmStage = bob.coordinator.processScannedQr(mOfferForBob.qrString, t0 + 2)
+                as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+
+        check(aliceConfirmStage.safetyNumber != bobConfirmStage.safetyNumber) {
+            "Active MITM substitution MUST yield different 60-digit Safety Numbers on Alice and Bob"
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 7. Secure Re-Pairing & Key-Change Warning Detection
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun secureRePairingFlagsKeyChangeAndRequiresExplicitAcknowledgement() {
+        val envA = TestNode(1_700_090_000L)
+        val envB = TestNode(1_700_090_000L)
+        val t0 = 1_700_090_000L
+
+        val offer1 = envA.coordinator.startInitiatorOffer(t0).getOrThrow()
+        val resp1 = envB.coordinator.processScannedQr(offer1.qrString, t0 + 1)
+                as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+        envA.coordinator.processScannedQr(resp1.acceptQrToDisplay, t0 + 2)
+        envA.coordinator.confirmSafetyFingerprint(true, t0 + 3).getOrThrow()
+        envB.coordinator.confirmSafetyFingerprint(true, t0 + 3).getOrThrow()
+
+        check(envA.coordinator.unpairForSecureRePairing(rotateDeviceIdentity = false, nowEpochSec = t0 + 100).isSuccess)
+        check(envB.coordinator.unpairForSecureRePairing(rotateDeviceIdentity = true, nowEpochSec = t0 + 100).isSuccess)
+
+        val offer2 = envA.coordinator.startInitiatorOffer(t0 + 110).getOrThrow()
+        val resp2 = envB.coordinator.processScannedQr(offer2.qrString, t0 + 111)
+                as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+        val init2 = envA.coordinator.processScannedQr(resp2.acceptQrToDisplay, t0 + 112)
+                as PairingCoordinator.QrProcessResult.InitiatorReadyToConfirm
+
+        check(init2.previousPeerChanged) { "Device A must detect that Device B's identity key changed" }
+        check(!resp2.previousPeerChanged) { "Device B must see that Device A kept the same identity key" }
+
+        val unacknowledged = envA.coordinator.confirmSafetyFingerprint(
+            fullSafetyNumberComparedViaTrustedChannel = true,
+            nowEpochSec = t0 + 115,
+            acknowledgeKeyChange = false
+        )
+        check(unacknowledged.isFailure) { "Key change must block confirmation until explicitly acknowledged" }
+
+        val acknowledged = envA.coordinator.confirmSafetyFingerprint(
+            fullSafetyNumberComparedViaTrustedChannel = true,
+            nowEpochSec = t0 + 116,
+            acknowledgeKeyChange = true
+        )
+        check(acknowledged.isSuccess)
+    }
+
+    // -------------------------------------------------------------------------
+    // 8. QR Luminance Padding Extraction & Malformed Input Resilience
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun malformedAndGarbageQrStringsAreSafelyRejected() {
+        val env = TestNode(1_700_100_000L)
+        val inputs = listOf(
             "",
-            "   ",
-            "https://example.com/pair?p=abc",
-            "duolink://pair/v1?p=",
-            "duolink://pair/v1?p=not!valid!base64==",
-            "duolink://pair/v1?p=" + "A".repeat(3000),
-            // Version 99 packet
-            "duolink://pair/v1?p=" + ByteEncoding.encodeBase64Url(ByteArray(80) { if (it == 0) 99 else 1 })
+            "https://example.com/evil",
+            "duolink://pair/v1?p=!!!not_base64!!!",
+            "duolink://pair/v1?p=" + ByteEncoding.encodeBase64Url(ByteArray(12) { 0x42 }),
+            "duolink://pair/v99?p=AAAA"
         )
-        for (raw in invalidInputs) {
-            val res = device.coordinator.processScannedQr(raw, 1_762_000_000L)
-            assertIs<QrProcessResult.Rejected>(res)
+        for (bad in inputs) {
+            val r = env.coordinator.processScannedQr(bad, 1_700_100_010L)
+            check(r is PairingCoordinator.QrProcessResult.Rejected) {
+                "Expected rejection for malformed input '$bad'"
+            }
         }
     }
 
     @Test
-    fun base64UrlStrictDecoder_rejectsPaddingWhitespaceAndTrailingBitMalleability() {
-        val original = byteArrayOf(0x01, 0x02, 0x03, 0x04)
-        val canonical = ByteEncoding.encodeBase64Url(original) // "AQIDBA"
-        assertContentEquals(original, ByteEncoding.decodeBase64UrlStrict(canonical))
+    fun forgedSpkSignatureInsideQrPacketIsRejected() {
+        val envA = TestNode(1_700_110_000L)
+        val envB = TestNode(1_700_110_000L)
+        val t0 = 1_700_110_000L
+        val offer = envA.coordinator.startInitiatorOffer(t0).getOrThrow()
 
-        // Reject '=' padding
-        assertFailsWith<IllegalArgumentException> {
-            ByteEncoding.decodeBase64UrlStrict("$canonical==")
-        }
-        // Flip unused low bits of final Base64 sextet ('A' -> 'B' changes trailing 4 zero bits)
-        val malleable = canonical.dropLast(1) + "B"
-        assertFailsWith<IllegalArgumentException> {
-            ByteEncoding.decodeBase64UrlStrict(malleable)
-        }
-    }
-
-    @Test
-    fun invalidCurveAttack_corruptedPublicKeyCoordinateOffCurve_isRejected() {
-        val kp = EcP256Crypto.generateSoftwareEcP256KeyPair()
-        val spki = kp.public.encoded.copyOf()
-        // Flip 1 bit in the X coordinate inside uncompressed EC point (last 64 bytes of 91-byte SPKI)
-        spki[spki.size - 40] = (spki[spki.size - 40].toInt() xor 0x01).toByte()
-        assertFailsWith<Exception> {
-            EcP256Crypto.validateAndParsePublicKey(spki)
-        }
-    }
-
-    @Test
-    fun keyPurposeSeparation_reusingIdentitySigningKeyAsSignedPreKey_isRejected() {
-        val now = 1_762_000_000L
-        val device = TestDevice(now)
-        val ikSpki = device.vault.getIdentityPublicKeySpki()
-        val deviceId = device.vault.getDeviceId()
-        val badTranscript = EcP256Crypto.buildSignedPreKeyTranscript(
-            deviceId = deviceId,
-            spkId = 99,
-            issuedAtEpochSec = now,
-            expiresAtEpochSec = now + 3600,
-            spkPublicKeySpki = ikSpki // Illegally reusing IK_sig as SPK_dh
+        val decoded = QrPairingCodec.decodeAndVerifySignatures(offer.qrString)
+        val forgedSpkSig: ByteArray = decoded.senderSpk.signatureByIdentityKey.copyOf()
+        forgedSpkSig[forgedSpkSig.size - 1] = (forgedSpkSig[forgedSpkSig.size - 1].toInt() xor 0x01).toByte()
+        val forgedIdentity = com.duolink.app.crypto.LocalIdentityPublic(
+            deviceId = decoded.senderDeviceId,
+            identitySigningPublicKeySpki = decoded.senderIkSigSpki,
+            currentSignedPreKey = decoded.senderSpk.copyOfWithSig(forgedSpkSig)
         )
-        val sig = device.vault.signWithIdentity(badTranscript)
-        val reusedSpk = com.duolink.app.crypto.SignedPreKeyPublic(
-            spkId = 99,
-            publicKeySpki = ikSpki,
-            issuedAtEpochSec = now,
-            expiresAtEpochSec = now + 3600,
-            signature = sig
+        val reSignedQrWithBadSpk = QrPairingCodec.encodeSignedPacket(
+            role = decoded.role,
+            sessionId = decoded.sessionId,
+            issuedAtEpochSec = decoded.issuedAtEpochSec,
+            expiresAtEpochSec = decoded.expiresAtEpochSec,
+            localIdentity = forgedIdentity,
+            senderNonce = decoded.senderNonce,
+            targetInitiatorDeviceId = null,
+            boundOfferDigest = null,
+            keyVault = envA.vault
         )
-        assertFalse(EcP256Crypto.verifySignedPreKey(deviceId, ikSpki, reusedSpk))
+
+        val res = envB.coordinator.processScannedQr(reSignedQrWithBadSpk, t0 + 2)
+        check(res is PairingCoordinator.QrProcessResult.Rejected)
+        check(res.reason == PairingRejectionReason.INVALID_SPK_SIGNATURE) {
+            "Expected INVALID_SPK_SIGNATURE, got ${res.reason}"
+        }
     }
 
     @Test
-    fun directoryFileByteStore_persistsEncryptedTrustStoreAndFailsClosedOnDiskTampering() {
-        val tempDir = java.nio.file.Files.createTempDirectory("duolink_store_test").toFile()
+    fun invalidNonP256SpkiIsRejected() {
+        val fakeSpki = ByteArray(91) { 0x30 }
+        expectThrows<GeneralSecurityException>("Malformed SPKI must be rejected") {
+            EcP256Crypto.decodeAndValidateP256PublicKey(fakeSpki)
+        }
+    }
+
+    @Test
+    fun canonicalBase64UrlAndQrBinaryCodecRejectNonCanonicalAndTrailingBytes() {
+        val envA = TestNode(1_700_120_000L)
+        val t0 = 1_700_120_000L
+        val offer = envA.coordinator.startInitiatorOffer(t0).getOrThrow()
+
+        // 1) Appending a trailing byte inside the Base64URL payload MUST fail strict wire decoding
+        val raw = ByteEncoding.decodeBase64UrlStrict(offer.qrString.removePrefix(QrPairingCodec.URI_PREFIX))
+        val withTrailing = raw + byteArrayOf(0x00)
+        val trailingQr = QrPairingCodec.URI_PREFIX + ByteEncoding.encodeBase64Url(withTrailing)
+        expectThrows<PairingValidationException>("Trailing bytes in QR packet must be rejected") {
+            QrPairingCodec.decodeAndVerifySignatures(trailingQr)
+        }
+
+        // 2) Padding '=' in Base64URL must be rejected by strict canonical decoder
+        expectThrows<IllegalArgumentException>("Base64URL padding must be rejected") {
+            ByteEncoding.decodeBase64UrlStrict("AQID=")
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 9. NEW MILESTONE 2 REVIEW REGRESSION TESTS (Findings 1, 2, 3, 6)
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun corruptedArchivedPeerBlocksRePairingFailClosedUntilExplicitRecovery() {
+        val envA = TestNode(1_700_200_000L)
+        val envB = TestNode(1_700_200_000L)
+        val envC = TestNode(1_700_200_000L)
+        val t0 = 1_700_200_000L
+
+        // Pair A & B, then unpair A so archived_peer_v1 is recorded on A
+        val offer1 = envA.coordinator.startInitiatorOffer(t0).getOrThrow()
+        val resp1 = envB.coordinator.processScannedQr(offer1.qrString, t0 + 1)
+                as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+        envA.coordinator.processScannedQr(resp1.acceptQrToDisplay, t0 + 2)
+        envA.coordinator.confirmSafetyFingerprint(true, t0 + 3).getOrThrow()
+        envB.coordinator.confirmSafetyFingerprint(true, t0 + 3).getOrThrow()
+
+        check(envA.coordinator.unpairForSecureRePairing(false, t0 + 10).isSuccess)
+        check(envA.trustStore.readArchivedPreviousPeer() is ArchivedPeerReadResult.Valid)
+
+        // Flip 1 bit in archived_peer_v1 -> MUST NOT return None! MUST block re-pairing fail-closed!
+        envA.trustRawStore.corruptRawBytesForTesting(PeerTrustStore.KEY_ARCHIVED_PEER) { bytes ->
+            bytes.also { it[it.lastIndex] = (it.last().toInt() xor 0x01).toByte() }
+        }
+        val corruptedRead = envA.trustStore.readArchivedPreviousPeer()
+        check(corruptedRead is ArchivedPeerReadResult.Corrupted) {
+            "Corrupted archived_peer_v1 MUST return Corrupted, got $corruptedRead"
+        }
+
+        val snap = envA.coordinator.currentStateSnapshot(t0 + 12)
+        check(snap is PairingStateSnapshot.TrustStorageCorrupted && snap.component == TrustStoreComponent.ARCHIVED_PEER)
+
+        // Offer creation, QR scanning, and normal unpairing MUST all fail closed
+        check(envA.coordinator.startInitiatorOffer(t0 + 13).isFailure)
+        val incomingFromC = envC.coordinator.startInitiatorOffer(t0 + 13).getOrThrow()
+        val scanRes = envA.coordinator.processScannedQr(incomingFromC.qrString, t0 + 14)
+        check(scanRes is PairingCoordinator.QrProcessResult.Rejected)
+        check(scanRes.reason == PairingRejectionReason.TRUST_STORAGE_CORRUPTED)
+        check(envA.coordinator.unpairForSecureRePairing(false, t0 + 15).isFailure)
+
+        // Recovery without explicit confirmation MUST fail
+        check(envA.coordinator.recoverFromCorruptedStorage(confirmDestructiveRecovery = false, nowEpochSec = t0 + 16).isFailure)
+
+        // Explicit destructive recovery succeeds, rotates device identity, and restores UnpairedIdle
+        val oldDeviceIdHex = envA.localId.deviceIdHex
+        val freshIdentity = envA.coordinator.recoverFromCorruptedStorage(
+            confirmDestructiveRecovery = true,
+            nowEpochSec = t0 + 17
+        ).getOrThrow()
+        check(freshIdentity.deviceIdHex != oldDeviceIdHex) {
+            "Explicit recovery must issue a fresh device identity"
+        }
+        check(envA.coordinator.currentStateSnapshot(t0 + 18) is PairingStateSnapshot.UnpairedIdle)
+
+        // Also test 0-byte truncation of archived_peer_v1 -> MUST also return Corrupted
+        envA.trustRawStore.writeZeroByteEntryForTesting(PeerTrustStore.KEY_ARCHIVED_PEER)
+        check(envA.trustStore.readArchivedPreviousPeer() is ArchivedPeerReadResult.Corrupted)
+    }
+
+    @Test
+    fun corruptedPinnedPeerAndDeletedOrCorruptedReplayLedgerFailClosed() {
+        val envA = TestNode(1_700_210_000L)
+        val envB = TestNode(1_700_210_000L)
+        val t0 = 1_700_210_000L
+
+        val offer = envA.coordinator.startInitiatorOffer(t0).getOrThrow()
+        val resp = envB.coordinator.processScannedQr(offer.qrString, t0 + 1)
+                as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+        envA.coordinator.processScannedQr(resp.acceptQrToDisplay, t0 + 2)
+        envA.coordinator.confirmSafetyFingerprint(true, t0 + 3).getOrThrow()
+        envB.coordinator.confirmSafetyFingerprint(true, t0 + 3).getOrThrow()
+
+        // 1) Deleting replay_ledger_v1 alongside active pinned_peer_v1 MUST be flagged as Corrupted!
+        envA.trustRawStore.delete(PeerTrustStore.KEY_REPLAY_LEDGER)
+        val snapDeletedReplay = envA.coordinator.currentStateSnapshot(t0 + 5)
+        check(
+            snapDeletedReplay is PairingStateSnapshot.TrustStorageCorrupted &&
+                snapDeletedReplay.component == TrustStoreComponent.REPLAY_LEDGER
+        ) { "Deleting replay_ledger_v1 while paired MUST fail closed, got $snapDeletedReplay" }
+
+        // 2) Corrupting replay_ledger_v1 bytes on Device B MUST fail closed instead of resetting to empty list!
+        envB.trustRawStore.corruptRawBytesForTesting(PeerTrustStore.KEY_REPLAY_LEDGER) { bytes ->
+            bytes.also { it[it.lastIndex] = (it.last().toInt() xor 0x55).toByte() }
+        }
+        check(envB.trustStore.readReplayLedger() is ReplayLedgerReadResult.Corrupted)
+        check(envB.coordinator.unpairForSecureRePairing(false, t0 + 6).isFailure)
+
+        // 3) Recover Device B, pair again, then corrupt pinned_peer_v1 -> MUST fail closed!
+        envA.coordinator.recoverFromCorruptedStorage(true, t0 + 7).getOrThrow()
+        envB.coordinator.recoverFromCorruptedStorage(true, t0 + 7).getOrThrow()
+        val offer2 = envA.coordinator.startInitiatorOffer(t0 + 8).getOrThrow()
+        val resp2 = envB.coordinator.processScannedQr(offer2.qrString, t0 + 9)
+                as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+        envA.coordinator.processScannedQr(resp2.acceptQrToDisplay, t0 + 10)
+        envA.coordinator.confirmSafetyFingerprint(true, t0 + 11).getOrThrow()
+
+        envA.trustRawStore.corruptRawBytesForTesting(PeerTrustStore.KEY_PINNED_PEER) { bytes ->
+            bytes.also { it[10] = (it[10].toInt() xor 0xFF).toByte() }
+        }
+        check(envA.trustStore.readPinnedPeer() is PinnedPeerReadResult.Corrupted)
+        val snapPinnedCorrupt = envA.coordinator.currentStateSnapshot(t0 + 12)
+        check(
+            snapPinnedCorrupt is PairingStateSnapshot.TrustStorageCorrupted &&
+                snapPinnedCorrupt.component == TrustStoreComponent.PINNED_PEER
+        )
+    }
+
+    @Test
+    fun corruptedOrDeletedSpkMetadataAndSealedSpkFailClosed() {
+        val sealer = JcaAesGcmSealer()
+        val vaultStore = InMemoryByteStore()
+        val vault = SealedSoftwareKeyVault(sealer = sealer, byteStore = vaultStore)
+        val trustStore = PeerTrustStore(InMemoryByteStore(), sealer)
+        val coordinator = PairingCoordinator(vault, trustStore)
+        val t0 = 1_700_220_000L
+
+        vault.getOrCreateLocalIdentity(t0)
+        check(vault.checkVaultHealth() is VaultHealth.Healthy)
+
+        // Case 1: Corrupt spk_entries_v2 -> MUST NOT return emptyList() or reset spkId to 1!
+        val originalSpkMeta = (vaultStore.readState("spk_entries_v2") as RawStoreRead.Present).bytes
+        vaultStore.corruptRawBytesForTesting("spk_entries_v2") { bytes ->
+            bytes.also { it[it.lastIndex] = (it.last().toInt() xor 0x01).toByte() }
+        }
+        check(vault.checkVaultHealth() is VaultHealth.Corrupted)
+        expectThrows<KeyVaultStorageCorruptedException>("Corrupted SPK metadata must throw fail-closed") {
+            vault.getOrCreateLocalIdentity(t0 + 1)
+        }
+        val snap1 = coordinator.currentStateSnapshot(t0 + 1)
+        check(snap1 is PairingStateSnapshot.TrustStorageCorrupted && snap1.component == TrustStoreComponent.KEY_VAULT)
+        check(coordinator.startInitiatorOffer(t0 + 1).isFailure)
+
+        // Restore valid spk_entries_v2, then test deleting spk_entries_v2 while vault_init_v2 remains
+        vaultStore.write("spk_entries_v2", originalSpkMeta)
+        check(vault.checkVaultHealth() is VaultHealth.Healthy)
+        vaultStore.delete("spk_entries_v2")
+        check(vault.checkVaultHealth() is VaultHealth.Corrupted)
+
+        // Restore valid spk_entries_v2, then corrupt sealed_spk_v2_1 private key blob
+        vaultStore.write("spk_entries_v2", originalSpkMeta)
+        vaultStore.corruptRawBytesForTesting("sealed_spk_v2_1") { bytes ->
+            bytes.also { it[it.lastIndex] = (it.last().toInt() xor 0x0F).toByte() }
+        }
+        check(vault.checkVaultHealth() is VaultHealth.Corrupted)
+
+        // Explicit coordinator recovery restores vault & trust health cleanly
+        check(coordinator.recoverFromCorruptedStorage(confirmDestructiveRecovery = true, nowEpochSec = t0 + 5).isSuccess)
+        check(vault.checkVaultHealth() is VaultHealth.Healthy)
+    }
+
+    @Test
+    fun atomicDirectoryFileByteStoreCrashRecoveryAndZeroByteDetection() {
+        val tempDir = Files.createTempDirectory("duolink_crash_test").toFile()
         try {
-            val now = 1_762_000_000L
-            val sealer = JcaAesGcmSealer()
-            val fileStore = com.duolink.app.pairing.DirectoryFileByteStore(tempDir)
-            val phoneA = PairingCoordinator(
-                keyVault = SealedSoftwareKeyVault(sealer, now),
-                trustStore = PeerTrustStore(fileStore, sealer)
-            )
-            val phoneB = TestDevice(now)
+            val fileStore = DirectoryFileByteStore(tempDir)
+            val committedPayload = "committed-v1-security-record".toByteArray(StandardCharsets.UTF_8)
+            fileStore.write("pinned_peer_v1", committedPayload)
 
-            val offer = phoneA.startInitiatorOffer(now).getOrThrow()
-            val resp = assertIs<QrProcessResult.ResponderReadyToConfirm>(
-                phoneB.coordinator.processScannedQr(offer.offerQrUri, now + 1)
-            )
-            assertIs<QrProcessResult.InitiatorReadyToConfirm>(
-                phoneA.processScannedQr(resp.acceptQrUri, now + 2)
-            )
-            val saved = phoneA.confirmSafetyFingerprint(now + 3).getOrThrow()
+            // 1) Simulate crash during an update write leaving an incomplete .tmp file alongside intact .bin
+            val orphanUpdateTmp = File(tempDir, "pinned_peer_v1.bin.tmp")
+            orphanUpdateTmp.writeBytes(byteArrayOf(0x01, 0x02))
+            val readAfterUpdateCrash = fileStore.readState("pinned_peer_v1")
+            check(readAfterUpdateCrash is RawStoreRead.Present && readAfterUpdateCrash.bytes.contentEquals(committedPayload)) {
+                "Committed record must survive interrupted .tmp update intact"
+            }
+            check(!orphanUpdateTmp.exists()) { "Orphaned .tmp file must be cleaned up on read" }
 
-            // Reload from disk using same key
-            val reloadedStore = PeerTrustStore(com.duolink.app.pairing.DirectoryFileByteStore(tempDir), sealer)
-            val reloaded = reloadedStore.loadPinnedPeer()
-            assertNotNull(reloaded)
-            assertEquals(saved.safetyNumber, reloaded.safetyNumber)
-            assertContentEquals(saved.rootPairingKey, reloaded.rootPairingKey)
+            // 2) Simulate crash during initial creation before .bin ever existed
+            val orphanInitialTmp = File(tempDir, "never_committed.bin.tmp")
+            orphanInitialTmp.writeBytes(byteArrayOf(0xAA.toByte()))
+            val readInitialCrash = fileStore.readState("never_committed")
+            check(readInitialCrash is RawStoreRead.Missing)
+            check(!orphanInitialTmp.exists())
 
-            // Corrupt 1 byte in encrypted file on disk -> must fail closed with GeneralSecurityException
-            val rawBytes = fileStore.read("pinned_peer_v1")!!
-            rawBytes[rawBytes.lastIndex] = (rawBytes.last().toInt() xor 0x01).toByte()
-            fileStore.write("pinned_peer_v1", rawBytes)
-            assertFailsWith<GeneralSecurityException> {
-                reloadedStore.loadPinnedPeer()
+            // 3) Simulate 0-byte truncated security file on disk -> MUST return CorruptedIo, NEVER Missing!
+            val truncatedBin = File(tempDir, "archived_peer_v1.bin")
+            truncatedBin.writeBytes(ByteArray(0))
+            val zeroRead = fileStore.readState("archived_peer_v1")
+            check(zeroRead is RawStoreRead.CorruptedIo) {
+                "Zero-byte security file MUST be reported as CorruptedIo, got $zeroRead"
             }
         } finally {
             tempDir.deleteRecursively()
@@ -648,20 +662,162 @@ class PairingAndCryptoTest {
     }
 
     @Test
-    fun expiredStagedConfirmation_cannotBeConfirmedAfterTtlWindow() {
-        val now = 1_762_000_000L
-        val phoneA = TestDevice(now)
-        val phoneB = TestDevice(now)
+    fun keyProtectionReportSeparatesIdentityWrappingAndSoftwareSpkHonestly() {
+        val vault = SealedSoftwareKeyVault()
+        val report = vault.getKeyProtectionReport(1_700_230_000L)
 
-        val offer = phoneA.coordinator.startInitiatorOffer(now).getOrThrow()
-        assertIs<QrProcessResult.ResponderReadyToConfirm>(
-            phoneB.coordinator.processScannedQr(offer.offerQrUri, now + 2)
+        check(report.activeSignedPreKey.tier == KeyProtectionTier.SOFTWARE_WRAPPED_AT_REST)
+        check(!report.activeSignedPreKey.isHardwareBacked) {
+            "Software-wrapped SPK_dh MUST NEVER claim hardware backing"
+        }
+        check(!report.activeSignedPreKey.isKeystoreNonExportable) {
+            "Software-wrapped SPK_dh MUST NEVER claim Keystore non-exportability"
+        }
+        check(report.identitySigningKey.keyRolePersian != report.storageWrappingKey.keyRolePersian)
+        check(report.storageWrappingKey.keyRolePersian != report.activeSignedPreKey.keyRolePersian)
+    }
+
+    @Test
+    fun confirmSafetyFingerprintRequiresFull60DigitTrustedChannelComparison() {
+        val envA = TestNode(1_700_240_000L)
+        val envB = TestNode(1_700_240_000L)
+        val t0 = 1_700_240_000L
+
+        val offer = envA.coordinator.startInitiatorOffer(t0).getOrThrow()
+        val resp = envB.coordinator.processScannedQr(offer.qrString, t0 + 1)
+                as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+        val init = envA.coordinator.processScannedQr(resp.acceptQrToDisplay, t0 + 2)
+                as PairingCoordinator.QrProcessResult.InitiatorReadyToConfirm
+
+        check(init.publicHandshakeTranscriptId.length == 14) { "Expected XXXX-XXXX-XXXX diagnostic ID" }
+        check(init.safetyNumber.filter { it.isDigit() }.length == 60)
+
+        // Attempting to confirm without comparing all 60 digits via trusted channel MUST fail!
+        val rejected = envA.coordinator.confirmSafetyFingerprint(
+            fullSafetyNumberComparedViaTrustedChannel = false,
+            nowEpochSec = t0 + 3
+        )
+        check(rejected.isFailure)
+        check(envA.trustStore.readPinnedPeer() is PinnedPeerReadResult.None)
+
+        // Confirming after full 60-digit verification succeeds
+        check(envA.coordinator.confirmSafetyFingerprint(true, t0 + 4).isSuccess)
+    }
+
+    @Test
+    fun simulatedProcessRestartPreservesIdentityTrustReplayAndMonotonicSpkId() {
+        val dirA = Files.createTempDirectory("duolink_restart_a").toFile()
+        val dirB = Files.createTempDirectory("duolink_restart_b").toFile()
+        val fixedMskA = ByteArray(32) { (0x11 + it).toByte() }
+        val fixedMskB = ByteArray(32) { (0x61 + it).toByte() }
+        val t0 = 1_700_250_000L
+
+        try {
+            val usedOfferQr: String
+            val initialIdHexA: String
+            val pairedRootHex: String
+
+            // Process lifetime #1
+            run {
+                val sealerA = JcaAesGcmSealer(fixedMskA)
+                val sealerB = JcaAesGcmSealer(fixedMskB)
+                val vaultA = SealedSoftwareKeyVault(sealerA, DirectoryFileByteStore(dirA))
+                val vaultB = SealedSoftwareKeyVault(sealerB, DirectoryFileByteStore(dirB))
+                initialIdHexA = vaultA.getOrCreateLocalIdentity(t0).deviceIdHex
+
+                // Rotate SPK 4 times so SPK #1 and #2 are pruned, highestIssuedSpkId == 5
+                repeat(4) { idx -> vaultA.rotateSignedPreKey(t0 + idx + 1) }
+                check(vaultA.getOrCreateLocalIdentity(t0 + 5).currentSignedPreKey.spkId == 5)
+
+                val coordA = PairingCoordinator(vaultA, PeerTrustStore(DirectoryFileByteStore(dirA), sealerA))
+                val coordB = PairingCoordinator(vaultB, PeerTrustStore(DirectoryFileByteStore(dirB), sealerB))
+
+                val offer = coordA.startInitiatorOffer(t0 + 10).getOrThrow()
+                usedOfferQr = offer.qrString
+                val resp = coordB.processScannedQr(usedOfferQr, t0 + 11)
+                        as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+                coordA.processScannedQr(resp.acceptQrToDisplay, t0 + 12)
+                val recA = coordA.confirmSafetyFingerprint(true, t0 + 13).getOrThrow()
+                coordB.confirmSafetyFingerprint(true, t0 + 13).getOrThrow()
+                pairedRootHex = ByteEncoding.toHexLower(recA.rootPairingKey)
+            }
+
+            // Process lifetime #2 (brand-new objects over persisted DirectoryFileByteStore)
+            run {
+                val sealerA = JcaAesGcmSealer(fixedMskA)
+                val sealerB = JcaAesGcmSealer(fixedMskB)
+                val vaultA = SealedSoftwareKeyVault(sealerA, DirectoryFileByteStore(dirA))
+                val vaultB = SealedSoftwareKeyVault(sealerB, DirectoryFileByteStore(dirB))
+
+                val reloadedIdA = vaultA.getOrCreateLocalIdentity(t0 + 20)
+                check(reloadedIdA.deviceIdHex == initialIdHexA) { "Device ID must persist across restart" }
+                check(reloadedIdA.currentSignedPreKey.spkId == 5) { "Active SPK ID #5 must persist across restart" }
+
+                val rotatedAfterRestart = vaultA.rotateSignedPreKey(t0 + 21)
+                check(rotatedAfterRestart.spkId == 6) { "Monotonic SPK ID must advance to 6 after restart" }
+
+                val coordA = PairingCoordinator(vaultA, PeerTrustStore(DirectoryFileByteStore(dirA), sealerA))
+                val coordB = PairingCoordinator(vaultB, PeerTrustStore(DirectoryFileByteStore(dirB), sealerB))
+
+                val snapA = coordA.currentStateSnapshot(t0 + 22) as PairingStateSnapshot.PairedActive
+                check(ByteEncoding.toHexLower(snapA.peerRecord.rootPairingKey) == pairedRootHex)
+
+                // Unpair B and verify persistent replay ledger on disk still blocks usedOfferQr after restart!
+                check(coordB.unpairForSecureRePairing(false, t0 + 25).isSuccess)
+                val replayAfterRestart = coordB.processScannedQr(usedOfferQr, t0 + 26)
+                check(replayAfterRestart is PairingCoordinator.QrProcessResult.Rejected)
+                check(replayAfterRestart.reason == PairingRejectionReason.REPLAYED_SESSION)
+            }
+        } finally {
+            dirA.deleteRecursively()
+            dirB.deleteRecursively()
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    private class TestNode(initEpochSec: Long) {
+        val sealer = JcaAesGcmSealer()
+        val vaultRawStore = InMemoryByteStore()
+        val trustRawStore = InMemoryByteStore()
+        val vault = SealedSoftwareKeyVault(sealer = sealer, byteStore = vaultRawStore)
+        val localId = vault.getOrCreateLocalIdentity(initEpochSec)
+        val trustStore = PeerTrustStore(trustRawStore, sealer)
+        val coordinator = PairingCoordinator(vault, trustStore)
+    }
+
+    private fun com.duolink.app.crypto.SignedPreKeyPublic.copyOfWithSig(
+        newSig: ByteArray
+    ): com.duolink.app.crypto.SignedPreKeyPublic =
+        com.duolink.app.crypto.SignedPreKeyPublic(
+            spkId = this.spkId,
+            publicKeySpki = this.publicKeySpki,
+            signatureByIdentityKey = newSig,
+            createdAtEpochSec = this.createdAtEpochSec
         )
 
-        // Attempt to confirm 15 minutes later (past expiry) -> rejected and state cleared
-        val lateConfirm = phoneB.coordinator.confirmSafetyFingerprint(now + 900)
-        assertTrue(lateConfirm.isFailure)
-        assertFalse(phoneB.coordinator.isPaired())
-        assertIs<PairingStateSnapshot.Unpaired>(phoneB.coordinator.currentStateSnapshot(now + 900))
+    private fun hexToBytes(hex: String): ByteArray {
+        val clean = hex.trim()
+        return ByteArray(clean.length / 2) { idx ->
+            clean.substring(idx * 2, idx * 2 + 2).toInt(16).toByte()
+        }
+    }
+
+    private inline fun <reified T : Throwable> expectThrows(message: String, block: () -> Unit) {
+        var threwExpected = false
+        try {
+            block()
+        } catch (t: Throwable) {
+            if (t is T) {
+                threwExpected = true
+            } else {
+                throw AssertionError("$message — expected ${T::class.java.simpleName}, got ${t::class.java.simpleName}: ${t.message}", t)
+            }
+        }
+        if (!threwExpected) {
+            throw AssertionError("$message — expected ${T::class.java.simpleName} to be thrown, but nothing was thrown")
+        }
     }
 }

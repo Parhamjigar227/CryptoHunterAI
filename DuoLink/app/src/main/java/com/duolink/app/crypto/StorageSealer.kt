@@ -1,87 +1,155 @@
 package com.duolink.app.crypto
 
-import java.security.GeneralSecurityException
 import java.security.SecureRandom
 import javax.crypto.Cipher
-import javax.crypto.KeyGenerator
-import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /**
- * Authenticated local storage sealer (AES-256-GCM with mandatory context AAD).
- * On Android devices, backed by non-exportable AndroidKeyStore AES-256-GCM key.
+ * Exact protection tier of an individual cryptographic key on the device.
+ *
+ * Security accuracy rules:
+ * - [STRONGBOX_HARDWARE] and [TEE_HARDWARE] are genuinely hardware-backed (`AndroidKeyStore` + secure hardware).
+ * - [ANDROID_KEYSTORE_OS_SOFTWARE] resides inside `AndroidKeyStore` (`encoded == null`, OS daemon isolation),
+ *   but the device lacks hardware-backed Keymaster/KeyMint (`isInsideSecureHardware == false`).
+ * - [SOFTWARE_WRAPPED_AT_REST] means the private key was generated in app JVM heap memory, encrypted at rest
+ *   under an AES-256-GCM wrapping key (`MSK`), and decrypted transiently in heap memory during cryptographic
+ *   use (e.g., `SPK_dh` ECDH on Android API 26–30). It is NEITHER hardware-backed NOR non-exportable from RAM.
+ * - [JVM_TEST_SOFTWARE] is used strictly by JVM unit tests outside Android.
+ */
+enum class KeyProtectionTier {
+    STRONGBOX_HARDWARE,
+    TEE_HARDWARE,
+    ANDROID_KEYSTORE_OS_SOFTWARE,
+    SOFTWARE_WRAPPED_AT_REST,
+    JVM_TEST_SOFTWARE;
+
+    val isHardwareBacked: Boolean
+        get() = this == STRONGBOX_HARDWARE || this == TEE_HARDWARE
+
+    val isKeystoreNonExportable: Boolean
+        get() = this == STRONGBOX_HARDWARE ||
+            this == TEE_HARDWARE ||
+            this == ANDROID_KEYSTORE_OS_SOFTWARE
+}
+
+/**
+ * Protection report for one specific cryptographic key.
+ */
+data class SingleKeyProtectionStatus(
+    val keyRolePersian: String,
+    val algorithm: String,
+    val tier: KeyProtectionTier,
+    val persianDescription: String
+) {
+    val isHardwareBacked: Boolean get() = tier.isHardwareBacked
+    val isKeystoreNonExportable: Boolean get() = tier.isKeystoreNonExportable
+}
+
+/**
+ * Separate, per-key protection report covering all three device keys:
+ * 1. [identitySigningKey] (`IK_sig`, ECDSA P-256)
+ * 2. [storageWrappingKey] (`MSK`, AES-256-GCM)
+ * 3. [activeSignedPreKey] (`SPK_dh`, ECDH P-256)
+ */
+data class KeyProtectionReport(
+    val identitySigningKey: SingleKeyProtectionStatus,
+    val storageWrappingKey: SingleKeyProtectionStatus,
+    val activeSignedPreKey: SingleKeyProtectionStatus
+)
+
+/**
+ * Authenticated local envelope encryption (`AES-256-GCM`) used to protect:
+ * 1. The paired peer's pinned trust record, historical identity archive, and replay ledger at rest.
+ * 2. Software-generated ECDH Signed Pre-Keys (`SPK_dh`) at rest on Android 8.0–11 (API 26–30) or when
+ *    KeyMint hardware ECDH is unavailable on API 31+.
+ *
+ * Wire format of a sealed blob:
+ * `[version = 0x01 (1 byte)] || [ivLength (1 byte)] || [iv (ivLength bytes)] || [ciphertext + 128-bit GCM tag]`
  */
 interface StorageSealer {
-    fun seal(plaintext: ByteArray, aad: ByteArray): ByteArray
-    fun unseal(sealedBlob: ByteArray, aad: ByteArray): ByteArray
-}
-
-object SealedBlobFormat {
-    const val FORMAT_VERSION: Byte = 0x01
-    const val GCM_IV_BYTES: Int = 12
-    const val GCM_TAG_BITS: Int = 128
-    const val GCM_TAG_BYTES: Int = GCM_TAG_BITS / 8
-
-    fun pack(iv: ByteArray, ciphertextWithTag: ByteArray): ByteArray {
-        require(iv.size == GCM_IV_BYTES) { "Expected $GCM_IV_BYTES-byte GCM IV, got ${iv.size}" }
-        require(ciphertextWithTag.size >= GCM_TAG_BYTES) { "Ciphertext shorter than GCM tag" }
-        val out = ByteArray(2 + iv.size + ciphertextWithTag.size)
-        out[0] = FORMAT_VERSION
-        out[1] = iv.size.toByte()
-        System.arraycopy(iv, 0, out, 2, iv.size)
-        System.arraycopy(ciphertextWithTag, 0, out, 2 + iv.size, ciphertextWithTag.size)
-        return out
-    }
-
-    fun unpack(sealedBlob: ByteArray): Pair<ByteArray, ByteArray> {
-        if (sealedBlob.size < 2 + GCM_IV_BYTES + GCM_TAG_BYTES) {
-            throw GeneralSecurityException("Sealed blob truncated or malformed")
-        }
-        if (sealedBlob[0] != FORMAT_VERSION) {
-            throw GeneralSecurityException("Unsupported sealed blob version: ${sealedBlob[0]}")
-        }
-        val ivLen = sealedBlob[1].toInt() and 0xFF
-        if (ivLen != GCM_IV_BYTES || sealedBlob.size < 2 + ivLen + GCM_TAG_BYTES) {
-            throw GeneralSecurityException("Invalid GCM IV length in sealed blob: $ivLen")
-        }
-        val iv = sealedBlob.copyOfRange(2, 2 + ivLen)
-        val ciphertext = sealedBlob.copyOfRange(2 + ivLen, sealedBlob.size)
-        return iv to ciphertext
-    }
+    fun seal(plaintext: ByteArray, associatedData: ByteArray): ByteArray
+    fun unseal(sealedBlob: ByteArray, associatedData: ByteArray): ByteArray
+    fun queryProtectionStatus(): SingleKeyProtectionStatus
 }
 
 /**
- * Standard JCA AES-256-GCM sealer with fresh 96-bit CSPRNG IV per encryption.
+ * Pure JCA `AES-256-GCM` implementation backed by an in-memory 256-bit key for deterministic JVM unit tests.
+ * Production Android runtime uses `AndroidKeystoreSealer` (`AndroidKeyStore` AES-256-GCM key).
  */
 class JcaAesGcmSealer(
-    private val secretKey: SecretKey = generateRandomAes256Key(),
+    rawKeyBytes: ByteArray = ByteArray(32).also { SecureRandom().nextBytes(it) },
     private val secureRandom: SecureRandom = SecureRandom()
 ) : StorageSealer {
 
-    override fun seal(plaintext: ByteArray, aad: ByteArray): ByteArray {
-        require(aad.isNotEmpty()) { "Associated data (AAD) is mandatory for sealed storage" }
-        val iv = ByteArray(SealedBlobFormat.GCM_IV_BYTES).also { secureRandom.nextBytes(it) }
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, secretKey, GCMParameterSpec(SealedBlobFormat.GCM_TAG_BITS, iv))
-        cipher.updateAAD(aad)
-        val ciphertext = cipher.doFinal(plaintext)
-        return SealedBlobFormat.pack(iv, ciphertext)
+    private val secretKey: SecretKeySpec
+
+    init {
+        require(rawKeyBytes.size == 32) { "AES-256 key must be 32 bytes" }
+        secretKey = SecretKeySpec(rawKeyBytes.copyOf(), "AES")
     }
 
-    override fun unseal(sealedBlob: ByteArray, aad: ByteArray): ByteArray {
-        require(aad.isNotEmpty()) { "Associated data (AAD) is mandatory for sealed storage" }
-        val (iv, ciphertext) = SealedBlobFormat.unpack(sealedBlob)
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(SealedBlobFormat.GCM_TAG_BITS, iv))
-        cipher.updateAAD(aad)
-        return cipher.doFinal(ciphertext)
+    override fun seal(plaintext: ByteArray, associatedData: ByteArray): ByteArray {
+        val iv = ByteArray(GCM_IV_BYTES)
+        secureRandom.nextBytes(iv)
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey, GCMParameterSpec(GCM_TAG_BITS, iv))
+        if (associatedData.isNotEmpty()) {
+            cipher.updateAAD(associatedData)
+        }
+        val ciphertextAndTag = cipher.doFinal(plaintext)
+        return encodeSealedEnvelope(iv, ciphertextAndTag)
+    }
+
+    override fun unseal(sealedBlob: ByteArray, associatedData: ByteArray): ByteArray {
+        val (iv, ciphertextAndTag) = decodeSealedEnvelope(sealedBlob)
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(GCM_TAG_BITS, iv))
+        if (associatedData.isNotEmpty()) {
+            cipher.updateAAD(associatedData)
+        }
+        return cipher.doFinal(ciphertextAndTag)
+    }
+
+    override fun queryProtectionStatus(): SingleKeyProtectionStatus {
+        return SingleKeyProtectionStatus(
+            keyRolePersian = "کلید پوششی ذخیره‌سازی محلی (MSK)",
+            algorithm = "AES-256-GCM",
+            tier = KeyProtectionTier.JVM_TEST_SOFTWARE,
+            persianDescription = "محیط تست JVM (کلید AES-256 در حافظه آزمایشی؛ غیرسخت‌افزاری)"
+        )
     }
 
     companion object {
-        fun generateRandomAes256Key(): SecretKey {
-            val kg = KeyGenerator.getInstance("AES")
-            kg.init(256, SecureRandom())
-            return kg.generateKey()
+        const val ENVELOPE_VERSION: Byte = 0x01
+        const val GCM_IV_BYTES = 12
+        const val GCM_TAG_BITS = 128
+        const val TRANSFORMATION = "AES/GCM/NoPadding"
+
+        fun encodeSealedEnvelope(iv: ByteArray, ciphertextAndTag: ByteArray): ByteArray {
+            require(iv.size in 12..16) { "Unexpected GCM IV length: ${iv.size}" }
+            val out = ByteArray(2 + iv.size + ciphertextAndTag.size)
+            out[0] = ENVELOPE_VERSION
+            out[1] = iv.size.toByte()
+            System.arraycopy(iv, 0, out, 2, iv.size)
+            System.arraycopy(ciphertextAndTag, 0, out, 2 + iv.size, ciphertextAndTag.size)
+            return out
+        }
+
+        fun decodeSealedEnvelope(sealedBlob: ByteArray): Pair<ByteArray, ByteArray> {
+            require(sealedBlob.size >= 2 + GCM_IV_BYTES + (GCM_TAG_BITS / 8)) {
+                "Sealed envelope too short (${sealedBlob.size} bytes)"
+            }
+            val version = sealedBlob[0]
+            require(version == ENVELOPE_VERSION) { "Unsupported sealed envelope version: $version" }
+            val ivLen = sealedBlob[1].toInt() and 0xFF
+            require(ivLen in 12..16) { "Invalid IV length in sealed envelope: $ivLen" }
+            require(sealedBlob.size >= 2 + ivLen + (GCM_TAG_BITS / 8)) {
+                "Truncated sealed envelope payload"
+            }
+            val iv = sealedBlob.copyOfRange(2, 2 + ivLen)
+            val ciphertextAndTag = sealedBlob.copyOfRange(2 + ivLen, sealedBlob.size)
+            return iv to ciphertextAndTag
         }
     }
 }

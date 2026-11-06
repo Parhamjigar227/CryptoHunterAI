@@ -3,629 +3,732 @@ package com.duolink.app.pairing
 import com.duolink.app.crypto.ByteEncoding
 import com.duolink.app.crypto.DeviceKeyVault
 import com.duolink.app.crypto.EcP256Crypto
+import com.duolink.app.crypto.HkdfSha256
+import com.duolink.app.crypto.LocalIdentityPublic
 import com.duolink.app.crypto.SafetyFingerprint
 import com.duolink.app.crypto.SignedPreKeyPublic
-import com.duolink.app.crypto.TranscriptBuilder
-import com.duolink.app.crypto.zeroize
+import com.duolink.app.crypto.VaultHealth
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.Arrays
 
 /**
- * Coordinates DuoLink's strictly two-device mutual QR pairing, replay & tamper protection,
- * third-device rejection, peer key-change warning, and explicit two-party fingerprint confirmation.
+ * Coordinates DuoLink's two-person mutual QR pairing, replay protection, single-peer pinning,
+ * key-change detection, fail-closed corruption handling, and secure re-pairing.
  */
 class PairingCoordinator(
     private val keyVault: DeviceKeyVault,
     private val trustStore: PeerTrustStore,
-    private val secureRandom: SecureRandom = SecureRandom()
+    private val secureRandom: SecureRandom = SecureRandom(),
+    private val qrTtlSeconds: Long = DEFAULT_QR_TTL_SECONDS,
+    private val maxClockSkewSeconds: Long = DEFAULT_CLOCK_SKEW_SECONDS
 ) {
-    companion object {
-        const val OFFER_TTL_SEC: Long = 300L        // 5 minutes
-        const val MAX_OFFER_WINDOW_SEC: Long = 600L // Hard upper bound on exp - iat
-        const val CLOCK_SKEW_TOLERANCE_SEC: Long = 60L
-    }
+    private var activeInitiatorOffer: ActiveInitiatorOffer? = null
+    private var pendingConfirmation: PendingPairingConfirmation? = null
 
-    private data class ActiveOfferSession(
-        val sessionId: String,
-        val localSpk: SignedPreKeyPublic,
-        val offerNonce: ByteArray,
-        val offerQrUri: String,
-        val offerTranscriptDigest: ByteArray,
-        val issuedAtEpochSec: Long,
+    private data class ActiveInitiatorOffer(
+        val qrString: String,
+        val packet: PairingQrPacket,
+        val localSpkIdUsed: Int
+    )
+
+    data class OfferGenerationResult(
+        val qrString: String,
+        val sessionIdHex: String,
         val expiresAtEpochSec: Long
     )
 
-    private data class StagedConfirmation(
-        val role: PairingStateSnapshot.AwaitingUserConfirmation.Role,
-        val acceptQrUri: String?,
-        val candidateRecord: PairedPeerRecord,
-        val sessionVerificationCode: String,
-        val expiresAtEpochSec: Long,
-        val keyChangeAlert: KeyChangeAlert?
-    )
+    sealed class QrProcessResult {
+        data class ResponderReadyToConfirm(
+            val acceptQrToDisplay: String,
+            val safetyNumber: String,
+            val publicHandshakeTranscriptId: String,
+            val peerDeviceIdHex: String,
+            val previousPeerChanged: Boolean,
+            val previousPeerDeviceIdHex: String?
+        ) : QrProcessResult()
 
-    private var activeOffer: ActiveOfferSession? = null
-    private var stagedConfirmation: StagedConfirmation? = null
+        data class InitiatorReadyToConfirm(
+            val safetyNumber: String,
+            val publicHandshakeTranscriptId: String,
+            val peerDeviceIdHex: String,
+            val previousPeerChanged: Boolean,
+            val previousPeerDeviceIdHex: String?
+        ) : QrProcessResult()
 
+        data class Rejected(
+            val reason: PairingRejectionReason,
+            val detail: String
+        ) : QrProcessResult()
+    }
+
+    /**
+     * Evaluates both key-vault metadata health and trust-store health. Any corruption immediately
+     * surfaces as [TrustStoreHealth.Corrupted] so every pairing/re-pairing flow fails closed.
+     */
     @Synchronized
-    fun getLocalDeviceId(): String = keyVault.getDeviceId()
-
-    @Synchronized
-    fun getLocalIdentityDigits(): String = SafetyFingerprint.computeSingleIdentityDigits(
-        deviceId = keyVault.getDeviceId(),
-        ikSpki = keyVault.getIdentityPublicKeySpki()
-    )
-
-    @Synchronized
-    fun isHardwareKeyBacked(): Boolean = keyVault.isHardwareBacked
-
-    @Synchronized
-    fun getHardwareKeyDescription(): String = keyVault.hardwareDescription
-
-    @Synchronized
-    fun getCurrentSignedPreKey(nowEpochSec: Long = currentEpochSec()): SignedPreKeyPublic =
-        keyVault.getCurrentSignedPreKey(nowEpochSec)
-
-    @Synchronized
-    fun rotateSignedPreKey(nowEpochSec: Long = currentEpochSec()): SignedPreKeyPublic =
-        keyVault.rotateSignedPreKey(nowEpochSec)
-
-    @Synchronized
-    fun isPaired(): Boolean = trustStore.loadPinnedPeer() != null
-
-    @Synchronized
-    fun getPinnedPeer(): PairedPeerRecord? = trustStore.loadPinnedPeer()
+    fun inspectCombinedSecurityHealth(): TrustStoreHealth {
+        when (val vaultHealth = keyVault.checkVaultHealth()) {
+            is VaultHealth.Corrupted -> return TrustStoreHealth.Corrupted(
+                component = TrustStoreComponent.KEY_VAULT,
+                reason = vaultHealth.reason
+            )
+            is VaultHealth.Healthy -> {}
+        }
+        return trustStore.inspectHealth()
+    }
 
     @Synchronized
     fun currentStateSnapshot(nowEpochSec: Long = currentEpochSec()): PairingStateSnapshot {
-        val pinned = trustStore.loadPinnedPeer()
-        if (pinned != null) {
-            return PairingStateSnapshot.Paired(
-                peerDeviceId = pinned.peerDeviceId,
-                safetyNumber = pinned.safetyNumber,
-                pairedAtEpochSec = pinned.pairedAtEpochSec,
-                peerSpkId = pinned.peerSpkId
+        when (val health = inspectCombinedSecurityHealth()) {
+            is TrustStoreHealth.Corrupted -> return PairingStateSnapshot.TrustStorageCorrupted(
+                component = health.component,
+                technicalReason = health.reason
+            )
+            is TrustStoreHealth.Healthy -> {}
+        }
+
+        when (val pinned = trustStore.readPinnedPeer()) {
+            is PinnedPeerReadResult.Corrupted -> return PairingStateSnapshot.TrustStorageCorrupted(
+                component = TrustStoreComponent.PINNED_PEER,
+                technicalReason = pinned.reason
+            )
+            is PinnedPeerReadResult.Valid -> return PairingStateSnapshot.PairedActive(pinned.record)
+            is PinnedPeerReadResult.None -> {}
+        }
+
+        val pending = pendingConfirmation
+        if (pending != null) {
+            return PairingStateSnapshot.AwaitingUserConfirmation(
+                peerDeviceIdHex = ByteEncoding.toHexLower(pending.peerDeviceId),
+                safetyNumber = pending.safetyNumber,
+                publicHandshakeTranscriptId = pending.publicHandshakeTranscriptId,
+                responseAcceptQrPayload = pending.responseQrStringForPeer,
+                previousPeerChanged = pending.previousPeerChanged,
+                previousPeerDeviceIdHex = pending.previousPeerDeviceIdHex
             )
         }
-        val staged = stagedConfirmation
-        if (staged != null) {
-            if (nowEpochSec <= staged.expiresAtEpochSec + CLOCK_SKEW_TOLERANCE_SEC) {
-                return PairingStateSnapshot.AwaitingUserConfirmation(
-                    role = staged.role,
-                    acceptQrUri = staged.acceptQrUri,
-                    peerDeviceId = staged.candidateRecord.peerDeviceId,
-                    safetyNumber = staged.candidateRecord.safetyNumber,
-                    sessionVerificationCode = staged.sessionVerificationCode,
-                    expiresAtEpochSec = staged.expiresAtEpochSec,
-                    keyChangeAlert = staged.keyChangeAlert
-                )
-            } else {
-                clearStagedConfirmation()
-            }
+
+        val offer = activeInitiatorOffer
+        if (offer != null && nowEpochSec <= offer.packet.expiresAtEpochSec) {
+            return PairingStateSnapshot.InitiatorOfferReady(
+                offerQrPayload = offer.qrString,
+                sessionIdHex = ByteEncoding.toHexLower(offer.packet.sessionId),
+                expiresAtEpochSec = offer.packet.expiresAtEpochSec
+            )
+        } else if (offer != null) {
+            activeInitiatorOffer = null
         }
-        val offer = activeOffer
-        if (offer != null) {
-            if (nowEpochSec <= offer.expiresAtEpochSec + CLOCK_SKEW_TOLERANCE_SEC) {
-                return PairingStateSnapshot.OfferCreated(
-                    sessionId = offer.sessionId,
-                    offerQrUri = offer.offerQrUri,
-                    expiresAtEpochSec = offer.expiresAtEpochSec
-                )
-            } else {
-                activeOffer = null
-            }
-        }
-        return PairingStateSnapshot.Unpaired
+        return PairingStateSnapshot.UnpairedIdle
     }
 
     /**
-     * Creates a signed Initiator OFFER QR URI. Refuses if already paired with a peer.
+     * Step 1 (Device A): Creates a fresh signed `OFFER` QR payload.
+     * Refuses if security storage is corrupted or if a peer is already pinned.
      */
     @Synchronized
-    fun startInitiatorOffer(nowEpochSec: Long = currentEpochSec()): Result<PairingStateSnapshot.OfferCreated> {
-        if (trustStore.loadPinnedPeer() != null) {
-            return Result.failure(IllegalStateException(PairingRejectionReason.THIRD_DEVICE_BLOCKED.persianTitle))
+    fun startInitiatorOffer(nowEpochSec: Long = currentEpochSec()): Result<OfferGenerationResult> {
+        ensureSecurityStorageHealthyResult()?.let { return Result.failure(it) }
+
+        when (val pinned = trustStore.readPinnedPeer()) {
+            is PinnedPeerReadResult.Valid -> return Result.failure(
+                PairingValidationException(
+                    PairingRejectionReason.THIRD_DEVICE_BLOCKED,
+                    PairingRejectionReason.THIRD_DEVICE_BLOCKED.persianMessage
+                )
+            )
+            is PinnedPeerReadResult.Corrupted -> return Result.failure(
+                PairingValidationException(
+                    PairingRejectionReason.TRUST_STORAGE_CORRUPTED,
+                    pinned.reason
+                )
+            )
+            is PinnedPeerReadResult.None -> {}
         }
-        clearStagedConfirmation()
 
-        val sessionIdBytes = ByteArray(QrPairingCodec.SESSION_ID_BYTES).also { secureRandom.nextBytes(it) }
-        val sessionId = ByteEncoding.toHexLower(sessionIdBytes)
-        val nonce = ByteArray(QrPairingCodec.NONCE_BYTES).also { secureRandom.nextBytes(it) }
-        val localDeviceId = keyVault.getDeviceId()
-        val localIkSpki = keyVault.getIdentityPublicKeySpki()
-        val localSpk = keyVault.getCurrentSignedPreKey(nowEpochSec)
-        val exp = nowEpochSec + OFFER_TTL_SEC
+        pendingConfirmation = null
+        val localIdentity = try {
+            keyVault.getOrCreateLocalIdentity(nowEpochSec)
+        } catch (e: Exception) {
+            return Result.failure(
+                PairingValidationException(
+                    PairingRejectionReason.TRUST_STORAGE_CORRUPTED,
+                    e.message ?: PairingRejectionReason.TRUST_STORAGE_CORRUPTED.persianMessage,
+                    e
+                )
+            )
+        }
 
-        val transcript = QrPairingCodec.buildOfferSigningTranscript(
+        val sessionId = ByteArray(16).also { secureRandom.nextBytes(it) }
+        val offerNonce = ByteArray(32).also { secureRandom.nextBytes(it) }
+        val expiresAt = nowEpochSec + qrTtlSeconds
+
+        val qrString = QrPairingCodec.encodeSignedPacket(
+            role = QrPacketRole.OFFER,
             sessionId = sessionId,
-            senderDeviceId = localDeviceId,
-            senderIkSigSpki = localIkSpki,
-            senderSpk = localSpk,
-            nonce = nonce,
             issuedAtEpochSec = nowEpochSec,
-            expiresAtEpochSec = exp
+            expiresAtEpochSec = expiresAt,
+            localIdentity = localIdentity,
+            senderNonce = offerNonce,
+            targetInitiatorDeviceId = null,
+            boundOfferDigest = null,
+            keyVault = keyVault
         )
-        val signature = keyVault.signWithIdentity(transcript)
-        val uri = QrPairingCodec.encodeOfferUri(
-            sessionId = sessionId,
-            senderDeviceId = localDeviceId,
-            senderIkSigSpki = localIkSpki,
-            senderSpk = localSpk,
-            nonce = nonce,
-            issuedAtEpochSec = nowEpochSec,
-            expiresAtEpochSec = exp,
-            signature = signature
-        )
-
-        activeOffer = ActiveOfferSession(
-            sessionId = sessionId,
-            localSpk = localSpk,
-            offerNonce = nonce,
-            offerQrUri = uri,
-            offerTranscriptDigest = ByteEncoding.sha256(transcript),
-            issuedAtEpochSec = nowEpochSec,
-            expiresAtEpochSec = exp
+        val parsed = QrPairingCodec.decodeAndVerifySignatures(qrString)
+        activeInitiatorOffer = ActiveInitiatorOffer(
+            qrString = qrString,
+            packet = parsed,
+            localSpkIdUsed = localIdentity.currentSignedPreKey.spkId
         )
         return Result.success(
-            PairingStateSnapshot.OfferCreated(
-                sessionId = sessionId,
-                offerQrUri = uri,
-                expiresAtEpochSec = exp
+            OfferGenerationResult(
+                qrString = qrString,
+                sessionIdHex = ByteEncoding.toHexLower(sessionId),
+                expiresAtEpochSec = expiresAt
             )
         )
     }
 
     /**
-     * Processes a scanned QR URI in either normal pairing mode or peer identity verification mode.
+     * Processes a scanned QR string as either:
+     * - Responder scanning an `OFFER` QR (when unpaired/idle), OR
+     * - Initiator scanning the matching `ACCEPT` QR for its active `OFFER`.
      *
-     * @param verifyExistingPeerMode When true and already paired, checks whether a scanned QR
-     *   matches the pinned peer identity or surfaces an explicit PEER_KEY_CHANGED_WARNING if the
-     *   contact's key changed (instead of a generic third-device block).
+     * Fails closed with [PairingRejectionReason.TRUST_STORAGE_CORRUPTED] if any trust, archive,
+     * replay, or SPK metadata store is corrupted.
      */
     @Synchronized
     fun processScannedQr(
-        rawQrText: String,
-        nowEpochSec: Long = currentEpochSec(),
-        verifyExistingPeerMode: Boolean = false
+        qrText: String,
+        nowEpochSec: Long = currentEpochSec()
     ): QrProcessResult {
-        val decoded = when (val res = QrPairingCodec.decodeUri(rawQrText)) {
-            is QrPairingCodec.CodecResult.Err -> return QrProcessResult.Rejected(res.reason)
-            is QrPairingCodec.CodecResult.Ok -> res.packet
+        ensureSecurityStorageHealthyResult()?.let { err ->
+            return QrProcessResult.Rejected(err.reason, err.message)
         }
 
-        // 1. Validate curve, canonical SPKI, and cryptographic binding deviceId == H(IK_sig_pub)
-        val computedSenderId = try {
-            EcP256Crypto.computeDeviceId(decoded.senderIkSigSpki)
-        } catch (_: Exception) {
-            return QrProcessResult.Rejected(PairingRejectionReason.TAMPERED_SIGNATURE)
-        }
-        if (computedSenderId != decoded.senderDeviceId) {
-            return QrProcessResult.Rejected(PairingRejectionReason.IDENTITY_SUBSTITUTION)
-        }
-
-        // 2. Reject scanning our own QR code
-        val localDeviceId = keyVault.getDeviceId()
-        if (decoded.senderDeviceId == localDeviceId) {
-            return QrProcessResult.Rejected(PairingRejectionReason.SELF_PAIRING_ATTEMPT)
-        }
-
-        // 3. Verify timestamps & TTL window BEFORE touching state
-        if (!isFreshTimestampWindow(decoded.issuedAtEpochSec, decoded.expiresAtEpochSec, nowEpochSec)) {
-            return QrProcessResult.Rejected(PairingRejectionReason.EXPIRED_PAYLOAD)
-        }
-
-        // 4. Verify packet outer signature under senderIkSigSpki AND SPK signature
-        if (!EcP256Crypto.verifyIdentitySignature(
-                ikSigPublicKeySpki = decoded.senderIkSigSpki,
-                transcript = decoded.signedTranscript,
-                signatureBytes = decoded.signature
+        when (val existingPeer = trustStore.readPinnedPeer()) {
+            is PinnedPeerReadResult.Valid -> return QrProcessResult.Rejected(
+                PairingRejectionReason.THIRD_DEVICE_BLOCKED,
+                PairingRejectionReason.THIRD_DEVICE_BLOCKED.persianMessage
             )
+            is PinnedPeerReadResult.Corrupted -> return QrProcessResult.Rejected(
+                PairingRejectionReason.TRUST_STORAGE_CORRUPTED,
+                existingPeer.reason
+            )
+            is PinnedPeerReadResult.None -> {}
+        }
+
+        val packet = try {
+            QrPairingCodec.decodeAndVerifySignatures(qrText)
+        } catch (e: PairingValidationException) {
+            return QrProcessResult.Rejected(e.reason, e.reason.persianMessage)
+        } catch (e: Exception) {
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.MALFORMED_PAYLOAD,
+                PairingRejectionReason.MALFORMED_PAYLOAD.persianMessage
+            )
+        }
+
+        if (packet.issuedAtEpochSec > nowEpochSec + maxClockSkewSeconds) {
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.FUTURE_TIMESTAMP_SKEW,
+                PairingRejectionReason.FUTURE_TIMESTAMP_SKEW.persianMessage
+            )
+        }
+        if (nowEpochSec > packet.expiresAtEpochSec) {
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.EXPIRED_QR,
+                PairingRejectionReason.EXPIRED_QR.persianMessage
+            )
+        }
+
+        val localIdentity = try {
+            keyVault.getOrCreateLocalIdentity(nowEpochSec)
+        } catch (e: Exception) {
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.TRUST_STORAGE_CORRUPTED,
+                e.message ?: PairingRejectionReason.TRUST_STORAGE_CORRUPTED.persianMessage
+            )
+        }
+
+        if (ByteEncoding.constantTimeEquals(packet.senderDeviceId, localIdentity.deviceId) ||
+            ByteEncoding.constantTimeEquals(packet.senderIkSigSpki, localIdentity.identitySigningPublicKeySpki)
         ) {
-            return QrProcessResult.Rejected(PairingRejectionReason.TAMPERED_SIGNATURE)
-        }
-        if (!EcP256Crypto.verifySignedPreKey(
-                deviceId = decoded.senderDeviceId,
-                ikSigPublicKeySpki = decoded.senderIkSigSpki,
-                spk = decoded.senderSpk
-            )
-        ) {
-            return QrProcessResult.Rejected(PairingRejectionReason.TAMPERED_SIGNATURE)
-        }
-        if (nowEpochSec > decoded.senderSpk.expiresAtEpochSec + CLOCK_SKEW_TOLERANCE_SEC) {
-            return QrProcessResult.Rejected(PairingRejectionReason.EXPIRED_PAYLOAD)
-        }
-
-        // 5. Enforce replay check against persistent sealed ledger
-        val replayToken = computeReplayToken(decoded)
-        if (trustStore.hasSeenReplayToken(replayToken)) {
-            return QrProcessResult.Rejected(PairingRejectionReason.REPLAYED_NONCE)
-        }
-
-        // 6. Check existing pinned peer state (2-device exclusivity & key-change warning)
-        val existingPeer = trustStore.loadPinnedPeer()
-        if (existingPeer != null) {
-            return handleScanWhenAlreadyPaired(
-                existingPeer = existingPeer,
-                decoded = decoded,
-                replayToken = replayToken,
-                verifyExistingPeerMode = verifyExistingPeerMode
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.SELF_PAIRING_FORBIDDEN,
+                PairingRejectionReason.SELF_PAIRING_FORBIDDEN.persianMessage
             )
         }
 
-        // 7. Unpaired state: route OFFER (Responder) vs ACCEPT (Initiator)
-        return when (decoded) {
-            is QrPairingCodec.DecodedQrPacket.Offer ->
-                handleOfferAsResponder(decoded, replayToken, nowEpochSec)
-            is QrPairingCodec.DecodedQrPacket.Accept ->
-                handleAcceptAsInitiator(decoded, replayToken, nowEpochSec)
+        val replayToken = buildReplayToken(packet)
+        val seenReplay = try {
+            trustStore.hasSeenReplayToken(replayToken)
+        } catch (e: TrustStorageCorruptedException) {
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.TRUST_STORAGE_CORRUPTED,
+                e.message ?: PairingRejectionReason.TRUST_STORAGE_CORRUPTED.persianMessage
+            )
+        }
+        if (seenReplay) {
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.REPLAYED_SESSION,
+                PairingRejectionReason.REPLAYED_SESSION.persianMessage
+            )
+        }
+
+        return when (packet.role) {
+            QrPacketRole.OFFER -> handleIncomingOffer(packet, localIdentity, replayToken, nowEpochSec)
+            QrPacketRole.ACCEPT -> handleIncomingAccept(packet, localIdentity, replayToken, nowEpochSec)
         }
     }
 
     /**
-     * Checks an observed peer identity public key (e.g., during handshake or manual verification)
-     * against the currently pinned peer. Returns KeyChangeAlert if the key changed.
-     */
-    @Synchronized
-    fun verifyPinnedPeerIdentityKey(presentedIkSigSpki: ByteArray): KeyChangeAlert? {
-        val pinned = trustStore.loadPinnedPeer() ?: return null
-        if (ByteEncoding.constantTimeEquals(pinned.peerIkSigSpki, presentedIkSigSpki)) {
-            return null
-        }
-        val newDeviceId = EcP256Crypto.computeDeviceId(presentedIkSigSpki)
-        val newSafetyNumber = SafetyFingerprint.computeSafetyNumber(
-            localDeviceId = keyVault.getDeviceId(),
-            localIkSpki = keyVault.getIdentityPublicKeySpki(),
-            peerDeviceId = newDeviceId,
-            peerIkSpki = presentedIkSigSpki
-        )
-        return KeyChangeAlert(
-            previousDeviceId = pinned.peerDeviceId,
-            previousSafetyNumber = pinned.safetyNumber,
-            newDeviceId = newDeviceId,
-            newSafetyNumber = newSafetyNumber
-        )
-    }
-
-    /**
-     * Explicit user confirmation gate on THIS device.
-     * If a previous peer's key changed across re-pairing, [acknowledgeKeyChange] MUST be true.
+     * Explicit user confirmation of the **complete 60-digit Safety Number** compared through an
+     * independent trusted channel (in person or direct trusted voice call).
+     *
+     * Rules enforced:
+     * 1. Security storage (`trustStore` + `keyVault`) MUST be healthy (fail-closed).
+     * 2. [fullSafetyNumberComparedViaTrustedChannel] MUST be `true`.
+     * 3. If [PendingPairingConfirmation.previousPeerChanged] is `true`, [acknowledgeKeyChange] MUST also be `true`.
      */
     @Synchronized
     fun confirmSafetyFingerprint(
+        fullSafetyNumberComparedViaTrustedChannel: Boolean,
         nowEpochSec: Long = currentEpochSec(),
         acknowledgeKeyChange: Boolean = false
     ): Result<PairedPeerRecord> {
-        val staged = stagedConfirmation
-            ?: return Result.failure(IllegalStateException("نشست در انتظار تأییدی وجود ندارد"))
-        if (nowEpochSec > staged.expiresAtEpochSec + CLOCK_SKEW_TOLERANCE_SEC) {
-            clearStagedConfirmation()
-            return Result.failure(IllegalStateException(PairingRejectionReason.EXPIRED_PAYLOAD.persianTitle))
-        }
-        if (staged.keyChangeAlert != null && !acknowledgeKeyChange) {
+        ensureSecurityStorageHealthyResult()?.let { return Result.failure(it) }
+
+        if (!fullSafetyNumberComparedViaTrustedChannel) {
             return Result.failure(
-                IllegalStateException("تغییر کلید امنیتی مخاطب باید به‌طور صریح توسط کاربر تأیید شود")
+                IllegalStateException(
+                    "مقایسه کامل تمام ۶۰ رقم کد امنیتی از طریق یک کانال مستقل و مورد اعتماد الزامی است"
+                )
             )
         }
-        val confirmedRecord = staged.candidateRecord.copy(pairedAtEpochSec = nowEpochSec)
-        trustStore.savePinnedPeer(confirmedRecord)
-        activeOffer = null
-        stagedConfirmation = null
-        return Result.success(confirmedRecord)
+
+        when (val pinned = trustStore.readPinnedPeer()) {
+            is PinnedPeerReadResult.Valid -> return Result.failure(
+                PairingValidationException(
+                    PairingRejectionReason.THIRD_DEVICE_BLOCKED,
+                    PairingRejectionReason.THIRD_DEVICE_BLOCKED.persianMessage
+                )
+            )
+            is PinnedPeerReadResult.Corrupted -> return Result.failure(
+                PairingValidationException(
+                    PairingRejectionReason.TRUST_STORAGE_CORRUPTED,
+                    pinned.reason
+                )
+            )
+            is PinnedPeerReadResult.None -> {}
+        }
+
+        val pending = pendingConfirmation
+            ?: return Result.failure(IllegalStateException("هیچ جلسه جفت‌سازی در انتظار تأیید وجود ندارد"))
+
+        if (pending.previousPeerChanged && !acknowledgeKeyChange) {
+            return Result.failure(
+                IllegalStateException("تغییر کلید امنیتی مخاطب شناسایی شده و نیازمند تأیید آگاهانه است")
+            )
+        }
+
+        val record = PairedPeerRecord(
+            peerDeviceId = pending.peerDeviceId.copyOf(),
+            peerIkSigSpki = pending.peerIkSigSpki.copyOf(),
+            peerSpkId = pending.peerSpk.spkId,
+            peerSpkPubSpki = pending.peerSpk.publicKeySpki.copyOf(),
+            peerSpkSignature = pending.peerSpk.signatureByIdentityKey.copyOf(),
+            peerSpkCreatedAtEpochSec = pending.peerSpk.createdAtEpochSec,
+            rootPairingKey = pending.derivedRootPairingKey.copyOf(),
+            safetyNumber = pending.safetyNumber,
+            pairedAtEpochSec = nowEpochSec,
+            safetyNumberVerified = true
+        )
+        return try {
+            trustStore.savePinnedPeer(record)
+            Arrays.fill(pending.derivedRootPairingKey, 0.toByte())
+            pendingConfirmation = null
+            activeInitiatorOffer = null
+            Result.success(record)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
     }
 
     @Synchronized
-    fun cancelPendingSession() {
-        activeOffer = null
-        clearStagedConfirmation()
+    fun cancelPendingPairing() {
+        pendingConfirmation?.let { Arrays.fill(it.derivedRootPairingKey, 0.toByte()) }
+        pendingConfirmation = null
+        activeInitiatorOffer = null
     }
 
     /**
-     * Secure unpair / re-pairing reset procedure:
-     * Archives the previous peer fingerprint (so key-change alerts still fire on re-pair),
-     * clears the active pairing slot, and rotates this device's Signed Pre-Key.
+     * Explicit user-initiated unpairing / secure re-pairing flow.
+     * Archives the previous peer identity so re-pairing with a different identity key triggers
+     * an explicit key-change warning.
+     *
+     * Fails closed with [Result.failure] if security storage is corrupted (never silently wipes
+     * corrupted archives).
      */
     @Synchronized
     fun unpairForSecureRePairing(
-        regenerateDeviceIdentity: Boolean = false,
+        rotateDeviceIdentity: Boolean = false,
         nowEpochSec: Long = currentEpochSec()
-    ) {
-        activeOffer = null
-        clearStagedConfirmation()
-        trustStore.archiveAndClearPinnedPeer()
-        if (regenerateDeviceIdentity) {
-            keyVault.resetIdentityKeys(nowEpochSec)
-        } else {
-            keyVault.rotateSignedPreKey(nowEpochSec)
+    ): Result<Unit> {
+        ensureSecurityStorageHealthyResult()?.let { return Result.failure(it) }
+        return try {
+            cancelPendingPairing()
+            trustStore.archiveAndClearPinnedPeer()
+            if (rotateDeviceIdentity) {
+                keyVault.resetIdentityKeys(nowEpochSec)
+            } else {
+                keyVault.rotateSignedPreKey(nowEpochSec)
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
         }
     }
 
-    private fun handleScanWhenAlreadyPaired(
-        existingPeer: PairedPeerRecord,
-        decoded: QrPairingCodec.DecodedQrPacket,
-        replayToken: ByteArray,
-        verifyExistingPeerMode: Boolean
-    ): QrProcessResult {
-        val sameIdentityKey = ByteEncoding.constantTimeEquals(
-            existingPeer.peerIkSigSpki,
-            decoded.senderIkSigSpki
-        )
-        if (sameIdentityKey) {
-            trustStore.recordReplayToken(replayToken)
-            var updated = false
-            if (decoded.senderSpk.spkId > existingPeer.peerSpkId) {
-                trustStore.savePinnedPeer(
-                    existingPeer.copy(
-                        peerSpkId = decoded.senderSpk.spkId,
-                        peerSpkDhSpki = decoded.senderSpk.publicKeySpki,
-                        peerSpkIssuedAtSec = decoded.senderSpk.issuedAtEpochSec,
-                        peerSpkExpiresAtSec = decoded.senderSpk.expiresAtEpochSec,
-                        peerSpkSignature = decoded.senderSpk.signature
+    /**
+     * Explicit destructive recovery procedure required when `pinned_peer_v1`, `archived_peer_v1`,
+     * `replay_ledger_v1`, or `spk_entries_v2` is corrupted.
+     *
+     * Requires [confirmDestructiveRecovery] = `true`, purges corrupted local security files, rotates
+     * device identity keys (`IK_sig` + `SPK_dh`), and re-initializes an authenticated replay ledger.
+     */
+    @Synchronized
+    fun recoverFromCorruptedStorage(
+        confirmDestructiveRecovery: Boolean,
+        nowEpochSec: Long = currentEpochSec()
+    ): Result<LocalIdentityPublic> {
+        if (!confirmDestructiveRecovery) {
+            return Result.failure(
+                IllegalStateException("تأیید صریح کاربر برای بازیابی و بازنشانی ذخیره‌سازی امن الزامی است")
+            )
+        }
+        return try {
+            cancelPendingPairing()
+            trustStore.purgeCorruptedTrustStateForRecovery()
+            val freshIdentity = keyVault.resetIdentityKeys(nowEpochSec)
+            when (val health = inspectCombinedSecurityHealth()) {
+                is TrustStoreHealth.Corrupted -> Result.failure(
+                    PairingValidationException(
+                        PairingRejectionReason.TRUST_STORAGE_CORRUPTED,
+                        health.reason
                     )
                 )
-                updated = true
+                is TrustStoreHealth.Healthy -> Result.success(freshIdentity)
             }
-            return QrProcessResult.ExistingPeerVerified(
-                peerDeviceId = existingPeer.peerDeviceId,
-                safetyNumber = existingPeer.safetyNumber,
-                preKeyUpdated = updated
-            )
+        } catch (e: Exception) {
+            Result.failure(e)
         }
-
-        // Different identity key presented while already paired!
-        if (verifyExistingPeerMode) {
-            val newSafety = SafetyFingerprint.computeSafetyNumber(
-                localDeviceId = keyVault.getDeviceId(),
-                localIkSpki = keyVault.getIdentityPublicKeySpki(),
-                peerDeviceId = decoded.senderDeviceId,
-                peerIkSpki = decoded.senderIkSigSpki
-            )
-            val alert = KeyChangeAlert(
-                previousDeviceId = existingPeer.peerDeviceId,
-                previousSafetyNumber = existingPeer.safetyNumber,
-                newDeviceId = decoded.senderDeviceId,
-                newSafetyNumber = newSafety
-            )
-            return QrProcessResult.Rejected(
-                reason = PairingRejectionReason.PEER_KEY_CHANGED_WARNING,
-                keyChangeAlert = alert
-            )
-        }
-
-        return QrProcessResult.Rejected(PairingRejectionReason.THIRD_DEVICE_BLOCKED)
     }
 
-    private fun handleOfferAsResponder(
-        offer: QrPairingCodec.DecodedQrPacket.Offer,
+    private fun ensureSecurityStorageHealthyResult(): PairingValidationException? {
+        return when (val health = inspectCombinedSecurityHealth()) {
+            is TrustStoreHealth.Healthy -> null
+            is TrustStoreHealth.Corrupted -> PairingValidationException(
+                PairingRejectionReason.TRUST_STORAGE_CORRUPTED,
+                "${PairingRejectionReason.TRUST_STORAGE_CORRUPTED.persianMessage} [${health.component}: ${health.reason}]"
+            )
+        }
+    }
+
+    private fun handleIncomingOffer(
+        offer: PairingQrPacket,
+        localIdentity: LocalIdentityPublic,
         replayToken: ByteArray,
         nowEpochSec: Long
     ): QrProcessResult {
-        val localDeviceId = keyVault.getDeviceId()
-        val localIkSpki = keyVault.getIdentityPublicKeySpki()
-        val localSpk = keyVault.getCurrentSignedPreKey(nowEpochSec)
+        if (activeInitiatorOffer != null) {
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.UNEXPECTED_PACKET_ROLE,
+                "این دستگاه منتظر اسکن کد پاسخ (ACCEPT) است، نه کد درخواست جدید"
+            )
+        }
 
-        val acceptNonce = ByteArray(QrPairingCodec.NONCE_BYTES).also { secureRandom.nextBytes(it) }
-        val offerDigest = ByteEncoding.sha256(offer.signedTranscript)
-        val acceptExp = nowEpochSec + OFFER_TTL_SEC
+        val previousCheck = evaluateArchivedPeerHistoryStrict(offer.senderIkSigSpki)
+            ?: return QrProcessResult.Rejected(
+                PairingRejectionReason.TRUST_STORAGE_CORRUPTED,
+                PairingRejectionReason.TRUST_STORAGE_CORRUPTED.persianMessage
+            )
 
-        val acceptTranscript = QrPairingCodec.buildAcceptSigningTranscript(
+        val acceptNonce = ByteArray(32).also { secureRandom.nextBytes(it) }
+        val expiresAt = nowEpochSec + qrTtlSeconds
+
+        val acceptQr = QrPairingCodec.encodeSignedPacket(
+            role = QrPacketRole.ACCEPT,
             sessionId = offer.sessionId,
-            targetPeerDeviceId = offer.senderDeviceId,
-            offerTranscriptDigest = offerDigest,
-            senderDeviceId = localDeviceId,
-            senderIkSigSpki = localIkSpki,
-            senderSpk = localSpk,
-            nonce = acceptNonce,
             issuedAtEpochSec = nowEpochSec,
-            expiresAtEpochSec = acceptExp
+            expiresAtEpochSec = expiresAt,
+            localIdentity = localIdentity,
+            senderNonce = acceptNonce,
+            targetInitiatorDeviceId = offer.senderDeviceId,
+            boundOfferDigest = offer.rawTranscriptDigestSha256,
+            keyVault = keyVault
         )
-        val acceptSig = keyVault.signWithIdentity(acceptTranscript)
-        val acceptUri = QrPairingCodec.encodeAcceptUri(
-            sessionId = offer.sessionId,
-            targetPeerDeviceId = offer.senderDeviceId,
-            offerTranscriptDigest = offerDigest,
-            senderDeviceId = localDeviceId,
-            senderIkSigSpki = localIkSpki,
-            senderSpk = localSpk,
-            nonce = acceptNonce,
-            issuedAtEpochSec = nowEpochSec,
-            expiresAtEpochSec = acceptExp,
-            signature = acceptSig
-        )
+        val acceptParsed = QrPairingCodec.decodeAndVerifySignatures(acceptQr)
 
-        val dhSecret = keyVault.agreeWithSignedPreKey(localSpk.spkId, offer.senderSpk.publicKeySpki)
-        val rootPairingKey = EcP256Crypto.deriveRootPairingKey(
-            dhSharedSecret = dhSecret,
-            sessionId = offer.sessionId,
-            offerNonce = offer.nonce,
-            acceptNonce = acceptNonce,
-            offerDeviceId = offer.senderDeviceId,
-            offerIkSpki = offer.senderIkSigSpki,
-            acceptDeviceId = localDeviceId,
-            acceptIkSpki = localIkSpki
-        )
+        val rootKey = try {
+            deriveRootPairingKey(
+                localSpkId = localIdentity.currentSignedPreKey.spkId,
+                peerSpk = offer.senderSpk,
+                initiatorIdentitySpki = offer.senderIkSigSpki,
+                responderIdentitySpki = localIdentity.identitySigningPublicKeySpki,
+                initiatorDeviceId = offer.senderDeviceId,
+                responderDeviceId = localIdentity.deviceId,
+                sessionId = offer.sessionId,
+                offerDigest = offer.rawTranscriptDigestSha256,
+                acceptDigest = acceptParsed.rawTranscriptDigestSha256,
+                offerNonce = offer.senderNonce,
+                acceptNonce = acceptNonce
+            )
+        } catch (e: Exception) {
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.INVALID_PUBLIC_KEY,
+                PairingRejectionReason.INVALID_PUBLIC_KEY.persianMessage
+            )
+        }
 
         val safetyNumber = SafetyFingerprint.computeSafetyNumber(
-            localDeviceId = localDeviceId,
-            localIkSpki = localIkSpki,
+            localDeviceId = localIdentity.deviceId,
+            localIdentityPublicKeySpki = localIdentity.identitySigningPublicKeySpki,
             peerDeviceId = offer.senderDeviceId,
-            peerIkSpki = offer.senderIkSigSpki
+            peerIdentityPublicKeySpki = offer.senderIkSigSpki
         )
-        val sessionCode = SafetyFingerprint.computeSessionVerificationCode(
+        val publicTranscriptId = SafetyFingerprint.computePublicHandshakeTranscriptId(
             sessionId = offer.sessionId,
-            offerDigest = offerDigest,
-            offerNonce = offer.nonce,
+            offerDigest = offer.rawTranscriptDigestSha256,
+            offerNonce = offer.senderNonce,
             acceptNonce = acceptNonce
         )
-        val keyChangeAlert = checkArchivedPeerKeyChange(
-            newPeerDeviceId = offer.senderDeviceId,
-            newPeerIkSpki = offer.senderIkSigSpki,
-            newSafetyNumber = safetyNumber
-        )
 
-        trustStore.recordReplayToken(replayToken)
-        activeOffer = null
-        clearStagedConfirmation()
-        stagedConfirmation = StagedConfirmation(
-            role = PairingStateSnapshot.AwaitingUserConfirmation.Role.RESPONDER,
-            acceptQrUri = acceptUri,
-            candidateRecord = PairedPeerRecord(
-                peerDeviceId = offer.senderDeviceId,
-                peerIkSigSpki = offer.senderIkSigSpki,
-                peerSpkId = offer.senderSpk.spkId,
-                peerSpkDhSpki = offer.senderSpk.publicKeySpki,
-                peerSpkIssuedAtSec = offer.senderSpk.issuedAtEpochSec,
-                peerSpkExpiresAtSec = offer.senderSpk.expiresAtEpochSec,
-                peerSpkSignature = offer.senderSpk.signature,
-                safetyNumber = safetyNumber,
-                rootPairingKey = rootPairingKey,
-                pairedAtEpochSec = nowEpochSec
-            ),
-            sessionVerificationCode = sessionCode,
-            expiresAtEpochSec = acceptExp,
-            keyChangeAlert = keyChangeAlert
+        try {
+            trustStore.recordReplayToken(replayToken)
+        } catch (e: TrustStorageCorruptedException) {
+            Arrays.fill(rootKey, 0.toByte())
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.TRUST_STORAGE_CORRUPTED,
+                e.message ?: PairingRejectionReason.TRUST_STORAGE_CORRUPTED.persianMessage
+            )
+        }
+
+        pendingConfirmation?.let { Arrays.fill(it.derivedRootPairingKey, 0.toByte()) }
+        pendingConfirmation = PendingPairingConfirmation(
+            sessionId = offer.sessionId.copyOf(),
+            peerDeviceId = offer.senderDeviceId.copyOf(),
+            peerIkSigSpki = offer.senderIkSigSpki.copyOf(),
+            peerSpk = offer.senderSpk,
+            derivedRootPairingKey = rootKey,
+            safetyNumber = safetyNumber,
+            publicHandshakeTranscriptId = publicTranscriptId,
+            responseQrStringForPeer = acceptQr,
+            previousPeerChanged = previousCheck.first,
+            previousPeerDeviceIdHex = previousCheck.second
         )
 
         return QrProcessResult.ResponderReadyToConfirm(
-            acceptQrUri = acceptUri,
-            peerDeviceId = offer.senderDeviceId,
+            acceptQrToDisplay = acceptQr,
             safetyNumber = safetyNumber,
-            sessionVerificationCode = sessionCode,
-            expiresAtEpochSec = acceptExp,
-            keyChangeFromPreviousPeer = keyChangeAlert
+            publicHandshakeTranscriptId = publicTranscriptId,
+            peerDeviceIdHex = ByteEncoding.toHexLower(offer.senderDeviceId),
+            previousPeerChanged = previousCheck.first,
+            previousPeerDeviceIdHex = previousCheck.second
         )
     }
 
-    private fun handleAcceptAsInitiator(
-        accept: QrPairingCodec.DecodedQrPacket.Accept,
+    private fun handleIncomingAccept(
+        accept: PairingQrPacket,
+        localIdentity: LocalIdentityPublic,
         replayToken: ByteArray,
         nowEpochSec: Long
     ): QrProcessResult {
-        val localDeviceId = keyVault.getDeviceId()
-        if (accept.targetPeerDeviceId != localDeviceId) {
-            return QrProcessResult.Rejected(PairingRejectionReason.WRONG_PEER_TARGET)
-        }
-        val pendingOffer = activeOffer
-            ?: return QrProcessResult.Rejected(PairingRejectionReason.NO_ACTIVE_OFFER_SESSION)
+        val activeOffer = activeInitiatorOffer
+            ?: return QrProcessResult.Rejected(
+                PairingRejectionReason.UNEXPECTED_PACKET_ROLE,
+                "هیچ درخواست جفت‌سازی فعالی روی این دستگاه وجود ندارد"
+            )
 
-        if (nowEpochSec > pendingOffer.expiresAtEpochSec + CLOCK_SKEW_TOLERANCE_SEC) {
-            activeOffer = null
-            return QrProcessResult.Rejected(PairingRejectionReason.EXPIRED_PAYLOAD)
-        }
-        if (accept.sessionId != pendingOffer.sessionId) {
-            return QrProcessResult.Rejected(PairingRejectionReason.OFFER_DIGEST_MISMATCH)
-        }
-        if (!ByteEncoding.constantTimeEquals(accept.offerTranscriptDigest, pendingOffer.offerTranscriptDigest)) {
-            return QrProcessResult.Rejected(PairingRejectionReason.OFFER_DIGEST_MISMATCH)
+        if (nowEpochSec > activeOffer.packet.expiresAtEpochSec) {
+            activeInitiatorOffer = null
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.EXPIRED_QR,
+                "درخواست جفت‌سازی اولیه منقضی شده است؛ کد جدید بسازید"
+            )
         }
 
-        val localIkSpki = keyVault.getIdentityPublicKeySpki()
-        val dhSecret = keyVault.agreeWithSignedPreKey(
-            localSpkId = pendingOffer.localSpk.spkId,
-            peerDhPublicKeySpki = accept.senderSpk.publicKeySpki
-        )
-        val rootPairingKey = EcP256Crypto.deriveRootPairingKey(
-            dhSharedSecret = dhSecret,
-            sessionId = pendingOffer.sessionId,
-            offerNonce = pendingOffer.offerNonce,
-            acceptNonce = accept.nonce,
-            offerDeviceId = localDeviceId,
-            offerIkSpki = localIkSpki,
-            acceptDeviceId = accept.senderDeviceId,
-            acceptIkSpki = accept.senderIkSigSpki
-        )
+        val targetInitId = accept.targetInitiatorDeviceId
+        val boundOfferDigest = accept.boundOfferDigest
+        if (targetInitId == null ||
+            boundOfferDigest == null ||
+            !ByteEncoding.constantTimeEquals(accept.sessionId, activeOffer.packet.sessionId) ||
+            !ByteEncoding.constantTimeEquals(targetInitId, localIdentity.deviceId) ||
+            !ByteEncoding.constantTimeEquals(boundOfferDigest, activeOffer.packet.rawTranscriptDigestSha256)
+        ) {
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.SESSION_MISMATCH,
+                PairingRejectionReason.SESSION_MISMATCH.persianMessage
+            )
+        }
+
+        val previousCheck = evaluateArchivedPeerHistoryStrict(accept.senderIkSigSpki)
+            ?: return QrProcessResult.Rejected(
+                PairingRejectionReason.TRUST_STORAGE_CORRUPTED,
+                PairingRejectionReason.TRUST_STORAGE_CORRUPTED.persianMessage
+            )
+
+        val rootKey = try {
+            deriveRootPairingKey(
+                localSpkId = activeOffer.localSpkIdUsed,
+                peerSpk = accept.senderSpk,
+                initiatorIdentitySpki = localIdentity.identitySigningPublicKeySpki,
+                responderIdentitySpki = accept.senderIkSigSpki,
+                initiatorDeviceId = localIdentity.deviceId,
+                responderDeviceId = accept.senderDeviceId,
+                sessionId = activeOffer.packet.sessionId,
+                offerDigest = activeOffer.packet.rawTranscriptDigestSha256,
+                acceptDigest = accept.rawTranscriptDigestSha256,
+                offerNonce = activeOffer.packet.senderNonce,
+                acceptNonce = accept.senderNonce
+            )
+        } catch (e: Exception) {
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.INVALID_PUBLIC_KEY,
+                PairingRejectionReason.INVALID_PUBLIC_KEY.persianMessage
+            )
+        }
 
         val safetyNumber = SafetyFingerprint.computeSafetyNumber(
-            localDeviceId = localDeviceId,
-            localIkSpki = localIkSpki,
+            localDeviceId = localIdentity.deviceId,
+            localIdentityPublicKeySpki = localIdentity.identitySigningPublicKeySpki,
             peerDeviceId = accept.senderDeviceId,
-            peerIkSpki = accept.senderIkSigSpki
+            peerIdentityPublicKeySpki = accept.senderIkSigSpki
         )
-        val sessionCode = SafetyFingerprint.computeSessionVerificationCode(
-            sessionId = pendingOffer.sessionId,
-            offerDigest = pendingOffer.offerTranscriptDigest,
-            offerNonce = pendingOffer.offerNonce,
-            acceptNonce = accept.nonce
-        )
-        val keyChangeAlert = checkArchivedPeerKeyChange(
-            newPeerDeviceId = accept.senderDeviceId,
-            newPeerIkSpki = accept.senderIkSigSpki,
-            newSafetyNumber = safetyNumber
+        val publicTranscriptId = SafetyFingerprint.computePublicHandshakeTranscriptId(
+            sessionId = activeOffer.packet.sessionId,
+            offerDigest = activeOffer.packet.rawTranscriptDigestSha256,
+            offerNonce = activeOffer.packet.senderNonce,
+            acceptNonce = accept.senderNonce
         )
 
-        trustStore.recordReplayToken(replayToken)
-        activeOffer = null
-        clearStagedConfirmation()
-        stagedConfirmation = StagedConfirmation(
-            role = PairingStateSnapshot.AwaitingUserConfirmation.Role.INITIATOR,
-            acceptQrUri = null,
-            candidateRecord = PairedPeerRecord(
-                peerDeviceId = accept.senderDeviceId,
-                peerIkSigSpki = accept.senderIkSigSpki,
-                peerSpkId = accept.senderSpk.spkId,
-                peerSpkDhSpki = accept.senderSpk.publicKeySpki,
-                peerSpkIssuedAtSec = accept.senderSpk.issuedAtEpochSec,
-                peerSpkExpiresAtSec = accept.senderSpk.expiresAtEpochSec,
-                peerSpkSignature = accept.senderSpk.signature,
-                safetyNumber = safetyNumber,
-                rootPairingKey = rootPairingKey,
-                pairedAtEpochSec = nowEpochSec
-            ),
-            sessionVerificationCode = sessionCode,
-            expiresAtEpochSec = accept.expiresAtEpochSec,
-            keyChangeAlert = keyChangeAlert
+        try {
+            trustStore.recordReplayToken(replayToken)
+        } catch (e: TrustStorageCorruptedException) {
+            Arrays.fill(rootKey, 0.toByte())
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.TRUST_STORAGE_CORRUPTED,
+                e.message ?: PairingRejectionReason.TRUST_STORAGE_CORRUPTED.persianMessage
+            )
+        }
+
+        pendingConfirmation?.let { Arrays.fill(it.derivedRootPairingKey, 0.toByte()) }
+        pendingConfirmation = PendingPairingConfirmation(
+            sessionId = activeOffer.packet.sessionId.copyOf(),
+            peerDeviceId = accept.senderDeviceId.copyOf(),
+            peerIkSigSpki = accept.senderIkSigSpki.copyOf(),
+            peerSpk = accept.senderSpk,
+            derivedRootPairingKey = rootKey,
+            safetyNumber = safetyNumber,
+            publicHandshakeTranscriptId = publicTranscriptId,
+            responseQrStringForPeer = null,
+            previousPeerChanged = previousCheck.first,
+            previousPeerDeviceIdHex = previousCheck.second
         )
+        activeInitiatorOffer = null
 
         return QrProcessResult.InitiatorReadyToConfirm(
-            peerDeviceId = accept.senderDeviceId,
             safetyNumber = safetyNumber,
-            sessionVerificationCode = sessionCode,
-            keyChangeFromPreviousPeer = keyChangeAlert
+            publicHandshakeTranscriptId = publicTranscriptId,
+            peerDeviceIdHex = ByteEncoding.toHexLower(accept.senderDeviceId),
+            previousPeerChanged = previousCheck.first,
+            previousPeerDeviceIdHex = previousCheck.second
         )
     }
 
-    private fun checkArchivedPeerKeyChange(
-        newPeerDeviceId: String,
-        newPeerIkSpki: ByteArray,
-        newSafetyNumber: String
-    ): KeyChangeAlert? {
-        val archived = trustStore.loadArchivedPreviousPeer() ?: return null
-        if (ByteEncoding.constantTimeEquals(archived.peerIkSigSpki, newPeerIkSpki)) {
-            return null
+    /**
+     * Evaluates historical archived peer state strictly:
+     * - [ArchivedPeerReadResult.None] -> `false to null`
+     * - [ArchivedPeerReadResult.Valid] -> `changed to prevHex`
+     * - [ArchivedPeerReadResult.Corrupted] -> `null` (caller MUST block fail-closed!)
+     */
+    private fun evaluateArchivedPeerHistoryStrict(candidateIkSpki: ByteArray): Pair<Boolean, String?>? {
+        return when (val prev = trustStore.readArchivedPreviousPeer()) {
+            is ArchivedPeerReadResult.None -> false to null
+            is ArchivedPeerReadResult.Corrupted -> null
+            is ArchivedPeerReadResult.Valid -> {
+                val changed = !ByteEncoding.constantTimeEquals(prev.identity.peerIkSigSpki, candidateIkSpki)
+                changed to ByteEncoding.toHexLower(prev.identity.peerDeviceId)
+            }
         }
-        return KeyChangeAlert(
-            previousDeviceId = archived.peerDeviceId,
-            previousSafetyNumber = archived.safetyNumber,
-            newDeviceId = newPeerDeviceId,
-            newSafetyNumber = newSafetyNumber
-        )
     }
 
-    private fun isFreshTimestampWindow(iat: Long, exp: Long, now: Long): Boolean {
-        if (exp <= iat) return false
-        if (exp - iat > MAX_OFFER_WINDOW_SEC) return false
-        if (iat > now + CLOCK_SKEW_TOLERANCE_SEC) return false
-        if (now > exp + CLOCK_SKEW_TOLERANCE_SEC) return false
-        return true
-    }
+    private fun deriveRootPairingKey(
+        localSpkId: Int,
+        peerSpk: SignedPreKeyPublic,
+        initiatorIdentitySpki: ByteArray,
+        responderIdentitySpki: ByteArray,
+        initiatorDeviceId: ByteArray,
+        responderDeviceId: ByteArray,
+        sessionId: ByteArray,
+        offerDigest: ByteArray,
+        acceptDigest: ByteArray,
+        offerNonce: ByteArray,
+        acceptNonce: ByteArray
+    ): ByteArray {
+        val ecdhShared = keyVault.agreeWithSignedPreKey(localSpkId, peerSpk.publicKeySpki)
+        return try {
+            val salt = MessageDigest.getInstance("SHA-256").run {
+                update("DuoLink-PairSalt-v1".toByteArray(StandardCharsets.UTF_8))
+                update(sessionId)
+                update(offerNonce)
+                update(acceptNonce)
+                digest()
+            }
+            val infoPrefix = "DuoLink-PairRoot-v1".toByteArray(StandardCharsets.UTF_8)
+            val infoBuf = ByteBuffer.allocate(
+                infoPrefix.size +
+                    16 + 16 +
+                    4 + initiatorIdentitySpki.size +
+                    4 + responderIdentitySpki.size +
+                    32 + 32
+            )
+            infoBuf.put(infoPrefix)
+            infoBuf.put(initiatorDeviceId)
+            infoBuf.put(responderDeviceId)
+            infoBuf.putInt(initiatorIdentitySpki.size)
+            infoBuf.put(initiatorIdentitySpki)
+            infoBuf.putInt(responderIdentitySpki.size)
+            infoBuf.put(responderIdentitySpki)
+            infoBuf.put(offerDigest)
+            infoBuf.put(acceptDigest)
 
-    private fun computeReplayToken(packet: QrPairingCodec.DecodedQrPacket): ByteArray {
-        val typeLabel = when (packet) {
-            is QrPairingCodec.DecodedQrPacket.Offer -> "OFFER"
-            is QrPairingCodec.DecodedQrPacket.Accept -> "ACCEPT"
+            HkdfSha256.deriveKey(
+                ikm = ecdhShared,
+                salt = salt,
+                info = infoBuf.array(),
+                outputLength = 32
+            )
+        } finally {
+            Arrays.fill(ecdhShared, 0.toByte())
         }
-        val transcript = TranscriptBuilder()
-            .putUtf8("DUOLINK-REPLAY-TOKEN-V1")
-            .putUtf8(typeLabel)
-            .putUtf8(packet.sessionId)
-            .putUtf8(packet.senderDeviceId)
-            .putBytes(packet.nonce)
-            .build()
-        return ByteEncoding.sha256(transcript)
     }
 
-    private fun clearStagedConfirmation() {
-        stagedConfirmation?.candidateRecord?.rootPairingKey?.zeroize()
-        stagedConfirmation = null
+    private fun buildReplayToken(packet: PairingQrPacket): ByteArray {
+        val buf = ByteBuffer.allocate(1 + 16 + 16 + 32)
+        buf.put(packet.role.wireCode)
+        buf.put(packet.sessionId)
+        buf.put(packet.senderDeviceId)
+        buf.put(packet.senderNonce)
+        return buf.array()
     }
 
-    private fun currentEpochSec(): Long = System.currentTimeMillis() / 1000L
+    companion object {
+        const val DEFAULT_QR_TTL_SECONDS: Long = 300L
+        const val DEFAULT_CLOCK_SKEW_SECONDS: Long = 90L
+
+        fun currentEpochSec(): Long = System.currentTimeMillis() / 1000L
+    }
 }

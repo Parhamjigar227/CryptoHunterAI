@@ -1,252 +1,462 @@
 package com.duolink.app.pairing
 
 import com.duolink.app.crypto.ByteEncoding
+import com.duolink.app.crypto.EcP256Crypto
+import com.duolink.app.crypto.KeyValueByteStore
+import com.duolink.app.crypto.RawStoreRead
+import com.duolink.app.crypto.SignedPreKeyPublic
 import com.duolink.app.crypto.StorageSealer
-import java.io.ByteArrayOutputStream
-import java.io.File
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import java.security.GeneralSecurityException
+import java.security.MessageDigest
 
 /**
- * Minimal key-value byte storage interface so PeerTrustStore runs identically against
- * app-private files on Android and in-memory maps in deterministic unit tests.
+ * Identifies which security storage component failed integrity/authentication validation.
  */
-interface KeyValueByteStore {
-    fun read(key: String): ByteArray?
-    fun write(key: String, bytes: ByteArray)
-    fun delete(key: String)
-}
-
-class InMemoryByteStore : KeyValueByteStore {
-    private val map = HashMap<String, ByteArray>()
-    override fun read(key: String): ByteArray? = map[key]?.copyOf()
-    override fun write(key: String, bytes: ByteArray) {
-        map[key] = bytes.copyOf()
-    }
-    override fun delete(key: String) {
-        map.remove(key)
-    }
-}
-
-class DirectoryFileByteStore(private val directory: File) : KeyValueByteStore {
-    init {
-        if (!directory.exists()) {
-            directory.mkdirs()
-        }
-    }
-
-    private fun fileFor(key: String): File {
-        val safeName = key.replace(Regex("[^a-zA-Z0-9._-]"), "_") + ".bin"
-        return File(directory, safeName)
-    }
-
-    override fun read(key: String): ByteArray? {
-        val f = fileFor(key)
-        return if (f.exists() && f.isFile) f.readBytes() else null
-    }
-
-    override fun write(key: String, bytes: ByteArray) {
-        val target = fileFor(key)
-        val tmp = File(directory, target.name + ".tmp")
-        tmp.writeBytes(bytes)
-        if (!tmp.renameTo(target)) {
-            target.writeBytes(bytes)
-            tmp.delete()
-        }
-    }
-
-    override fun delete(key: String) {
-        fileFor(key).delete()
-    }
+enum class TrustStoreComponent {
+    PINNED_PEER,
+    ARCHIVED_PEER,
+    REPLAY_LEDGER,
+    KEY_VAULT
 }
 
 /**
- * Encrypted persistent store for:
- * 1. The single pinned peer identity & derived RootPairingKey (enforcing max 1 peer = 2 devices total).
- * 2. Historical previous peer identity (to surface KeyChangeAlert during re-pairing if peer key changed).
- * 3. Bounded persistent replay-nonce ledger (prevents QR replay even across app restarts).
+ * Thrown whenever encrypted trust/replay storage fails AEAD authentication, binary schema checks,
+ * embedded signature checks, or anti-deletion invariants. Callers MUST fail closed.
+ */
+class TrustStorageCorruptedException(
+    val component: TrustStoreComponent,
+    message: String,
+    cause: Throwable? = null
+) : GeneralSecurityException(message, cause)
+
+/**
+ * Tri-state read outcome for the active pinned peer record (`pinned_peer_v1`).
+ */
+sealed class PinnedPeerReadResult {
+    data object None : PinnedPeerReadResult()
+    data class Valid(val record: PairedPeerRecord) : PinnedPeerReadResult()
+    data class Corrupted(val reason: String) : PinnedPeerReadResult()
+}
+
+/**
+ * Tri-state read outcome for the archived historical peer identity (`archived_peer_v1`).
+ *
+ * Security rule: [Corrupted] MUST block pairing and re-pairing so an attacker or storage fault cannot
+ * bypass key-change warnings (`previousPeerChanged`) by corrupting `archived_peer_v1`.
+ */
+sealed class ArchivedPeerReadResult {
+    data object None : ArchivedPeerReadResult()
+    data class Valid(val identity: PeerTrustStore.ArchivedPeerIdentity) : ArchivedPeerReadResult()
+    data class Corrupted(val reason: String) : ArchivedPeerReadResult()
+}
+
+/**
+ * Tri-state read outcome for the persistent QR replay ledger (`replay_ledger_v1`).
+ */
+sealed class ReplayLedgerReadResult {
+    data object Uninitialized : ReplayLedgerReadResult()
+    data class Valid(val hashes: List<ByteArray>) : ReplayLedgerReadResult()
+    data class Corrupted(val reason: String) : ReplayLedgerReadResult()
+}
+
+/**
+ * Aggregate health state of all trust-store records.
+ */
+sealed class TrustStoreHealth {
+    data object Healthy : TrustStoreHealth()
+    data class Corrupted(
+        val component: TrustStoreComponent,
+        val reason: String
+    ) : TrustStoreHealth()
+}
+
+/**
+ * Encrypted, authenticated persistence for:
+ * 1. The single allowed peer trust record (`pinned_peer_v1`), sealed with `AES-256-GCM` + domain AAD.
+ * 2. Previous peer identity history (`archived_peer_v1`) so re-pairing with a changed key triggers an
+ *    explicit key-change warning; corruption fails closed instead of returning `None`.
+ * 3. Persistent replay ledger (`replay_ledger_v1`) of consumed QR session/nonce digests so replayed QR
+ *    codes are rejected even across app restarts; corruption or deletion fails closed.
  */
 class PeerTrustStore(
-    private val byteStore: KeyValueByteStore,
+    private val store: KeyValueByteStore,
     private val sealer: StorageSealer
 ) {
-    data class ArchivedPeerIdentity(
-        val peerDeviceId: String,
-        val peerIkSigSpki: ByteArray,
-        val safetyNumber: String
-    )
+
+    /**
+     * Evaluates integrity and cryptographic authenticity across `pinned_peer_v1`, `archived_peer_v1`,
+     * and `replay_ledger_v1`, including anti-deletion cross-checks.
+     */
+    @Synchronized
+    fun inspectHealth(): TrustStoreHealth {
+        val pinned = readPinnedPeer()
+        if (pinned is PinnedPeerReadResult.Corrupted) {
+            return TrustStoreHealth.Corrupted(TrustStoreComponent.PINNED_PEER, pinned.reason)
+        }
+        val archived = readArchivedPreviousPeer()
+        if (archived is ArchivedPeerReadResult.Corrupted) {
+            return TrustStoreHealth.Corrupted(TrustStoreComponent.ARCHIVED_PEER, archived.reason)
+        }
+        val replay = readReplayLedger()
+        if (replay is ReplayLedgerReadResult.Corrupted) {
+            return TrustStoreHealth.Corrupted(TrustStoreComponent.REPLAY_LEDGER, replay.reason)
+        }
+        if ((pinned is PinnedPeerReadResult.Valid || archived is ArchivedPeerReadResult.Valid) &&
+            replay is ReplayLedgerReadResult.Uninitialized
+        ) {
+            return TrustStoreHealth.Corrupted(
+                TrustStoreComponent.REPLAY_LEDGER,
+                "Replay ledger missing alongside active or archived trust state"
+            )
+        }
+        return TrustStoreHealth.Healthy
+    }
 
     @Synchronized
-    fun loadPinnedPeer(): PairedPeerRecord? {
-        val sealed = byteStore.read(KEY_PINNED_PEER) ?: return null
-        val plain = sealer.unseal(sealed, AAD_PINNED_PEER)
-        return deserializePeerRecord(plain)
+    fun ensureHealthyOrThrow() {
+        when (val health = inspectHealth()) {
+            is TrustStoreHealth.Healthy -> return
+            is TrustStoreHealth.Corrupted -> throw TrustStorageCorruptedException(
+                component = health.component,
+                message = health.reason
+            )
+        }
+    }
+
+    @Synchronized
+    fun readPinnedPeer(): PinnedPeerReadResult {
+        return when (val raw = store.readState(KEY_PINNED_PEER)) {
+            is RawStoreRead.Missing -> PinnedPeerReadResult.None
+            is RawStoreRead.CorruptedIo -> PinnedPeerReadResult.Corrupted(raw.detail)
+            is RawStoreRead.Present -> {
+                val plain = try {
+                    sealer.unseal(raw.bytes, AAD_PINNED_PEER)
+                } catch (e: Exception) {
+                    return PinnedPeerReadResult.Corrupted(
+                        "Pinned peer record failed AEAD authentication: ${e.javaClass.simpleName}"
+                    )
+                }
+                try {
+                    PinnedPeerReadResult.Valid(deserializePeerRecordStrict(plain))
+                } catch (e: Exception) {
+                    PinnedPeerReadResult.Corrupted(
+                        "Pinned peer record failed schema/key validation: ${e.message ?: e.javaClass.simpleName}"
+                    )
+                }
+            }
+        }
+    }
+
+    @Synchronized
+    fun readArchivedPreviousPeer(): ArchivedPeerReadResult {
+        return when (val raw = store.readState(KEY_ARCHIVED_PEER)) {
+            is RawStoreRead.Missing -> ArchivedPeerReadResult.None
+            is RawStoreRead.CorruptedIo -> ArchivedPeerReadResult.Corrupted(raw.detail)
+            is RawStoreRead.Present -> {
+                val plain = try {
+                    sealer.unseal(raw.bytes, AAD_ARCHIVED_PEER)
+                } catch (e: Exception) {
+                    return ArchivedPeerReadResult.Corrupted(
+                        "Archived peer record failed AEAD authentication: ${e.javaClass.simpleName}"
+                    )
+                }
+                try {
+                    ArchivedPeerReadResult.Valid(deserializeArchivedPeerStrict(plain))
+                } catch (e: Exception) {
+                    ArchivedPeerReadResult.Corrupted(
+                        "Archived peer record failed schema/key validation: ${e.message ?: e.javaClass.simpleName}"
+                    )
+                }
+            }
+        }
+    }
+
+    @Synchronized
+    fun readReplayLedger(): ReplayLedgerReadResult {
+        return when (val raw = store.readState(KEY_REPLAY_LEDGER)) {
+            is RawStoreRead.Missing -> ReplayLedgerReadResult.Uninitialized
+            is RawStoreRead.CorruptedIo -> ReplayLedgerReadResult.Corrupted(raw.detail)
+            is RawStoreRead.Present -> {
+                val plain = try {
+                    sealer.unseal(raw.bytes, AAD_REPLAY_LEDGER)
+                } catch (e: Exception) {
+                    return ReplayLedgerReadResult.Corrupted(
+                        "Replay ledger failed AEAD authentication: ${e.javaClass.simpleName}"
+                    )
+                }
+                try {
+                    ReplayLedgerReadResult.Valid(deserializeReplayEntriesStrict(plain))
+                } catch (e: Exception) {
+                    ReplayLedgerReadResult.Corrupted(
+                        "Replay ledger failed schema validation: ${e.message ?: e.javaClass.simpleName}"
+                    )
+                }
+            }
+        }
     }
 
     @Synchronized
     fun savePinnedPeer(record: PairedPeerRecord) {
-        val plain = serializePeerRecord(record)
-        val sealed = sealer.seal(plain, AAD_PINNED_PEER)
-        byteStore.write(KEY_PINNED_PEER, sealed)
-        // Clear archived previous identity once new peer is explicitly confirmed
-        byteStore.delete(KEY_ARCHIVED_PEER)
+        ensureHealthyOrThrow()
+        ensureReplayLedgerInitializedInternal()
+        val plaintext = serializePeerRecord(record)
+        val sealed = sealer.seal(plaintext, AAD_PINNED_PEER)
+        store.write(KEY_PINNED_PEER, sealed)
     }
 
     /**
-     * Unpairs the current peer and archives its public identity fingerprint so a subsequent
-     * re-pairing explicitly warns if the peer's identity key has changed.
+     * Archives the currently pinned peer identity (so subsequent re-pairing detects key changes)
+     * BEFORE deleting the active pinned peer record.
+     *
+     * Fails closed with [TrustStorageCorruptedException] if ANY trust-store component (`pinned_peer_v1`,
+     * `archived_peer_v1`, or `replay_ledger_v1`) is corrupted, never wiping corrupted records silently.
      */
     @Synchronized
     fun archiveAndClearPinnedPeer() {
-        val current = try {
-            loadPinnedPeer()
-        } catch (_: Exception) {
-            null
-        }
-        if (current != null) {
-            val archivedPlain = serializeArchivedPeer(
-                ArchivedPeerIdentity(
-                    peerDeviceId = current.peerDeviceId,
-                    peerIkSigSpki = current.peerIkSigSpki,
-                    safetyNumber = current.safetyNumber
-                )
+        ensureHealthyOrThrow()
+        ensureReplayLedgerInitializedInternal()
+        when (val current = readPinnedPeer()) {
+            is PinnedPeerReadResult.Corrupted -> throw TrustStorageCorruptedException(
+                TrustStoreComponent.PINNED_PEER,
+                current.reason
             )
-            byteStore.write(KEY_ARCHIVED_PEER, sealer.seal(archivedPlain, AAD_ARCHIVED_PEER))
+            is PinnedPeerReadResult.Valid -> {
+                val archivedPlain = serializeArchivedPeer(
+                    current.record.peerDeviceId,
+                    current.record.peerIkSigSpki
+                )
+                // Persist archived identity FIRST before deleting active pinned peer (crash-safe ordering).
+                store.write(KEY_ARCHIVED_PEER, sealer.seal(archivedPlain, AAD_ARCHIVED_PEER))
+                store.delete(KEY_PINNED_PEER)
+            }
+            is PinnedPeerReadResult.None -> {
+                // Keep any existing valid archived_peer_v1 intact across repeated unpair calls.
+            }
         }
-        byteStore.delete(KEY_PINNED_PEER)
     }
 
     @Synchronized
-    fun loadArchivedPreviousPeer(): ArchivedPeerIdentity? {
-        val sealed = byteStore.read(KEY_ARCHIVED_PEER) ?: return null
-        return try {
-            deserializeArchivedPeer(sealer.unseal(sealed, AAD_ARCHIVED_PEER))
-        } catch (_: Exception) {
-            null
+    fun hasSeenReplayToken(token: ByteArray): Boolean {
+        ensureHealthyOrThrow()
+        val targetHash = sha256(token)
+        val entries = when (val replay = readReplayLedger()) {
+            is ReplayLedgerReadResult.Uninitialized -> emptyList()
+            is ReplayLedgerReadResult.Valid -> replay.hashes
+            is ReplayLedgerReadResult.Corrupted -> throw TrustStorageCorruptedException(
+                TrustStoreComponent.REPLAY_LEDGER,
+                replay.reason
+            )
         }
+        return entries.any { ByteEncoding.constantTimeEquals(it, targetHash) }
     }
 
     @Synchronized
-    fun hasSeenReplayToken(replayTokenHash: ByteArray): Boolean {
-        require(replayTokenHash.size == 32)
-        val entries = loadReplayEntriesInternal()
-        return entries.any { ByteEncoding.constantTimeEquals(it, replayTokenHash) }
+    fun recordReplayToken(token: ByteArray) {
+        ensureHealthyOrThrow()
+        val targetHash = sha256(token)
+        val current = when (val replay = readReplayLedger()) {
+            is ReplayLedgerReadResult.Uninitialized -> ArrayList()
+            is ReplayLedgerReadResult.Valid -> ArrayList(replay.hashes)
+            is ReplayLedgerReadResult.Corrupted -> throw TrustStorageCorruptedException(
+                TrustStoreComponent.REPLAY_LEDGER,
+                replay.reason
+            )
+        }
+        if (current.any { ByteEncoding.constantTimeEquals(it, targetHash) }) return
+        current.add(targetHash)
+        while (current.size > MAX_REPLAY_ENTRIES) {
+            current.removeAt(0)
+        }
+        writeReplayEntriesInternal(current)
     }
 
+    /**
+     * Explicit destructive recovery procedure invoked ONLY after explicit user authorization when
+     * security storage has been flagged as corrupted. Purges corrupted files and writes a fresh
+     * authenticated empty replay ledger under `MSK`.
+     */
     @Synchronized
-    fun recordReplayToken(replayTokenHash: ByteArray) {
-        require(replayTokenHash.size == 32)
-        val entries = loadReplayEntriesInternal().toMutableList()
-        if (entries.any { ByteEncoding.constantTimeEquals(it, replayTokenHash) }) return
-        entries.add(replayTokenHash.copyOf())
-        while (entries.size > MAX_REPLAY_ENTRIES) {
-            entries.removeAt(0)
-        }
-        val out = ByteArrayOutputStream(4 + entries.size * 32)
-        out.write(ByteBuffer.allocate(4).putInt(entries.size).array())
-        for (item in entries) {
-            out.write(item)
-        }
-        byteStore.write(KEY_REPLAY_LEDGER, sealer.seal(out.toByteArray(), AAD_REPLAY_LEDGER))
+    fun purgeCorruptedTrustStateForRecovery() {
+        store.delete(KEY_PINNED_PEER)
+        store.delete(KEY_ARCHIVED_PEER)
+        store.delete(KEY_REPLAY_LEDGER)
+        writeReplayEntriesInternal(emptyList())
     }
 
-    private fun loadReplayEntriesInternal(): List<ByteArray> {
-        val sealed = byteStore.read(KEY_REPLAY_LEDGER) ?: return emptyList()
-        val plain = sealer.unseal(sealed, AAD_REPLAY_LEDGER)
+    private fun ensureReplayLedgerInitializedInternal() {
+        when (val replay = readReplayLedger()) {
+            is ReplayLedgerReadResult.Uninitialized -> writeReplayEntriesInternal(emptyList())
+            is ReplayLedgerReadResult.Valid -> return
+            is ReplayLedgerReadResult.Corrupted -> throw TrustStorageCorruptedException(
+                TrustStoreComponent.REPLAY_LEDGER,
+                replay.reason
+            )
+        }
+    }
+
+    private fun writeReplayEntriesInternal(entries: List<ByteArray>) {
+        val buf = ByteBuffer.allocate(1 + 4 + entries.size * 32)
+        buf.put(RECORD_SCHEMA_VERSION)
+        buf.putInt(entries.size)
+        entries.forEach { hash ->
+            require(hash.size == 32) { "Replay digest must be 32 bytes" }
+            buf.put(hash)
+        }
+        store.write(KEY_REPLAY_LEDGER, sealer.seal(buf.array(), AAD_REPLAY_LEDGER))
+    }
+
+    private fun deserializeReplayEntriesStrict(plain: ByteArray): List<ByteArray> {
         val buf = ByteBuffer.wrap(plain)
+        require(buf.remaining() >= 5) { "Replay ledger header truncated" }
+        val ver = buf.get()
+        require(ver == RECORD_SCHEMA_VERSION) { "Unsupported replay ledger schema: $ver" }
         val count = buf.int
-        if (count < 0 || count > MAX_REPLAY_ENTRIES || buf.remaining() != count * 32) {
-            throw SecurityException("Corrupted replay ledger")
-        }
+        require(count in 0..MAX_REPLAY_ENTRIES) { "Invalid replay entry count: $count" }
+        require(buf.remaining() == count * 32) { "Replay ledger body length mismatch" }
         return List(count) {
             ByteArray(32).also { buf.get(it) }
         }
     }
 
+    private fun sha256(input: ByteArray): ByteArray =
+        MessageDigest.getInstance("SHA-256").digest(input)
+
     private fun serializePeerRecord(r: PairedPeerRecord): ByteArray {
-        val out = ByteArrayOutputStream(384)
-        writeUtf8(out, r.peerDeviceId)
-        writeChunk(out, r.peerIkSigSpki)
-        out.write(ByteBuffer.allocate(4).putInt(r.peerSpkId).array())
-        writeChunk(out, r.peerSpkDhSpki)
-        out.write(ByteBuffer.allocate(8).putLong(r.peerSpkIssuedAtSec).array())
-        out.write(ByteBuffer.allocate(8).putLong(r.peerSpkExpiresAtSec).array())
-        writeChunk(out, r.peerSpkSignature)
-        writeUtf8(out, r.safetyNumber)
-        writeChunk(out, r.rootPairingKey)
-        out.write(ByteBuffer.allocate(8).putLong(r.pairedAtEpochSec).array())
-        return out.toByteArray()
+        val snBytes = r.safetyNumber.toByteArray(StandardCharsets.UTF_8)
+        val total =
+            1 +
+                16 +
+                4 + r.peerIkSigSpki.size +
+                4 +
+                8 +
+                4 + r.peerSpkPubSpki.size +
+                4 + r.peerSpkSignature.size +
+                32 +
+                4 + snBytes.size +
+                8 +
+                1
+        val buf = ByteBuffer.allocate(total)
+        buf.put(RECORD_SCHEMA_VERSION)
+        buf.put(r.peerDeviceId)
+        buf.putInt(r.peerIkSigSpki.size)
+        buf.put(r.peerIkSigSpki)
+        buf.putInt(r.peerSpkId)
+        buf.putLong(r.peerSpkCreatedAtEpochSec)
+        buf.putInt(r.peerSpkPubSpki.size)
+        buf.put(r.peerSpkPubSpki)
+        buf.putInt(r.peerSpkSignature.size)
+        buf.put(r.peerSpkSignature)
+        buf.put(r.rootPairingKey)
+        buf.putInt(snBytes.size)
+        buf.put(snBytes)
+        buf.putLong(r.pairedAtEpochSec)
+        buf.put(if (r.safetyNumberVerified) 1.toByte() else 0.toByte())
+        return buf.array()
     }
 
-    private fun deserializePeerRecord(bytes: ByteArray): PairedPeerRecord {
+    private fun deserializePeerRecordStrict(bytes: ByteArray): PairedPeerRecord {
         val buf = ByteBuffer.wrap(bytes)
-        val peerDeviceId = readUtf8(buf)
-        val peerIkSigSpki = readChunk(buf)
+        val version = buf.get()
+        require(version == RECORD_SCHEMA_VERSION) { "Unsupported peer record schema: $version" }
+        val peerDeviceId = ByteArray(16).also { buf.get(it) }
+        val ikLen = buf.int
+        require(ikLen == 91 && buf.remaining() >= ikLen + 4) { "Invalid peer IK length" }
+        val peerIkSpki = ByteArray(ikLen).also { buf.get(it) }
+        val expectedDeviceId = EcP256Crypto.computeDeviceId(peerIkSpki)
+        require(ByteEncoding.constantTimeEquals(peerDeviceId, expectedDeviceId)) {
+            "Pinned peer deviceId does not match peer IK_sig"
+        }
+
         val peerSpkId = buf.int
-        val peerSpkDhSpki = readChunk(buf)
-        val peerSpkIssuedAt = buf.long
-        val peerSpkExpiresAt = buf.long
-        val peerSpkSig = readChunk(buf)
-        val safetyNumber = readUtf8(buf)
-        val rootKey = readChunk(buf)
+        val peerSpkCreatedAt = buf.long
+        val spkLen = buf.int
+        require(spkLen == 91 && buf.remaining() >= spkLen + 4) { "Invalid peer SPK length" }
+        val peerSpkSpki = ByteArray(spkLen).also { buf.get(it) }
+        val sigLen = buf.int
+        require(sigLen in 1..80 && buf.remaining() >= sigLen + 32 + 4) { "Invalid peer SPK signature length" }
+        val peerSpkSig = ByteArray(sigLen).also { buf.get(it) }
+        require(
+            EcP256Crypto.verifySignedPreKey(
+                deviceId = peerDeviceId,
+                identitySigningPublicKeySpki = peerIkSpki,
+                spk = SignedPreKeyPublic(peerSpkId, peerSpkSpki, peerSpkSig, peerSpkCreatedAt)
+            )
+        ) { "Pinned peer SPK signature verification failed" }
+
+        val rootKey = ByteArray(32).also { buf.get(it) }
+        val snLen = buf.int
+        require(snLen in 60..128 && buf.remaining() >= snLen + 9) { "Invalid safety number length" }
+        val snBytes = ByteArray(snLen).also { buf.get(it) }
         val pairedAt = buf.long
-        require(!buf.hasRemaining()) { "Trailing bytes in peer record" }
+        val verifiedFlag = buf.get().toInt()
+        require(verifiedFlag == 0 || verifiedFlag == 1) { "Invalid verified flag: $verifiedFlag" }
+        require(!buf.hasRemaining()) { "Unexpected trailing bytes in pinned peer record" }
+
         return PairedPeerRecord(
             peerDeviceId = peerDeviceId,
-            peerIkSigSpki = peerIkSigSpki,
+            peerIkSigSpki = peerIkSpki,
             peerSpkId = peerSpkId,
-            peerSpkDhSpki = peerSpkDhSpki,
-            peerSpkIssuedAtSec = peerSpkIssuedAt,
-            peerSpkExpiresAtSec = peerSpkExpiresAt,
+            peerSpkPubSpki = peerSpkSpki,
             peerSpkSignature = peerSpkSig,
-            safetyNumber = safetyNumber,
+            peerSpkCreatedAtEpochSec = peerSpkCreatedAt,
             rootPairingKey = rootKey,
-            pairedAtEpochSec = pairedAt
+            safetyNumber = String(snBytes, StandardCharsets.UTF_8),
+            pairedAtEpochSec = pairedAt,
+            safetyNumberVerified = verifiedFlag == 1
         )
     }
 
-    private fun serializeArchivedPeer(a: ArchivedPeerIdentity): ByteArray {
-        val out = ByteArrayOutputStream(192)
-        writeUtf8(out, a.peerDeviceId)
-        writeChunk(out, a.peerIkSigSpki)
-        writeUtf8(out, a.safetyNumber)
-        return out.toByteArray()
+    private fun serializeArchivedPeer(deviceId: ByteArray, ikSpki: ByteArray): ByteArray {
+        val buf = ByteBuffer.allocate(1 + 16 + 4 + ikSpki.size)
+        buf.put(RECORD_SCHEMA_VERSION)
+        buf.put(deviceId)
+        buf.putInt(ikSpki.size)
+        buf.put(ikSpki)
+        return buf.array()
     }
 
-    private fun deserializeArchivedPeer(bytes: ByteArray): ArchivedPeerIdentity {
+    private fun deserializeArchivedPeerStrict(bytes: ByteArray): ArchivedPeerIdentity {
         val buf = ByteBuffer.wrap(bytes)
-        val id = readUtf8(buf)
-        val ik = readChunk(buf)
-        val sn = readUtf8(buf)
-        require(!buf.hasRemaining())
-        return ArchivedPeerIdentity(id, ik, sn)
+        val version = buf.get()
+        require(version == RECORD_SCHEMA_VERSION) { "Unsupported archived peer schema: $version" }
+        require(buf.remaining() >= 20) { "Truncated archived peer header" }
+        val deviceId = ByteArray(16).also { buf.get(it) }
+        val ikLen = buf.int
+        require(ikLen == 91 && buf.remaining() == ikLen) { "Invalid archived peer IK length" }
+        val ikSpki = ByteArray(ikLen).also { buf.get(it) }
+        val expectedDeviceId = EcP256Crypto.computeDeviceId(ikSpki)
+        require(ByteEncoding.constantTimeEquals(deviceId, expectedDeviceId)) {
+            "Archived peer deviceId does not match archived IK_sig"
+        }
+        return ArchivedPeerIdentity(deviceId, ikSpki)
     }
 
-    private fun writeUtf8(out: ByteArrayOutputStream, s: String) =
-        writeChunk(out, s.toByteArray(StandardCharsets.UTF_8))
+    data class ArchivedPeerIdentity(
+        val peerDeviceId: ByteArray,
+        val peerIkSigSpki: ByteArray
+    ) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is ArchivedPeerIdentity) return false
+            return peerDeviceId.contentEquals(other.peerDeviceId) &&
+                peerIkSigSpki.contentEquals(other.peerIkSigSpki)
+        }
 
-    private fun writeChunk(out: ByteArrayOutputStream, b: ByteArray) {
-        out.write(ByteBuffer.allocate(4).putInt(b.size).array())
-        out.write(b)
-    }
-
-    private fun readUtf8(buf: ByteBuffer): String =
-        String(readChunk(buf), StandardCharsets.UTF_8)
-
-    private fun readChunk(buf: ByteBuffer): ByteArray {
-        val len = buf.int
-        require(len in 0..16384 && buf.remaining() >= len) { "Invalid chunk length" }
-        return ByteArray(len).also { buf.get(it) }
+        override fun hashCode(): Int =
+            31 * peerDeviceId.contentHashCode() + peerIkSigSpki.contentHashCode()
     }
 
     companion object {
-        private const val KEY_PINNED_PEER = "pinned_peer_v1"
-        private const val KEY_ARCHIVED_PEER = "archived_peer_v1"
-        private const val KEY_REPLAY_LEDGER = "replay_ledger_v1"
-        private const val MAX_REPLAY_ENTRIES = 512
+        private const val RECORD_SCHEMA_VERSION: Byte = 1
+        private const val MAX_REPLAY_ENTRIES = 256
+        const val KEY_PINNED_PEER = "pinned_peer_v1"
+        const val KEY_ARCHIVED_PEER = "archived_peer_v1"
+        const val KEY_REPLAY_LEDGER = "replay_ledger_v1"
 
-        private val AAD_PINNED_PEER = "duolink:trust_store:pinned_peer:v1".toByteArray(StandardCharsets.UTF_8)
-        private val AAD_ARCHIVED_PEER = "duolink:trust_store:archived_peer:v1".toByteArray(StandardCharsets.UTF_8)
-        private val AAD_REPLAY_LEDGER = "duolink:trust_store:replay_ledger:v1".toByteArray(StandardCharsets.UTF_8)
+        private val AAD_PINNED_PEER = "duolink:trust:pinned_peer:v1".toByteArray(StandardCharsets.UTF_8)
+        private val AAD_ARCHIVED_PEER = "duolink:trust:archived_peer:v1".toByteArray(StandardCharsets.UTF_8)
+        private val AAD_REPLAY_LEDGER = "duolink:trust:replay_ledger:v1".toByteArray(StandardCharsets.UTF_8)
     }
 }

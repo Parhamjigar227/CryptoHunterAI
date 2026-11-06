@@ -46,6 +46,17 @@ object ByteEncoding {
         return String(out)
     }
 
+    fun toHexUpper(bytes: ByteArray): String {
+        val out = CharArray(bytes.size * 2)
+        val digits = "0123456789ABCDEF"
+        for (i in bytes.indices) {
+            val v = bytes[i].toInt() and 0xFF
+            out[i * 2] = digits[v ushr 4]
+            out[i * 2 + 1] = digits[v and 0x0F]
+        }
+        return String(out)
+    }
+
     fun fromHexStrict(hex: String): ByteArray {
         require(hex.isNotEmpty() && hex.length % 2 == 0 && hexLowerPattern.matches(hex)) {
             "Invalid lowercase hex string"
@@ -55,6 +66,16 @@ object ByteEncoding {
             val lo = Character.digit(hex[idx * 2 + 1], 16)
             ((hi shl 4) or lo).toByte()
         }
+    }
+
+    fun compareLexicographically(a: ByteArray, b: ByteArray): Int {
+        val minLen = minOf(a.size, b.size)
+        for (i in 0 until minLen) {
+            val av = a[i].toInt() and 0xFF
+            val bv = b[i].toInt() and 0xFF
+            if (av != bv) return av - bv
+        }
+        return a.size - b.size
     }
 
     fun constantTimeEquals(a: ByteArray, b: ByteArray): Boolean = MessageDigest.isEqual(a, b)

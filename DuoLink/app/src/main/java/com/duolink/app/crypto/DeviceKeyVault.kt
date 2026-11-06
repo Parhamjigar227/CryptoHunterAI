@@ -1,381 +1,796 @@
 package com.duolink.app.crypto
 
-import java.math.BigInteger
+import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.GeneralSecurityException
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
+import java.security.MessageDigest
 import java.security.PrivateKey
+import java.security.PublicKey
 import java.security.SecureRandom
 import java.security.Signature
-import java.security.interfaces.ECPublicKey
-import java.security.spec.ECFieldFp
 import java.security.spec.ECGenParameterSpec
-import java.security.spec.ECPoint
 import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.X509EncodedKeySpec
+import java.util.Arrays
 import javax.crypto.KeyAgreement
 
+/**
+ * Raised when persisted key-vault metadata (`spk_entries_v2`, `vault_init_v2`, or sealed SPK private
+ * key blobs) fails AEAD authentication, schema validation, signature verification, or is deleted
+ * after vault initialization. Callers MUST fail closed rather than silently regenerating keys.
+ */
+class KeyVaultStorageCorruptedException(
+    message: String,
+    cause: Throwable? = null
+) : GeneralSecurityException(message, cause)
+
+/**
+ * Health check result for local key-vault metadata.
+ */
+sealed class VaultHealth {
+    data object Healthy : VaultHealth()
+    data class Corrupted(val reason: String) : VaultHealth()
+}
+
+/**
+ * Public metadata of a device's Signed Pre-Key (`SPK_dh`, NIST P-256 ECDH keypair) signed by `IK_sig`.
+ */
 data class SignedPreKeyPublic(
     val spkId: Int,
     val publicKeySpki: ByteArray,
-    val issuedAtEpochSec: Long,
-    val expiresAtEpochSec: Long,
-    val signature: ByteArray
+    val signatureByIdentityKey: ByteArray,
+    val createdAtEpochSec: Long
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is SignedPreKeyPublic) return false
         return spkId == other.spkId &&
-            issuedAtEpochSec == other.issuedAtEpochSec &&
-            expiresAtEpochSec == other.expiresAtEpochSec &&
+            createdAtEpochSec == other.createdAtEpochSec &&
             publicKeySpki.contentEquals(other.publicKeySpki) &&
-            signature.contentEquals(other.signature)
+            signatureByIdentityKey.contentEquals(other.signatureByIdentityKey)
     }
 
     override fun hashCode(): Int {
         var result = spkId
         result = 31 * result + publicKeySpki.contentHashCode()
-        result = 31 * result + issuedAtEpochSec.hashCode()
-        result = 31 * result + expiresAtEpochSec.hashCode()
-        result = 31 * result + signature.contentHashCode()
+        result = 31 * result + signatureByIdentityKey.contentHashCode()
+        result = 31 * result + createdAtEpochSec.hashCode()
         return result
     }
 }
 
 /**
- * Standard NIST P-256 (secp256r1) cryptographic validation, signature verification,
- * ECDH key agreement, and HKDF root key derivation.
+ * Immutable public identity bundle for this device.
+ */
+data class LocalIdentityPublic(
+    val deviceId: ByteArray,
+    val identitySigningPublicKeySpki: ByteArray,
+    val currentSignedPreKey: SignedPreKeyPublic
+) {
+    val deviceIdHex: String get() = ByteEncoding.toHexLower(deviceId)
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is LocalIdentityPublic) return false
+        return deviceId.contentEquals(other.deviceId) &&
+            identitySigningPublicKeySpki.contentEquals(other.identitySigningPublicKeySpki) &&
+            currentSignedPreKey == other.currentSignedPreKey
+    }
+
+    override fun hashCode(): Int {
+        var result = deviceId.contentHashCode()
+        result = 31 * result + identitySigningPublicKeySpki.contentHashCode()
+        result = 31 * result + currentSignedPreKey.hashCode()
+        return result
+    }
+}
+
+/**
+ * Abstraction over the device's cryptographic key vault.
+ *
+ * Production Android implementation: `AndroidKeystoreVault`
+ *   - `IK_sig` (`secp256r1` ECDSA): generated inside `AndroidKeyStore`.
+ *   - `MSK` (`AES-256-GCM`): generated inside `AndroidKeyStore`.
+ *   - `SPK_dh` (`secp256r1` ECDH):
+ *       - Android 12+ (API 31+) when KeyMint supports `PURPOSE_AGREE_KEY`: generated inside `AndroidKeyStore`.
+ *       - Android 8.0–11 (API 26–30) or HAL fallback: software-generated in app memory, encrypted at rest
+ *         under `MSK` (`AES-256-GCM`), and decrypted transiently in heap memory during `agreeWithSignedPreKey`.
+ *         Reported honestly as [KeyProtectionTier.SOFTWARE_WRAPPED_AT_REST] (neither hardware-backed nor
+ *         non-exportable from process RAM).
+ */
+interface DeviceKeyVault {
+    fun checkVaultHealth(): VaultHealth
+    fun getOrCreateLocalIdentity(nowEpochSec: Long): LocalIdentityPublic
+    fun signWithIdentityKey(payload: ByteArray): ByteArray
+    fun agreeWithSignedPreKey(localSpkId: Int, peerPublicKeySpki: ByteArray): ByteArray
+    fun rotateSignedPreKey(nowEpochSec: Long): SignedPreKeyPublic
+    fun resetIdentityKeys(nowEpochSec: Long): LocalIdentityPublic
+    fun getKeyProtectionReport(nowEpochSec: Long): KeyProtectionReport
+}
+
+/**
+ * Canonical JCA operations for NIST P-256 (`secp256r1`) signatures, ECDH key agreement, and `deviceId` derivation.
+ *
+ * Provider selection note:
+ * - Calls use standard JCA factory methods (`getInstance(algorithm)`) without hardcoding a provider name,
+ *   except when `AndroidKeyStore` is explicitly requested by `AndroidKeystoreVault` for API 31+ `KeyAgreement`.
+ * - On Android runtime, software EC/ECDH/ECDSA operations resolve via default JCA priority to `AndroidOpenSSL`
+ *   (Conscrypt / BoringSSL), whereas `AndroidKeyStore` private keys route via JCA delayed provider selection to
+ *   the platform Keystore provider.
+ * - On OpenJDK 17 JVM unit tests, default JCA priority resolves to `SunEC` / `SunJCE`.
  */
 object EcP256Crypto {
-    const val CURVE_STD_NAME = "secp256r1"
-    const val SIGNATURE_ALG = "SHA256withECDSA"
-    const val ECDH_ALG = "ECDH"
-    const val DEFAULT_SPK_VALIDITY_SEC: Long = 30L * 24L * 3600L // 30 days
-    private const val MAX_DER_SIG_BYTES = 80
-    private const val MIN_DER_SIG_BYTES = 64
-
-    // Official FIPS 186-4 / SEC 2 secp256r1 domain parameters
-    private val P256_P = BigInteger("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff", 16)
-    private val P256_A = BigInteger("ffffffff00000001000000000000000000000000fffffffffffffffffffffffc", 16)
-    private val P256_B = BigInteger("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b", 16)
-    private val P256_GX = BigInteger("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296", 16)
-    private val P256_GY = BigInteger("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5", 16)
-    private val P256_N = BigInteger("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", 16)
+    const val CURVE_NAME = "secp256r1"
+    const val SIGNATURE_ALGORITHM = "SHA256withECDSA"
+    const val KEY_AGREEMENT_ALGORITHM = "ECDH"
+    private val SPK_SIG_DOMAIN = "DuoLink-SPK-v1".toByteArray(StandardCharsets.UTF_8)
 
     /**
-     * Parses X.509 SubjectPublicKeyInfo DER bytes and strictly validates:
-     * 1. Key type is ECPublicKey on exact NIST P-256 (secp256r1) parameters.
-     * 2. Point Q is not infinity, coordinates in [0, p-1], and satisfies y^2 = x^3 + ax + b (mod p)
-     *    (defends against invalid-curve / twist attacks prior to ECDH).
-     * 3. Canonical DER round-trip matches input byte-for-byte (prevents DER malleability).
+     * Expected X.509 SubjectPublicKeyInfo prefix for uncompressed NIST P-256 (`secp256r1`) public keys (26 bytes),
+     * followed by `0x04 || X (32B) || Y (32B)` = 91 bytes total.
      */
-    fun validateAndParsePublicKey(spkiBytes: ByteArray): ECPublicKey {
-        if (spkiBytes.size !in 88..96) {
-            throw GeneralSecurityException("Unexpected EC P-256 SPKI key length: ${spkiBytes.size}")
+    private val P256_UNCOMPRESSED_SPKI_PREFIX = byteArrayOf(
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86.toByte(),
+        0x48, 0xCE.toByte(), 0x3D, 0x02, 0x01, 0x06, 0x08, 0x2A,
+        0x86.toByte(), 0x48, 0xCE.toByte(), 0x3D, 0x03, 0x01, 0x07, 0x03,
+        0x42, 0x00, 0x04
+    )
+
+    fun generateSoftwareP256KeyPair(secureRandom: SecureRandom = SecureRandom()): KeyPair {
+        val kpg = KeyPairGenerator.getInstance("EC")
+        kpg.initialize(ECGenParameterSpec(CURVE_NAME), secureRandom)
+        return kpg.generateKeyPair()
+    }
+
+    /**
+     * Strictly parses and validates a 91-byte X.509 SPKI uncompressed NIST P-256 public key.
+     * Rejects non-P-256 curves, compressed/infinity encodings, and malformed DER headers.
+     */
+    fun decodeAndValidateP256PublicKey(spkiBytes: ByteArray): PublicKey {
+        if (spkiBytes.size != 91) {
+            throw GeneralSecurityException("Invalid P-256 SPKI length: ${spkiBytes.size} (expected 91)")
+        }
+        for (i in P256_UNCOMPRESSED_SPKI_PREFIX.indices) {
+            if (spkiBytes[i] != P256_UNCOMPRESSED_SPKI_PREFIX[i]) {
+                throw GeneralSecurityException("SPKI header does not match uncompressed NIST P-256")
+            }
         }
         val kf = KeyFactory.getInstance("EC")
-        val pub = kf.generatePublic(X509EncodedKeySpec(spkiBytes)) as? ECPublicKey
-            ?: throw GeneralSecurityException("Decoded key is not an ECPublicKey")
+        return kf.generatePublic(X509EncodedKeySpec(spkiBytes))
+    }
 
-        val params = pub.params
-        val field = params.curve.field as? ECFieldFp
-            ?: throw GeneralSecurityException("EC key does not use prime field Fp")
-
-        if (field.p != P256_P ||
-            params.curve.a != P256_A ||
-            params.curve.b != P256_B ||
-            params.generator.affineX != P256_GX ||
-            params.generator.affineY != P256_GY ||
-            params.order != P256_N ||
-            params.cofactor != 1
-        ) {
-            throw GeneralSecurityException("EC key parameters do not match secp256r1")
-        }
-
-        val w = pub.w
-        if (w == ECPoint.POINT_INFINITY) {
-            throw GeneralSecurityException("Invalid EC public key: point at infinity")
-        }
-        val x = w.affineX
-        val y = w.affineY
-        if (x < BigInteger.ZERO || x >= P256_P || y < BigInteger.ZERO || y >= P256_P) {
-            throw GeneralSecurityException("EC public key coordinates out of field range")
-        }
-        val lhs = y.modPow(BigInteger.TWO, P256_P)
-        val rhs = (x.modPow(BigInteger.valueOf(3), P256_P) + P256_A.multiply(x) + P256_B).mod(P256_P)
-        if (lhs != rhs) {
-            throw GeneralSecurityException("Invalid EC public key: point does not lie on secp256r1")
-        }
-
-        val reEncoded = pub.encoded ?: throw GeneralSecurityException("EC public key re-encoding failed")
-        if (!ByteEncoding.constantTimeEquals(reEncoded, spkiBytes)) {
-            throw GeneralSecurityException("Non-canonical X.509 SPKI DER encoding rejected")
-        }
-        return pub
+    fun decodeSoftwarePrivateKey(pkcs8Bytes: ByteArray): PrivateKey {
+        val kf = KeyFactory.getInstance("EC")
+        return kf.generatePrivate(PKCS8EncodedKeySpec(pkcs8Bytes))
     }
 
     /**
-     * Deterministically binds 128-bit deviceId (32 lowercase hex chars) to IK_sig public key.
+     * `deviceId = SHA-256("DuoLink-DeviceId-v1" || IK_sig_pub_spki)[0..15]` (16 bytes / 128 bits).
      */
-    fun computeDeviceId(ikSigPublicKeySpki: ByteArray): String {
-        validateAndParsePublicKey(ikSigPublicKeySpki)
-        val prefix = "DUOLINK-DEVICE-ID-V1\u0000".toByteArray(StandardCharsets.UTF_8)
-        val buf = ByteArray(prefix.size + ikSigPublicKeySpki.size)
-        System.arraycopy(prefix, 0, buf, 0, prefix.size)
-        System.arraycopy(ikSigPublicKeySpki, 0, buf, prefix.size, ikSigPublicKeySpki.size)
-        val digest = ByteEncoding.sha256(buf)
-        return ByteEncoding.toHexLower(digest.copyOfRange(0, 16))
+    fun computeDeviceId(identitySigningPublicKeySpki: ByteArray): ByteArray {
+        decodeAndValidateP256PublicKey(identitySigningPublicKeySpki)
+        val digest = MessageDigest.getInstance("SHA-256")
+        digest.update("DuoLink-DeviceId-v1".toByteArray(StandardCharsets.UTF_8))
+        digest.update(identitySigningPublicKeySpki)
+        return digest.digest().copyOfRange(0, 16)
     }
 
-    fun buildSignedPreKeyTranscript(
-        deviceId: String,
+    /**
+     * Canonical domain-separated transcript signed by `IK_sig` to bind `SPK_dh` to `deviceId` and timestamp.
+     */
+    fun buildSpkTranscript(
+        deviceId: ByteArray,
         spkId: Int,
-        issuedAtEpochSec: Long,
-        expiresAtEpochSec: Long,
-        spkPublicKeySpki: ByteArray
-    ): ByteArray = TranscriptBuilder()
-        .putUtf8("DUOLINK-SPK-V1")
-        .putUtf8(deviceId)
-        .putInt32(spkId)
-        .putInt64(issuedAtEpochSec)
-        .putInt64(expiresAtEpochSec)
-        .putBytes(spkPublicKeySpki)
-        .build()
+        spkPublicKeySpki: ByteArray,
+        createdAtEpochSec: Long
+    ): ByteArray {
+        require(deviceId.size == 16) { "deviceId must be 16 bytes" }
+        val buf = ByteBuffer.allocate(SPK_SIG_DOMAIN.size + 16 + 4 + 8 + 4 + spkPublicKeySpki.size)
+        buf.put(SPK_SIG_DOMAIN)
+        buf.put(deviceId)
+        buf.putInt(spkId)
+        buf.putLong(createdAtEpochSec)
+        buf.putInt(spkPublicKeySpki.size)
+        buf.put(spkPublicKeySpki)
+        return buf.array()
+    }
 
-    fun verifyIdentitySignature(
-        ikSigPublicKeySpki: ByteArray,
-        transcript: ByteArray,
-        signatureBytes: ByteArray
-    ): Boolean {
-        if (signatureBytes.size !in MIN_DER_SIG_BYTES..MAX_DER_SIG_BYTES) return false
+    fun signSha256Ecdsa(privateKey: PrivateKey, message: ByteArray): ByteArray {
+        val sig = Signature.getInstance(SIGNATURE_ALGORITHM)
+        sig.initSign(privateKey)
+        sig.update(message)
+        return sig.sign()
+    }
+
+    fun verifySha256Ecdsa(publicKeySpki: ByteArray, message: ByteArray, signatureBytes: ByteArray): Boolean {
+        if (signatureBytes.isEmpty() || signatureBytes.size > 80) return false
         return try {
-            val pubKey = validateAndParsePublicKey(ikSigPublicKeySpki)
-            val verifier = Signature.getInstance(SIGNATURE_ALG)
-            verifier.initVerify(pubKey)
-            verifier.update(transcript)
-            verifier.verify(signatureBytes)
+            val pubKey = decodeAndValidateP256PublicKey(publicKeySpki)
+            val sig = Signature.getInstance(SIGNATURE_ALGORITHM)
+            sig.initVerify(pubKey)
+            sig.update(message)
+            sig.verify(signatureBytes)
         } catch (_: Exception) {
             false
         }
     }
 
     fun verifySignedPreKey(
-        deviceId: String,
-        ikSigPublicKeySpki: ByteArray,
+        deviceId: ByteArray,
+        identitySigningPublicKeySpki: ByteArray,
         spk: SignedPreKeyPublic
     ): Boolean {
-        if (spk.spkId <= 0 || spk.expiresAtEpochSec <= spk.issuedAtEpochSec) return false
+        if (spk.spkId <= 0) return false
+        val expectedDeviceId = try {
+            computeDeviceId(identitySigningPublicKeySpki)
+        } catch (_: Exception) {
+            return false
+        }
+        if (!ByteEncoding.constantTimeEquals(deviceId, expectedDeviceId)) return false
         return try {
-            if (computeDeviceId(ikSigPublicKeySpki) != deviceId) return false
-            validateAndParsePublicKey(spk.publicKeySpki)
-            // Enforce key-purpose separation: SPK_dh must never equal IK_sig
-            if (ByteEncoding.constantTimeEquals(ikSigPublicKeySpki, spk.publicKeySpki)) return false
-            val transcript = buildSignedPreKeyTranscript(
-                deviceId = deviceId,
-                spkId = spk.spkId,
-                issuedAtEpochSec = spk.issuedAtEpochSec,
-                expiresAtEpochSec = spk.expiresAtEpochSec,
-                spkPublicKeySpki = spk.publicKeySpki
-            )
-            verifyIdentitySignature(ikSigPublicKeySpki, transcript, spk.signature)
+            decodeAndValidateP256PublicKey(spk.publicKeySpki)
+            val transcript = buildSpkTranscript(deviceId, spk.spkId, spk.publicKeySpki, spk.createdAtEpochSec)
+            verifySha256Ecdsa(identitySigningPublicKeySpki, transcript, spk.signatureByIdentityKey)
         } catch (_: Exception) {
             false
         }
     }
 
-    fun generateSoftwareEcP256KeyPair(secureRandom: SecureRandom = SecureRandom()): KeyPair {
-        val kpg = KeyPairGenerator.getInstance("EC")
-        kpg.initialize(ECGenParameterSpec(CURVE_STD_NAME), secureRandom)
-        return kpg.generateKeyPair()
-    }
-
-    fun computeEcdhSharedSecret(localPrivateKey: PrivateKey, peerPublicKeySpki: ByteArray, provider: String? = null): ByteArray {
-        val peerPub = validateAndParsePublicKey(peerPublicKeySpki)
+    fun ecdhSharedSecret(
+        localPrivateKey: PrivateKey,
+        peerPublicKeySpki: ByteArray,
+        provider: String? = null
+    ): ByteArray {
+        val peerPublic = decodeAndValidateP256PublicKey(peerPublicKeySpki)
         val ka = if (provider != null) {
-            KeyAgreement.getInstance(ECDH_ALG, provider)
+            KeyAgreement.getInstance(KEY_AGREEMENT_ALGORITHM, provider)
         } else {
-            KeyAgreement.getInstance(ECDH_ALG)
+            KeyAgreement.getInstance(KEY_AGREEMENT_ALGORITHM)
         }
         ka.init(localPrivateKey)
-        ka.doPhase(peerPub, true)
+        ka.doPhase(peerPublic, true)
         val secret = ka.generateSecret()
-        if (secret.size != 32 || secret.all { it == 0.toByte() }) {
-            secret.zeroize()
-            throw GeneralSecurityException("Invalid ECDH shared secret")
+        if (secret.size != 32) {
+            throw GeneralSecurityException("Unexpected P-256 ECDH shared secret size: ${secret.size}")
+        }
+        var allZero = 0
+        for (b in secret) {
+            allZero = allZero or (b.toInt() and 0xFF)
+        }
+        if (allZero == 0) {
+            throw GeneralSecurityException("Rejected degenerate all-zero ECDH shared secret")
         }
         return secret
     }
+}
+
+/**
+ * Shared fail-closed binary codec & validator for Signed Pre-Key (`SPK_dh`) metadata persisted in
+ * [KeyValueByteStore] by both `AndroidKeystoreVault` and [SealedSoftwareKeyVault].
+ *
+ * Security invariants:
+ * 1. Sealed under `MSK` (`AES-256-GCM`) with `AAD = "duolink:spk_meta:v2|" || deviceIdHex`, binding the
+ *    metadata list cryptographically to the active `IK_sig` identity key.
+ * 2. Stores a monotonic `highestIssuedSpkId` header so `spkId` never rolls back even after rotation pruning.
+ * 3. Every loaded `SignedPreKeyPublic` is re-verified against `IK_sig` on load; any bit-flip, truncation,
+ *    AAD mismatch, or missing `spk_entries_v2` alongside `vault_init_v2` throws [KeyVaultStorageCorruptedException].
+ */
+internal object SpkMetadataStoreCodec {
+    const val KEY_VAULT_INIT_MARKER = "vault_init_v2"
+    const val KEY_SPK_METADATA = "spk_entries_v2"
+    private const val SCHEMA_VERSION: Byte = 2
+    private val INIT_MAGIC = "DUOLINK_VAULT_INIT_V2".toByteArray(StandardCharsets.UTF_8)
+
+    data class PersistedSpkMetadata(
+        val publicPart: SignedPreKeyPublic,
+        val usesHardwareKeystore: Boolean
+    )
+
+    data class LoadedSpkCatalog(
+        val highestIssuedSpkId: Int,
+        val entries: List<PersistedSpkMetadata>
+    )
+
+    fun aadForInitMarker(deviceId: ByteArray): ByteArray =
+        ("duolink:vault_init:v2|" + ByteEncoding.toHexLower(deviceId)).toByteArray(StandardCharsets.UTF_8)
+
+    fun aadForSpkMetadata(deviceId: ByteArray): ByteArray =
+        ("duolink:spk_meta:v2|" + ByteEncoding.toHexLower(deviceId)).toByteArray(StandardCharsets.UTF_8)
+
+    fun aadForSoftwareSpkPrivateKey(deviceId: ByteArray, spkId: Int): ByteArray =
+        ("duolink:spk_priv:v2|" + ByteEncoding.toHexLower(deviceId) + "|$spkId").toByteArray(StandardCharsets.UTF_8)
+
+    fun writeInitMarker(
+        store: KeyValueByteStore,
+        sealer: StorageSealer,
+        deviceId: ByteArray
+    ) {
+        val payload = INIT_MAGIC + deviceId
+        val sealed = sealer.seal(payload, aadForInitMarker(deviceId))
+        store.write(KEY_VAULT_INIT_MARKER, sealed)
+    }
+
+    fun verifyInitMarkerIfPresent(
+        store: KeyValueByteStore,
+        sealer: StorageSealer,
+        expectedDeviceId: ByteArray
+    ): Boolean {
+        return when (val state = store.readState(KEY_VAULT_INIT_MARKER)) {
+            is RawStoreRead.Missing -> false
+            is RawStoreRead.CorruptedIo -> throw KeyVaultStorageCorruptedException(
+                "Corrupted vault initialization marker: ${state.detail}"
+            )
+            is RawStoreRead.Present -> {
+                val plain = try {
+                    sealer.unseal(state.bytes, aadForInitMarker(expectedDeviceId))
+                } catch (e: Exception) {
+                    throw KeyVaultStorageCorruptedException(
+                        "Vault initialization marker failed AEAD authentication (identity mismatch or tampering)",
+                        e
+                    )
+                }
+                val expected = INIT_MAGIC + expectedDeviceId
+                if (!ByteEncoding.constantTimeEquals(plain, expected)) {
+                    throw KeyVaultStorageCorruptedException("Vault initialization marker payload mismatch")
+                }
+                true
+            }
+        }
+    }
+
+    fun saveCatalog(
+        store: KeyValueByteStore,
+        sealer: StorageSealer,
+        deviceId: ByteArray,
+        highestIssuedSpkId: Int,
+        entries: List<PersistedSpkMetadata>
+    ) {
+        require(highestIssuedSpkId > 0) { "highestIssuedSpkId must be positive" }
+        require(entries.isNotEmpty()) { "SPK catalog must retain at least the active SPK" }
+        val totalSize = 1 + 4 + 4 + entries.sumOf {
+            4 + 8 + 1 + 4 + it.publicPart.publicKeySpki.size + 4 + it.publicPart.signatureByIdentityKey.size
+        }
+        val buf = ByteBuffer.allocate(totalSize)
+        buf.put(SCHEMA_VERSION)
+        buf.putInt(highestIssuedSpkId)
+        buf.putInt(entries.size)
+        for (entry in entries) {
+            buf.putInt(entry.publicPart.spkId)
+            buf.putLong(entry.publicPart.createdAtEpochSec)
+            buf.put(if (entry.usesHardwareKeystore) 1.toByte() else 0.toByte())
+            buf.putInt(entry.publicPart.publicKeySpki.size)
+            buf.put(entry.publicPart.publicKeySpki)
+            buf.putInt(entry.publicPart.signatureByIdentityKey.size)
+            buf.put(entry.publicPart.signatureByIdentityKey)
+        }
+        val sealed = sealer.seal(buf.array(), aadForSpkMetadata(deviceId))
+        store.write(KEY_SPK_METADATA, sealed)
+    }
 
     /**
-     * Derives the 256-bit Root Pairing Key (RPK) from mutual ECDH + nonces + full identity binding.
-     * Raw dhSharedSecret is zeroized before returning.
+     * Loads and cryptographically validates the persisted SPK catalog.
+     * Returns `null` ONLY when neither `vault_init_v2` nor `spk_entries_v2` exists (genuine first initialization).
+     * Any partial deletion, I/O corruption, AEAD tag failure, or signature failure throws [KeyVaultStorageCorruptedException].
      */
-    fun deriveRootPairingKey(
-        dhSharedSecret: ByteArray,
-        sessionId: String,
-        offerNonce: ByteArray,
-        acceptNonce: ByteArray,
-        offerDeviceId: String,
-        offerIkSpki: ByteArray,
-        acceptDeviceId: String,
-        acceptIkSpki: ByteArray
-    ): ByteArray {
-        try {
-            val saltInput = TranscriptBuilder()
-                .putUtf8("DUOLINK-PAIR-SALT-V1")
-                .putBytes(offerNonce)
-                .putBytes(acceptNonce)
-                .build()
-            val salt = ByteEncoding.sha256(saltInput)
-            val info = TranscriptBuilder()
-                .putUtf8("DUOLINK-PAIR-ROOT-V1")
-                .putUtf8(sessionId)
-                .putUtf8(offerDeviceId)
-                .putBytes(offerIkSpki)
-                .putUtf8(acceptDeviceId)
-                .putBytes(acceptIkSpki)
-                .build()
-            return HkdfSha256.deriveKey(
-                ikm = dhSharedSecret,
-                salt = salt,
-                info = info,
-                outputLength = 32
+    fun loadCatalogStrict(
+        store: KeyValueByteStore,
+        sealer: StorageSealer,
+        deviceId: ByteArray,
+        identitySigningPublicKeySpki: ByteArray
+    ): LoadedSpkCatalog? {
+        val markerInitialized = verifyInitMarkerIfPresent(store, sealer, deviceId)
+        return when (val raw = store.readState(KEY_SPK_METADATA)) {
+            is RawStoreRead.Missing -> {
+                if (markerInitialized) {
+                    throw KeyVaultStorageCorruptedException(
+                        "SPK metadata file missing after vault initialization (possible file deletion attack)"
+                    )
+                }
+                null
+            }
+            is RawStoreRead.CorruptedIo -> throw KeyVaultStorageCorruptedException(
+                "SPK metadata file I/O corruption: ${raw.detail}"
             )
-        } finally {
-            dhSharedSecret.zeroize()
+            is RawStoreRead.Present -> {
+                val plain = try {
+                    sealer.unseal(raw.bytes, aadForSpkMetadata(deviceId))
+                } catch (e: Exception) {
+                    throw KeyVaultStorageCorruptedException(
+                        "SPK metadata failed AEAD authentication under MSK",
+                        e
+                    )
+                }
+                parseAndVerifyCatalog(plain, deviceId, identitySigningPublicKeySpki)
+            }
+        }
+    }
+
+    private fun parseAndVerifyCatalog(
+        plain: ByteArray,
+        deviceId: ByteArray,
+        identitySigningPublicKeySpki: ByteArray
+    ): LoadedSpkCatalog {
+        try {
+            val buf = ByteBuffer.wrap(plain)
+            if (buf.remaining() < 9) {
+                throw KeyVaultStorageCorruptedException("SPK metadata truncated header")
+            }
+            val version = buf.get()
+            if (version != SCHEMA_VERSION) {
+                throw KeyVaultStorageCorruptedException("Unsupported SPK metadata schema version: $version")
+            }
+            val highestSpkId = buf.int
+            val count = buf.int
+            if (highestSpkId <= 0 || count !in 1..8) {
+                throw KeyVaultStorageCorruptedException(
+                    "Invalid SPK catalog bounds (highest=$highestSpkId, count=$count)"
+                )
+            }
+            val list = ArrayList<PersistedSpkMetadata>(count)
+            val seenIds = HashSet<Int>(count)
+            for (i in 0 until count) {
+                val spkId = buf.int
+                val createdAt = buf.long
+                val hwFlag = buf.get().toInt()
+                if (hwFlag != 0 && hwFlag != 1) {
+                    throw KeyVaultStorageCorruptedException("Invalid SPK hardware flag: $hwFlag")
+                }
+                val spkiLen = buf.int
+                if (spkiLen != 91 || buf.remaining() < spkiLen + 4) {
+                    throw KeyVaultStorageCorruptedException("Invalid SPK SPKI length: $spkiLen")
+                }
+                val spki = ByteArray(spkiLen).also { buf.get(it) }
+                val sigLen = buf.int
+                if (sigLen !in 1..80 || buf.remaining() < sigLen) {
+                    throw KeyVaultStorageCorruptedException("Invalid SPK signature length: $sigLen")
+                }
+                val sig = ByteArray(sigLen).also { buf.get(it) }
+                val pubPart = SignedPreKeyPublic(spkId, spki, sig, createdAt)
+                if (!seenIds.add(spkId) || spkId > highestSpkId) {
+                    throw KeyVaultStorageCorruptedException("Inconsistent SPK ID sequence ($spkId > $highestSpkId)")
+                }
+                if (!EcP256Crypto.verifySignedPreKey(deviceId, identitySigningPublicKeySpki, pubPart)) {
+                    throw KeyVaultStorageCorruptedException("Persisted SPK #$spkId failed IK_sig verification")
+                }
+                list.add(PersistedSpkMetadata(pubPart, hwFlag == 1))
+            }
+            if (buf.hasRemaining()) {
+                throw KeyVaultStorageCorruptedException("Trailing unexpected bytes in SPK metadata")
+            }
+            return LoadedSpkCatalog(highestSpkId, list)
+        } catch (e: KeyVaultStorageCorruptedException) {
+            throw e
+        } catch (e: Exception) {
+            throw KeyVaultStorageCorruptedException("Malformed SPK metadata binary structure", e)
         }
     }
 }
 
 /**
- * Abstraction for local device identity signing and signed pre-key ECDH operations.
- * Private keys never leave the vault implementation.
- */
-interface DeviceKeyVault {
-    val isHardwareBacked: Boolean
-    val hardwareDescription: String
-    fun getIdentityPublicKeySpki(): ByteArray
-    fun getDeviceId(): String
-    fun signWithIdentity(transcript: ByteArray): ByteArray
-    fun getCurrentSignedPreKey(nowEpochSec: Long): SignedPreKeyPublic
-    fun rotateSignedPreKey(nowEpochSec: Long): SignedPreKeyPublic
-    fun agreeWithSignedPreKey(localSpkId: Int, peerDhPublicKeySpki: ByteArray): ByteArray
-    fun resetIdentityKeys(nowEpochSec: Long)
-}
-
-/**
- * JCA-backed vault sealing all private key material under a StorageSealer (used in JVM unit tests).
- * Private keys are never exposed through any public method.
+ * Persistent software-sealed [DeviceKeyVault] backed by [StorageSealer] and [KeyValueByteStore].
+ *
+ * Used for deterministic JVM unit/regression tests (including restart persistence and fail-closed
+ * SPK metadata/key corruption tests) using the exact same [SpkMetadataStoreCodec] as `AndroidKeystoreVault`.
  */
 class SealedSoftwareKeyVault(
     private val sealer: StorageSealer = JcaAesGcmSealer(),
-    initialNowEpochSec: Long = System.currentTimeMillis() / 1000L,
-    private val secureRandom: SecureRandom = SecureRandom()
+    private val byteStore: KeyValueByteStore = InMemoryByteStore(),
+    private val secureRandom: SecureRandom = SecureRandom(),
+    private val maxRetainedSignedPreKeys: Int = 3
 ) : DeviceKeyVault {
 
-    override val isHardwareBacked: Boolean = false
-    override val hardwareDescription: String = "JCA Sealed Vault (JVM)"
-
-    private var sealedIdentityPkcs8: ByteArray = ByteArray(0)
-    private var identityPublicSpki: ByteArray = ByteArray(0)
-    private var nextSpkId: Int = 1
-    private val sealedSpkPkcs8ById = LinkedHashMap<Int, ByteArray>()
-    private var currentSpkPublic: SignedPreKeyPublic? = null
-
-    init {
-        resetIdentityKeys(initialNowEpochSec)
-    }
-
-    override fun getIdentityPublicKeySpki(): ByteArray = identityPublicSpki.copyOf()
-
-    override fun getDeviceId(): String = EcP256Crypto.computeDeviceId(identityPublicSpki)
-
-    override fun signWithIdentity(transcript: ByteArray): ByteArray {
-        val pkcs8 = sealer.unseal(sealedIdentityPkcs8, AAD_IDENTITY)
+    @Synchronized
+    override fun checkVaultHealth(): VaultHealth {
         return try {
-            val priv = KeyFactory.getInstance("EC").generatePrivate(PKCS8EncodedKeySpec(pkcs8))
-            val sig = Signature.getInstance(EcP256Crypto.SIGNATURE_ALG)
-            sig.initSign(priv, secureRandom)
-            sig.update(transcript)
-            sig.sign()
-        } finally {
-            pkcs8.zeroize()
-        }
-    }
-
-    override fun getCurrentSignedPreKey(nowEpochSec: Long): SignedPreKeyPublic {
-        val existing = currentSpkPublic
-        if (existing != null && nowEpochSec < existing.expiresAtEpochSec) {
-            return existing
-        }
-        return rotateSignedPreKey(nowEpochSec)
-    }
-
-    override fun rotateSignedPreKey(nowEpochSec: Long): SignedPreKeyPublic {
-        val spkId = nextSpkId++
-        val kp = EcP256Crypto.generateSoftwareEcP256KeyPair(secureRandom)
-        val pkcs8 = kp.private.encoded
-        val spki = kp.public.encoded
-        val aad = "duolink:spk_dh:v1|$spkId".toByteArray(StandardCharsets.UTF_8)
-        try {
-            sealedSpkPkcs8ById[spkId] = sealer.seal(pkcs8, aad)
-            // Keep at most 3 recent pre-keys to bound storage and retire old private keys
-            while (sealedSpkPkcs8ById.size > 3) {
-                val oldest = sealedSpkPkcs8ById.keys.first()
-                sealedSpkPkcs8ById.remove(oldest)
+            val ikPair = loadExistingIdentityKeyPairStrict() ?: return VaultHealth.Healthy
+            val deviceId = EcP256Crypto.computeDeviceId(ikPair.second)
+            val catalog = SpkMetadataStoreCodec.loadCatalogStrict(
+                store = byteStore,
+                sealer = sealer,
+                deviceId = deviceId,
+                identitySigningPublicKeySpki = ikPair.second
+            ) ?: throw KeyVaultStorageCorruptedException(
+                "Identity key exists in store without SPK metadata catalog"
+            )
+            // Verify every retained SPK private key blob is readable and authenticates under MSK.
+            for (entry in catalog.entries) {
+                loadAndUnsealSpkPrivateKeyStrict(deviceId, entry.publicPart.spkId)
             }
-        } finally {
-            pkcs8.zeroize()
+            VaultHealth.Healthy
+        } catch (e: Exception) {
+            VaultHealth.Corrupted(e.message ?: "Corrupted software key vault")
         }
-        val expiresAt = nowEpochSec + EcP256Crypto.DEFAULT_SPK_VALIDITY_SEC
-        val deviceId = getDeviceId()
-        val transcript = EcP256Crypto.buildSignedPreKeyTranscript(
+    }
+
+    @Synchronized
+    override fun getOrCreateLocalIdentity(nowEpochSec: Long): LocalIdentityPublic {
+        val existingIk = loadExistingIdentityKeyPairStrict()
+        if (existingIk == null) {
+            // Confirm no orphaned init marker or SPK catalog exists without IK_sig.
+            if (byteStore.readState(SpkMetadataStoreCodec.KEY_VAULT_INIT_MARKER) !is RawStoreRead.Missing ||
+                byteStore.readState(SpkMetadataStoreCodec.KEY_SPK_METADATA) !is RawStoreRead.Missing
+            ) {
+                throw KeyVaultStorageCorruptedException(
+                    "Orphaned SPK metadata found while identity signing key is missing"
+                )
+            }
+            return initializeFreshVault(nowEpochSec)
+        }
+
+        val (privBytes, ikSpki) = existingIk
+        Arrays.fill(privBytes, 0.toByte())
+        val deviceId = EcP256Crypto.computeDeviceId(ikSpki)
+        val catalog = SpkMetadataStoreCodec.loadCatalogStrict(
+            store = byteStore,
+            sealer = sealer,
             deviceId = deviceId,
-            spkId = spkId,
-            issuedAtEpochSec = nowEpochSec,
-            expiresAtEpochSec = expiresAt,
-            spkPublicKeySpki = spki
+            identitySigningPublicKeySpki = ikSpki
+        ) ?: throw KeyVaultStorageCorruptedException(
+            "SPK metadata catalog missing while identity signing key exists"
         )
-        val sig = signWithIdentity(transcript)
-        return SignedPreKeyPublic(
-            spkId = spkId,
-            publicKeySpki = spki,
-            issuedAtEpochSec = nowEpochSec,
-            expiresAtEpochSec = expiresAt,
-            signature = sig
-        ).also { currentSpkPublic = it }
+        val active = catalog.entries.maxByOrNull { it.publicPart.spkId }
+            ?: throw KeyVaultStorageCorruptedException("Empty SPK catalog")
+        // Verify active private key blob is intact before returning identity.
+        val activePrivBytes = loadAndUnsealSpkPrivateKeyStrict(deviceId, active.publicPart.spkId)
+        Arrays.fill(activePrivBytes, 0.toByte())
+
+        return LocalIdentityPublic(
+            deviceId = deviceId,
+            identitySigningPublicKeySpki = ikSpki,
+            currentSignedPreKey = active.publicPart
+        )
     }
 
-    override fun agreeWithSignedPreKey(localSpkId: Int, peerDhPublicKeySpki: ByteArray): ByteArray {
-        val sealedPkcs8 = sealedSpkPkcs8ById[localSpkId]
-            ?: throw GeneralSecurityException("Signed pre-key ID $localSpkId not found or retired")
-        val aad = "duolink:spk_dh:v1|$localSpkId".toByteArray(StandardCharsets.UTF_8)
-        val pkcs8 = sealer.unseal(sealedPkcs8, aad)
+    @Synchronized
+    override fun signWithIdentityKey(payload: ByteArray): ByteArray {
+        val (pkcs8, _) = loadExistingIdentityKeyPairStrict()
+            ?: throw GeneralSecurityException("Identity key not initialized")
         return try {
-            val priv = KeyFactory.getInstance("EC").generatePrivate(PKCS8EncodedKeySpec(pkcs8))
-            EcP256Crypto.computeEcdhSharedSecret(priv, peerDhPublicKeySpki)
+            val privKey = EcP256Crypto.decodeSoftwarePrivateKey(pkcs8)
+            EcP256Crypto.signSha256Ecdsa(privKey, payload)
         } finally {
-            pkcs8.zeroize()
+            Arrays.fill(pkcs8, 0.toByte())
         }
     }
 
-    override fun resetIdentityKeys(nowEpochSec: Long) {
-        sealedSpkPkcs8ById.clear()
-        currentSpkPublic = null
-        val kp = EcP256Crypto.generateSoftwareEcP256KeyPair(secureRandom)
+    @Synchronized
+    override fun agreeWithSignedPreKey(localSpkId: Int, peerPublicKeySpki: ByteArray): ByteArray {
+        val (ikPkcs8, ikSpki) = loadExistingIdentityKeyPairStrict()
+            ?: throw GeneralSecurityException("Identity key not initialized")
+        Arrays.fill(ikPkcs8, 0.toByte())
+        val deviceId = EcP256Crypto.computeDeviceId(ikSpki)
+        val catalog = SpkMetadataStoreCodec.loadCatalogStrict(
+            store = byteStore,
+            sealer = sealer,
+            deviceId = deviceId,
+            identitySigningPublicKeySpki = ikSpki
+        ) ?: throw KeyVaultStorageCorruptedException("Missing SPK catalog")
+        if (catalog.entries.none { it.publicPart.spkId == localSpkId }) {
+            throw GeneralSecurityException("Signed pre-key ID $localSpkId not found or expired")
+        }
+        val pkcs8 = loadAndUnsealSpkPrivateKeyStrict(deviceId, localSpkId)
+        return try {
+            val privKey = EcP256Crypto.decodeSoftwarePrivateKey(pkcs8)
+            EcP256Crypto.ecdhSharedSecret(privKey, peerPublicKeySpki)
+        } finally {
+            Arrays.fill(pkcs8, 0.toByte())
+        }
+    }
+
+    @Synchronized
+    override fun rotateSignedPreKey(nowEpochSec: Long): SignedPreKeyPublic {
+        val (ikPkcs8, ikSpki) = loadExistingIdentityKeyPairStrict()
+            ?: throw GeneralSecurityException("Identity key not initialized")
+        return try {
+            val deviceId = EcP256Crypto.computeDeviceId(ikSpki)
+            val catalog = SpkMetadataStoreCodec.loadCatalogStrict(
+                store = byteStore,
+                sealer = sealer,
+                deviceId = deviceId,
+                identitySigningPublicKeySpki = ikSpki
+            ) ?: throw KeyVaultStorageCorruptedException("Missing SPK catalog during rotation")
+            val nextSpkId = catalog.highestIssuedSpkId + 1
+            val newMeta = generateAndPersistSpk(
+                ikPrivateKey = EcP256Crypto.decodeSoftwarePrivateKey(ikPkcs8),
+                deviceId = deviceId,
+                spkId = nextSpkId,
+                nowEpochSec = nowEpochSec
+            )
+            val merged = (catalog.entries + newMeta).sortedBy { it.publicPart.spkId }
+            val retained = if (merged.size > maxRetainedSignedPreKeys) {
+                val evicted = merged.dropLast(maxRetainedSignedPreKeys)
+                evicted.forEach { byteStore.delete(spkPrivateKeyStoreKey(it.publicPart.spkId)) }
+                merged.takeLast(maxRetainedSignedPreKeys)
+            } else {
+                merged
+            }
+            SpkMetadataStoreCodec.saveCatalog(
+                store = byteStore,
+                sealer = sealer,
+                deviceId = deviceId,
+                highestIssuedSpkId = nextSpkId,
+                entries = retained
+            )
+            newMeta.publicPart
+        } finally {
+            Arrays.fill(ikPkcs8, 0.toByte())
+        }
+    }
+
+    @Synchronized
+    override fun resetIdentityKeys(nowEpochSec: Long): LocalIdentityPublic {
+        // Purge known keys cleanly before generating a brand-new identity.
+        for (spkId in 1..64) {
+            byteStore.delete(spkPrivateKeyStoreKey(spkId))
+        }
+        byteStore.delete(SpkMetadataStoreCodec.KEY_SPK_METADATA)
+        byteStore.delete(SpkMetadataStoreCodec.KEY_VAULT_INIT_MARKER)
+        byteStore.delete(KEY_SEALED_IK)
+        return initializeFreshVault(nowEpochSec)
+    }
+
+    @Synchronized
+    override fun getKeyProtectionReport(nowEpochSec: Long): KeyProtectionReport {
+        getOrCreateLocalIdentity(nowEpochSec)
+        return KeyProtectionReport(
+            identitySigningKey = SingleKeyProtectionStatus(
+                keyRolePersian = "کلید امضای هویت دستگاه (IK_sig)",
+                algorithm = "ECDSA P-256 (SHA-256)",
+                tier = KeyProtectionTier.JVM_TEST_SOFTWARE,
+                persianDescription = "محیط تست JVM (کلید امضای نرم‌افزاری رمزنگاری‌شده؛ غیرسخت‌افزاری)"
+            ),
+            storageWrappingKey = sealer.queryProtectionStatus(),
+            activeSignedPreKey = SingleKeyProtectionStatus(
+                keyRolePersian = "پیش‌کلید امضاشده توافق کلید (SPK_dh)",
+                algorithm = "ECDH P-256",
+                tier = KeyProtectionTier.SOFTWARE_WRAPPED_AT_REST,
+                persianDescription = "نرم‌افزاری (رمزنگاری‌شده در حافظه با کلید AES-256-GCM؛ غیرسخت‌افزاری و موقتاً در RAM هنگام ECDH)"
+            )
+        )
+    }
+
+    private fun initializeFreshVault(nowEpochSec: Long): LocalIdentityPublic {
+        val ikKp = EcP256Crypto.generateSoftwareP256KeyPair(secureRandom)
+        val ikSpki = ikKp.public.encoded
+        val ikPkcs8 = ikKp.private.encoded
+        val deviceId = EcP256Crypto.computeDeviceId(ikSpki)
+        try {
+            val ikBlob = ByteBuffer.allocate(1 + 4 + ikSpki.size + 4 + ikPkcs8.size).apply {
+                put(1.toByte())
+                putInt(ikSpki.size)
+                put(ikSpki)
+                putInt(ikPkcs8.size)
+                put(ikPkcs8)
+            }.array()
+            byteStore.write(KEY_SEALED_IK, sealer.seal(ikBlob, AAD_IK))
+            SpkMetadataStoreCodec.writeInitMarker(byteStore, sealer, deviceId)
+            val firstSpk = generateAndPersistSpk(
+                ikPrivateKey = ikKp.private,
+                deviceId = deviceId,
+                spkId = 1,
+                nowEpochSec = nowEpochSec
+            )
+            SpkMetadataStoreCodec.saveCatalog(
+                store = byteStore,
+                sealer = sealer,
+                deviceId = deviceId,
+                highestIssuedSpkId = 1,
+                entries = listOf(firstSpk)
+            )
+            return LocalIdentityPublic(
+                deviceId = deviceId,
+                identitySigningPublicKeySpki = ikSpki,
+                currentSignedPreKey = firstSpk.publicPart
+            )
+        } finally {
+            Arrays.fill(ikPkcs8, 0.toByte())
+        }
+    }
+
+    private fun generateAndPersistSpk(
+        ikPrivateKey: PrivateKey,
+        deviceId: ByteArray,
+        spkId: Int,
+        nowEpochSec: Long
+    ): SpkMetadataStoreCodec.PersistedSpkMetadata {
+        val kp = EcP256Crypto.generateSoftwareP256KeyPair(secureRandom)
+        val spki = kp.public.encoded
         val pkcs8 = kp.private.encoded
         try {
-            sealedIdentityPkcs8 = sealer.seal(pkcs8, AAD_IDENTITY)
-            identityPublicSpki = kp.public.encoded
+            val transcript = EcP256Crypto.buildSpkTranscript(deviceId, spkId, spki, nowEpochSec)
+            val sig = EcP256Crypto.signSha256Ecdsa(ikPrivateKey, transcript)
+            val sealedPriv = sealer.seal(
+                pkcs8,
+                SpkMetadataStoreCodec.aadForSoftwareSpkPrivateKey(deviceId, spkId)
+            )
+            byteStore.write(spkPrivateKeyStoreKey(spkId), sealedPriv)
+            return SpkMetadataStoreCodec.PersistedSpkMetadata(
+                publicPart = SignedPreKeyPublic(
+                    spkId = spkId,
+                    publicKeySpki = spki,
+                    signatureByIdentityKey = sig,
+                    createdAtEpochSec = nowEpochSec
+                ),
+                usesHardwareKeystore = false
+            )
         } finally {
-            pkcs8.zeroize()
+            Arrays.fill(pkcs8, 0.toByte())
         }
-        rotateSignedPreKey(nowEpochSec)
     }
+
+    private fun loadExistingIdentityKeyPairStrict(): Pair<ByteArray, ByteArray>? {
+        return when (val raw = byteStore.readState(KEY_SEALED_IK)) {
+            is RawStoreRead.Missing -> null
+            is RawStoreRead.CorruptedIo -> throw KeyVaultStorageCorruptedException(
+                "Identity signing key file I/O corruption: ${raw.detail}"
+            )
+            is RawStoreRead.Present -> {
+                val plain = try {
+                    sealer.unseal(raw.bytes, AAD_IK)
+                } catch (e: Exception) {
+                    throw KeyVaultStorageCorruptedException(
+                        "Identity signing key failed AEAD authentication under MSK",
+                        e
+                    )
+                }
+                try {
+                    val buf = ByteBuffer.wrap(plain)
+                    val ver = buf.get()
+                    if (ver != 1.toByte()) {
+                        throw KeyVaultStorageCorruptedException("Unsupported sealed IK schema: $ver")
+                    }
+                    val spkiLen = buf.int
+                    if (spkiLen != 91 || buf.remaining() < spkiLen + 4) {
+                        throw KeyVaultStorageCorruptedException("Invalid sealed IK SPKI length")
+                    }
+                    val spki = ByteArray(spkiLen).also { buf.get(it) }
+                    EcP256Crypto.decodeAndValidateP256PublicKey(spki)
+                    val pkcs8Len = buf.int
+                    if (pkcs8Len !in 32..512 || buf.remaining() != pkcs8Len) {
+                        throw KeyVaultStorageCorruptedException("Invalid sealed IK PKCS#8 length")
+                    }
+                    val pkcs8 = ByteArray(pkcs8Len).also { buf.get(it) }
+                    pkcs8 to spki
+                } catch (e: KeyVaultStorageCorruptedException) {
+                    throw e
+                } catch (e: Exception) {
+                    throw KeyVaultStorageCorruptedException("Malformed sealed IK blob", e)
+                }
+            }
+        }
+    }
+
+    private fun loadAndUnsealSpkPrivateKeyStrict(deviceId: ByteArray, spkId: Int): ByteArray {
+        return when (val raw = byteStore.readState(spkPrivateKeyStoreKey(spkId))) {
+            is RawStoreRead.Missing -> throw KeyVaultStorageCorruptedException(
+                "Sealed SPK #$spkId private key blob missing from store"
+            )
+            is RawStoreRead.CorruptedIo -> throw KeyVaultStorageCorruptedException(
+                "Sealed SPK #$spkId private key I/O corruption: ${raw.detail}"
+            )
+            is RawStoreRead.Present -> {
+                try {
+                    sealer.unseal(
+                        raw.bytes,
+                        SpkMetadataStoreCodec.aadForSoftwareSpkPrivateKey(deviceId, spkId)
+                    )
+                } catch (e: Exception) {
+                    throw KeyVaultStorageCorruptedException(
+                        "Sealed SPK #$spkId private key failed AEAD authentication",
+                        e
+                    )
+                }
+            }
+        }
+    }
+
+    private fun spkPrivateKeyStoreKey(spkId: Int): String = "sealed_spk_v2_$spkId"
 
     companion object {
-        private val AAD_IDENTITY = "duolink:ik_sig:v1".toByteArray(StandardCharsets.UTF_8)
+        private val AAD_IK = "duolink:ik_sig:v2".toByteArray(StandardCharsets.UTF_8)
+        private const val KEY_SEALED_IK = "sealed_ik_v2"
     }
 }

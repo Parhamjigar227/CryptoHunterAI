@@ -5,114 +5,119 @@ import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 
 /**
- * Computes canonical, role-symmetric 60-digit Safety Numbers (12 groups of 5 digits)
- * using 5,200 rounds of iterated SHA-512 over canonically ordered peer identities,
- * plus a handshake-specific Session Verification Code.
+ * Symmetric, order-independent 60-digit Safety Number generator modeled on Signal's numeric
+ * fingerprint scheme (`SHA-512` iterated 5,200 rounds over sorted canonical identity records).
+ *
+ * Security role distinction (CRITICAL):
+ * - [computeSafetyNumber] produces the **60-digit (12 × 5-digit) Safety Number** over both peers'
+ *   long-term `IK_sig` public keys and `deviceId`s. Both users MUST compare the **entire 60-digit
+ *   Safety Number** through an independent trusted out-of-band channel (in person or direct trusted
+ *   voice call) before confirming pairing to defeat active MITM / QR substitution attacks.
+ * - [computePublicHandshakeTranscriptId] produces a **12-hex-character public diagnostic identifier**
+ *   derived strictly from public QR handshake fields (`sessionId`, `offerDigest`, `offerNonce`,
+ *   `acceptNonce`). It is **NOT** a secret authentication token and **MUST NEVER** replace comparing
+ *   the complete 60-digit Safety Number.
  */
 object SafetyFingerprint {
+    private const val VERSION: Short = 1
     private const val ITERATIONS = 5200
-    private val VERSION_TAG = "DUOLINK-SAFETY-NUMBER-V1".toByteArray(StandardCharsets.UTF_8)
+    private val DOMAIN_PREFIX = "DuoLink-SafetyNumber-v1".toByteArray(StandardCharsets.UTF_8)
 
-    /**
-     * Computes the 60-digit Safety Number formatted as 12 space-separated 5-digit groups.
-     * Output is strictly identical on Device A and Device B regardless of initiator/responder role.
-     */
     fun computeSafetyNumber(
-        localDeviceId: String,
-        localIkSpki: ByteArray,
-        peerDeviceId: String,
-        peerIkSpki: ByteArray
+        localDeviceId: ByteArray,
+        localIdentityPublicKeySpki: ByteArray,
+        peerDeviceId: ByteArray,
+        peerIdentityPublicKeySpki: ByteArray
     ): String {
-        require(localDeviceId != peerDeviceId) { "Cannot compute safety number with identical device IDs" }
-        EcP256Crypto.validateAndParsePublicKey(localIkSpki)
-        EcP256Crypto.validateAndParsePublicKey(peerIkSpki)
-        require(EcP256Crypto.computeDeviceId(localIkSpki) == localDeviceId) { "Local deviceId mismatch" }
-        require(EcP256Crypto.computeDeviceId(peerIkSpki) == peerDeviceId) { "Peer deviceId mismatch" }
-
-        val firstPart = computeHalfDigest(localDeviceId, localIkSpki)
-        val secondPart = computeHalfDigest(peerDeviceId, peerIkSpki)
-
-        return if (localDeviceId < peerDeviceId) {
-            "$firstPart $secondPart"
-        } else {
-            "$secondPart $firstPart"
+        require(localDeviceId.size == 16 && peerDeviceId.size == 16) {
+            "Both deviceIds must be 16 bytes"
         }
-    }
+        EcP256Crypto.decodeAndValidateP256PublicKey(localIdentityPublicKeySpki)
+        EcP256Crypto.decodeAndValidateP256PublicKey(peerIdentityPublicKeySpki)
 
-    /**
-     * Computes a human-readable 30-digit half-fingerprint (6 groups of 5 digits) for one identity
-     * using 5,200 rounds of SHA-512. Concatenating the two sorted halves yields 60 digits (12 groups).
-     */
-    fun computeSingleIdentityDigits(deviceId: String, ikSpki: ByteArray): String {
-        EcP256Crypto.validateAndParsePublicKey(ikSpki)
-        require(EcP256Crypto.computeDeviceId(ikSpki) == deviceId) { "deviceId mismatch" }
-        return computeHalfDigest(deviceId, ikSpki)
-    }
+        val firstBlock = buildIdentityBlock(localDeviceId, localIdentityPublicKeySpki)
+        val secondBlock = buildIdentityBlock(peerDeviceId, peerIdentityPublicKeySpki)
 
-    private fun computeHalfDigest(deviceId: String, ikSpki: ByteArray): String {
-        val seed = TranscriptBuilder()
-            .putBytes(VERSION_TAG)
-            .putUtf8(deviceId)
-            .putBytes(ikSpki)
-            .build()
+        val cmp = ByteEncoding.compareLexicographically(firstBlock, secondBlock)
+        require(cmp != 0) { "Cannot compute safety number between identical device identities" }
+
+        val (lowBlock, highBlock) = if (cmp < 0) {
+            firstBlock to secondBlock
+        } else {
+            secondBlock to firstBlock
+        }
+
+        val canonicalPair = ByteArray(DOMAIN_PREFIX.size + 2 + lowBlock.size + highBlock.size)
+        val headerBuf = ByteBuffer.wrap(canonicalPair)
+        headerBuf.put(DOMAIN_PREFIX)
+        headerBuf.putShort(VERSION)
+        headerBuf.put(lowBlock)
+        headerBuf.put(highBlock)
 
         val sha512 = MessageDigest.getInstance("SHA-512")
-        var current = seed
+        var current = canonicalPair
         repeat(ITERATIONS) {
             sha512.reset()
             sha512.update(current)
-            sha512.update(ikSpki)
+            sha512.update(canonicalPair)
             current = sha512.digest()
         }
 
-        // Extract 6 chunks of 5 bytes (uint40 mod 100000) -> 6 groups of 5 decimal digits = 30 digits
-        val groups = ArrayList<String>(6)
-        for (chunkIdx in 0 until 6) {
-            val off = chunkIdx * 5
-            var value = 0L
-            for (b in 0 until 5) {
-                value = (value shl 8) or (current[off + b].toLong() and 0xFFL)
-            }
-            val fiveDigits = (value % 100_000L).toString().padStart(5, '0')
-            groups.add(fiveDigits)
+        val groups = ArrayList<String>(12)
+        for (groupIndex in 0 until 12) {
+            val offset = groupIndex * 5
+            val chunkValue =
+                ((current[offset].toLong() and 0xFFL) shl 32) or
+                    ((current[offset + 1].toLong() and 0xFFL) shl 24) or
+                    ((current[offset + 2].toLong() and 0xFFL) shl 16) or
+                    ((current[offset + 3].toLong() and 0xFFL) shl 8) or
+                    (current[offset + 4].toLong() and 0xFFL)
+            val fiveDigits = (chunkValue % 100_000L).toInt()
+            groups.add(String.format(java.util.Locale.US, "%05d", fiveDigits))
         }
-        return groups.joinToString(" ")
+
+        return buildString(75) {
+            for (i in groups.indices) {
+                append(groups[i])
+                when {
+                    i == 11 -> {}
+                    (i + 1) % 4 == 0 -> append('\n')
+                    else -> append(' ')
+                }
+            }
+        }
     }
 
     /**
-     * Computes a 12-hex-character (XXXX-XXXX-XXXX) session verification code binding the specific
-     * QR Offer + Accept handshake nonces and transcript digest.
+     * Public, non-secret 12-hex-character handshake diagnostic ID (`XXXX-XXXX-XXXX`) derived from
+     * public QR handshake fields (`sessionId`, `offerDigest`, `offerNonce`, `acceptNonce`).
+     *
+     * WARNING: Because all inputs appear in QR payloads, an active MITM relaying modified QRs can
+     * observe public fields; this identifier exists solely to help users spot stale/mismatched QR
+     * scans and MUST NOT be used as a security verification substitute for [computeSafetyNumber].
      */
-    fun computeSessionVerificationCode(
-        sessionId: String,
+    fun computePublicHandshakeTranscriptId(
+        sessionId: ByteArray,
         offerDigest: ByteArray,
         offerNonce: ByteArray,
         acceptNonce: ByteArray
     ): String {
-        val transcript = TranscriptBuilder()
-            .putUtf8("DUOLINK-SESSION-SAS-V1")
-            .putUtf8(sessionId)
-            .putBytes(offerDigest)
-            .putBytes(offerNonce)
-            .putBytes(acceptNonce)
-            .build()
-        val hash = ByteEncoding.sha256(transcript)
-        val hex = ByteEncoding.toHexLower(hash.copyOfRange(0, 6)).uppercase()
+        val sha256 = MessageDigest.getInstance("SHA-256")
+        sha256.update("DuoLink-PublicTranscriptId-v1".toByteArray(StandardCharsets.UTF_8))
+        sha256.update(sessionId)
+        sha256.update(offerDigest)
+        sha256.update(offerNonce)
+        sha256.update(acceptNonce)
+        val digest = sha256.digest()
+        val hex = ByteEncoding.toHexUpper(digest.copyOfRange(0, 6))
         return "${hex.substring(0, 4)}-${hex.substring(4, 8)}-${hex.substring(8, 12)}"
     }
 
-    /**
-     * Formats 60-digit safety number into 3 lines of 4 groups for clean Persian/LTR display.
-     */
-    fun formatMultiline(safetyNumber: String): String {
-        val parts = safetyNumber.trim().split(Regex("\\s+"))
-        if (parts.size != 12) return safetyNumber
-        return buildString {
-            append(parts.subList(0, 4).joinToString("  "))
-            append('\n')
-            append(parts.subList(4, 8).joinToString("  "))
-            append('\n')
-            append(parts.subList(8, 12).joinToString("  "))
-        }
+    private fun buildIdentityBlock(deviceId: ByteArray, publicKeySpki: ByteArray): ByteArray {
+        val buf = ByteBuffer.allocate(16 + 4 + publicKeySpki.size)
+        buf.put(deviceId)
+        buf.putInt(publicKeySpki.size)
+        buf.put(publicKeySpki)
+        return buf.array()
     }
 }

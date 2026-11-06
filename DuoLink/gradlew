@@ -1,0 +1,11 @@
+#!/usr/bin/env sh
+set -eu
+GH="${HOME}/.gradle/duolink/gradle-8.9"
+if [ ! -x "$GH/bin/gradle" ]; then
+  mkdir -p "${HOME}/.gradle/duolink"
+  ZIP="${TMPDIR:-/tmp}/duolink-gradle-8.9.zip"
+  curl -fL https://services.gradle.org/distributions/gradle-8.9-bin.zip -o "$ZIP"
+  unzip -oq "$ZIP" -d "${HOME}/.gradle/duolink"
+  rm -f "$ZIP"
+fi
+exec "$GH/bin/gradle" "$@"

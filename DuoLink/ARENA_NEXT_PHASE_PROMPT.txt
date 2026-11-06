@@ -1,0 +1,9 @@
+Continue this existing DuoLink Android project. Do NOT restart, replace, or redesign it. Inspect all files first and preserve Kotlin + Jetpack Compose, the Nasrin contact image/logo, and exact About copy:
+نسرین خانم
+این برنامه مخصوص شما ساخته شده است.
+
+The current 0.1.0 is only a UI foundation, not a working messenger. Never claim otherwise.
+
+Next milestone ONLY: design and implement secure two-device QR pairing. Before coding, compare maintained reputable Android cryptography/messaging libraries and document versions, licenses, maintenance and security rationale. Do not invent cryptography or custom primitives. No Firebase/cloud database. Never transmit private keys. Use Android Keystore where appropriate. Define threat model and key lifecycle. Pair exactly two devices by QR-based public identity/fingerprint exchange, with explicit confirmation on both devices. Add tests for QR tampering, wrong peer, replay, and key-change warning. Do not implement chat networking/calls/file transfer before pairing and tests are complete.
+
+Constraints: Android/Kotlin/Compose, minSdk 26 unless justified; no paid services or cloud accounts without approval; no secrets in source control; no “unhackable” claims; run and report actual build/tests; list changed files and limitations.

@@ -1,0 +1,8 @@
+# Local development database, test databases and generated keys never enter Git.
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.key
+*.pem
+node_modules/

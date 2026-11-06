@@ -1,0 +1,17 @@
+{
+  "name": "duolink-signaling-server",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Self-hostable DuoLink Method B remote-pairing signaling server (Node.js 22+ / node:sqlite). Stores only public keys, opaque E2EE ciphertexts and hashed tokens.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node serve.js",
+    "start:https": "node serve.js --https",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\"",
+    "test:verbose": "node --test --test-concurrency=1 --test-reporter=spec \"test/**/*.test.js\""
+  },
+  "license": "UNLICENSED"
+}

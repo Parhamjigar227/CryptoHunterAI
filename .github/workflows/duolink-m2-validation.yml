@@ -248,8 +248,16 @@ jobs:
           echo "=== Executing ./gradlew connectedDebugAndroidTest ==="
           ./gradlew connectedDebugAndroidTest --stacktrace
 
-          echo "=== Direct AndroidJUnitRunner Status Stream Verification ==="
+          echo "=== Installing Debug & Test APKs for Raw AndroidJUnitRunner Stream + MainActivity Cold-Start Smoke Check ==="
+          ./gradlew installDebug installDebugAndroidTest --stacktrace
           timeout 180 adb shell am instrument -w -r com.duolink.app.test/androidx.test.runner.AndroidJUnitRunner
+
+          echo "=== Cold-Start MainActivity Launch Smoke Check ==="
+          timeout 30 adb shell am start -W -n com.duolink.app/.MainActivity
+          sleep 3
+          APP_PID=$(timeout 5 adb shell pidof com.duolink.app | tr -d '\r' || true)
+          echo "Running com.duolink.app PID: ${APP_PID}"
+          test -n "$APP_PID"
 
           echo "=== Connected AndroidTest JUnit XML ==="
           find app/build/outputs/androidTest-results/connected -name "TEST-*.xml" -exec cat {} +

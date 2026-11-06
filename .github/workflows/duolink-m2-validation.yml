@@ -70,9 +70,18 @@ jobs:
           sha256sum "$TEST_APK_PATH"
           echo "=== Debug APK Badging Metadata (aapt2) ==="
           "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK_PATH" | head -n 25
+          mkdir -p /tmp/apk-only
+          cp "$APK_PATH" /tmp/apk-only/DuoLink-v0.2.0.apk
           EOS
           bash /tmp/run_build.sh 2>&1 | tee /tmp/job1.log
           exit "${PIPESTATUS[0]}"
+
+      - name: Upload Clean Installable APK (Single File)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DuoLink-v0.2.0-Android-APK
+          path: /tmp/apk-only/DuoLink-v0.2.0.apk
 
       - name: Upload Debug APK, SHA-256 & Unit Test Reports
         if: always()
@@ -141,6 +150,9 @@ jobs:
           - api: 29
             sysimg: "system-images;android-29;google_apis;x86_64"
             label: "API29-Android10"
+          - api: 33
+            sysimg: "system-images;android-33;google_apis;x86_64"
+            label: "API33-Android13"
           - api: 34
             sysimg: "system-images;android-34;google_apis;x86_64"
             label: "API34-Android14"

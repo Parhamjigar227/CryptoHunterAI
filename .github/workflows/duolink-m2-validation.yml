@@ -44,7 +44,7 @@ jobs:
           fi
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
 
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          { yes || true; } | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/tmp/sdk1.log 2>&1 || { cat /tmp/sdk1.log; exit 1; }
 
           echo "=== Environment & Preserved Archive Checksums ==="
@@ -186,13 +186,13 @@ jobs:
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
 
           echo "Installing SDK packages & system image ($TARGET_SYSIMG)..."
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          { yes || true; } | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager "platform-tools" "emulator" "platforms;android-35" "build-tools;35.0.0" \
             "platforms;android-${TARGET_API}" "${TARGET_SYSIMG}" >/tmp/sdk_emu.log 2>&1 || { cat /tmp/sdk_emu.log; exit 1; }
 
           echo "Creating AVD duolink_avd_${TARGET_API}..."
           echo "no" | avdmanager create avd --force --name "duolink_avd_${TARGET_API}" \
-            --package "${TARGET_SYSIMG}" --abi "x86_64" --device "pixel"
+            --package "${TARGET_SYSIMG}" --abi "x86_64" --device "pixel" >/tmp/avd.log 2>&1 || { cat /tmp/avd.log; exit 1; }
 
           adb start-server </dev/null >/dev/null 2>&1 || true
 

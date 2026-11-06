@@ -332,20 +332,18 @@ class AndroidIntegrationTest {
         val offer = coordA.startInitiatorOffer(t0).getOrThrow()
         val offerBitmap = QrBitmapCodec.renderQrBitmap(offer.qrString, sizePx = 420)
 
-        // Simulate CameraX ImageProxy YUV_420_888 Y-plane with row padding (rowStride = width + 32, pixelStride = 2)
+        // Simulate CameraX ImageProxy YUV_420_888 plane with interleaved stride + ISP row padding
         val width = offerBitmap.width
         val height = offerBitmap.height
-        val rowStride = width + 32
         val pixelStride = 2
+        val rowStride = width * pixelStride + 32
         val yBuffer = ByteBuffer.allocateDirect(rowStride * height)
         for (y in 0 until height) {
             for (x in 0 until width) {
                 val pixel = offerBitmap.getPixel(x, y)
                 val luma = if (pixel == Color.BLACK) 0x10.toByte() else 0xF0.toByte()
                 val idx = y * rowStride + x * pixelStride
-                if (idx < yBuffer.capacity()) {
-                    yBuffer.put(idx, luma)
-                }
+                yBuffer.put(idx, luma)
             }
         }
         yBuffer.rewind()
@@ -363,17 +361,26 @@ class AndroidIntegrationTest {
         val responderStep = coordB.processScannedQr(decodedOfferText!!, t0 + 2)
                 as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
 
-        // Render & scan ACCEPT QR through Bitmap -> Luminance -> ZXing as well
+        // Render & scan ACCEPT QR through padded Y-plane (pixelStride = 1, rowStride = width + 64)
         val acceptBmp = QrBitmapCodec.renderQrBitmap(responderStep.acceptQrToDisplay, sizePx = 420)
-        val acceptY = ByteArray(acceptBmp.width * acceptBmp.height)
+        val acceptRowStride = acceptBmp.width + 64
+        val acceptBuffer = ByteBuffer.allocateDirect(acceptRowStride * acceptBmp.height)
         for (y in 0 until acceptBmp.height) {
             for (x in 0 until acceptBmp.width) {
-                acceptY[y * acceptBmp.width + x] =
-                    if (acceptBmp.getPixel(x, y) == Color.BLACK) 0.toByte() else 0xFF.toByte()
+                val luma = if (acceptBmp.getPixel(x, y) == Color.BLACK) 0.toByte() else 0xFF.toByte()
+                acceptBuffer.put(y * acceptRowStride + x, luma)
             }
         }
+        acceptBuffer.rewind()
+        val acceptY = QrBitmapCodec.extractContiguousLuminance(
+            buffer = acceptBuffer,
+            width = acceptBmp.width,
+            height = acceptBmp.height,
+            rowStride = acceptRowStride,
+            pixelStride = 1
+        )
         val decodedAcceptText = QrBitmapCodec.decodeLuminance(acceptY, acceptBmp.width, acceptBmp.height)
-        assertNotNull(decodedAcceptText)
+        assertEquals(responderStep.acceptQrToDisplay, decodedAcceptText)
 
         val initiatorStep = coordA.processScannedQr(decodedAcceptText!!, t0 + 4)
                 as PairingCoordinator.QrProcessResult.InitiatorReadyToConfirm

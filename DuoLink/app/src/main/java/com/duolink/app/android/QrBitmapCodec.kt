@@ -8,6 +8,7 @@ import com.google.zxing.BinaryBitmap
 import com.google.zxing.DecodeHintType
 import com.google.zxing.EncodeHintType
 import com.google.zxing.PlanarYUVLuminanceSource
+import com.google.zxing.common.GlobalHistogramBinarizer
 import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.qrcode.QRCodeReader
 import com.google.zxing.qrcode.QRCodeWriter
@@ -115,19 +116,24 @@ object QrBitmapCodec {
 
     internal fun decodeLuminance(luminance: ByteArray, width: Int, height: Int): String? {
         val reader = QRCodeReader()
+        val normalSource = PlanarYUVLuminanceSource(
+            luminance,
+            width,
+            height,
+            0,
+            0,
+            width,
+            height,
+            false
+        )
         try {
-            val source = PlanarYUVLuminanceSource(
-                luminance,
-                width,
-                height,
-                0,
-                0,
-                width,
-                height,
-                false
-            )
-            val bitmap = BinaryBitmap(HybridBinarizer(source))
-            return reader.decode(bitmap, decodeHints).text
+            return reader.decode(BinaryBitmap(HybridBinarizer(normalSource)), decodeHints).text
+        } catch (_: Exception) {
+            reader.reset()
+        }
+
+        try {
+            return reader.decode(BinaryBitmap(GlobalHistogramBinarizer(normalSource)), decodeHints).text
         } catch (_: Exception) {
             reader.reset()
         }
@@ -144,8 +150,7 @@ object QrBitmapCodec {
                 height,
                 false
             )
-            val bitmap = BinaryBitmap(HybridBinarizer(source))
-            reader.decode(bitmap, decodeHints).text
+            reader.decode(BinaryBitmap(HybridBinarizer(source)), decodeHints).text
         } catch (_: Exception) {
             null
         } finally {

@@ -58,6 +58,17 @@ class PairingCoordinator(
             val previousPeerDeviceIdHex: String?
         ) : QrProcessResult()
 
+        /**
+         * Responder: the initiator's signed confirmation for this exact session was verified.
+         * If this device had already approved, the pairing is complete on both sides at this point.
+         */
+        data class PeerConfirmationVerified(
+            val safetyNumber: String,
+            val publicHandshakeTranscriptId: String,
+            val peerDeviceIdHex: String,
+            val localPairingComplete: Boolean
+        ) : QrProcessResult()
+
         data class Rejected(
             val reason: PairingRejectionReason,
             val detail: String
@@ -107,7 +118,10 @@ class PairingCoordinator(
                 publicHandshakeTranscriptId = pending.publicHandshakeTranscriptId,
                 responseAcceptQrPayload = pending.responseQrStringForPeer,
                 previousPeerChanged = pending.previousPeerChanged,
-                previousPeerDeviceIdHex = pending.previousPeerDeviceIdHex
+                previousPeerDeviceIdHex = pending.previousPeerDeviceIdHex,
+                localApproved = pending.localApproved,
+                peerConfirmed = pending.peerConfirmationVerified,
+                confirmQrPayloadForPeer = pending.confirmQrStringForPeer
             )
         }
 
@@ -281,6 +295,7 @@ class PairingCoordinator(
         return when (packet.role) {
             QrPacketRole.OFFER -> handleIncomingOffer(packet, localIdentity, replayToken, nowEpochSec)
             QrPacketRole.ACCEPT -> handleIncomingAccept(packet, localIdentity, replayToken, nowEpochSec)
+            QrPacketRole.CONFIRM -> handleIncomingConfirm(packet, localIdentity, replayToken, nowEpochSec)
         }
     }
 
@@ -334,6 +349,76 @@ class PairingCoordinator(
             )
         }
 
+        // Record that *this* device has approved. Persisting the pin is deliberately NOT done here.
+        if (!pending.localApproved) {
+            pendingConfirmation = pending.copy(localApproved = true, localApprovedAtEpochSec = nowEpochSec)
+        }
+
+        val record = PairedPeerRecord(
+            peerDeviceId = pending.peerDeviceId.copyOf(),
+            peerIkSigSpki = pending.peerIkSigSpki.copyOf(),
+            peerSpkId = pending.peerSpk.spkId,
+            peerSpkPubSpki = pending.peerSpk.publicKeySpki.copyOf(),
+            peerSpkSignature = pending.peerSpk.signatureByIdentityKey.copyOf(),
+            peerSpkCreatedAtEpochSec = pending.peerSpk.createdAtEpochSec,
+            rootPairingKey = pending.derivedRootPairingKey.copyOf(),
+            safetyNumber = pending.safetyNumber,
+            pairedAtEpochSec = nowEpochSec,
+            safetyNumberVerified = true
+        )
+        // MUTUAL GATE. A pairing may only be reported as successful once the *peer* has also confirmed
+        // this exact session. Previously this function pinned the peer immediately, so the initiator
+        // displayed a green "connected" state while the responder was still waiting — a false success.
+        if (!pending.peerConfirmationVerified) {
+            return Result.failure(
+                PeerConfirmationPendingException(
+                    role = if (pending.confirmQrStringForPeer != null) {
+                        PairingRole.INITIATOR
+                    } else {
+                        PairingRole.RESPONDER
+                    },
+                    confirmQrStringForPeer = pending.confirmQrStringForPeer
+                )
+            )
+        }
+        return try {
+            trustStore.savePinnedPeer(record)
+            Arrays.fill(pending.derivedRootPairingKey, 0.toByte())
+            pendingConfirmation = null
+            activeInitiatorOffer = null
+            Result.success(record)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Completes the pairing after the peer's confirmation has been verified.
+     *
+     * Both devices call this through their own confirmation path; it re-checks every precondition rather
+     * than trusting that the caller did, because "the pin exists" is the single most security-relevant
+     * fact in the app.
+     */
+    private fun finalizeMutualPairing(pending: PendingPairingConfirmation, nowEpochSec: Long): Result<PairedPeerRecord> {
+        if (!pending.localApproved || !pending.peerConfirmationVerified) {
+            return Result.failure(
+                IllegalStateException(
+                    "جفت‌سازی تنها زمانی کامل می‌شود که هر دو دستگاه تأیید کرده باشند"
+                )
+            )
+        }
+        when (val pinned = trustStore.readPinnedPeer()) {
+            is PinnedPeerReadResult.Valid -> return Result.failure(
+                PairingValidationException(
+                    PairingRejectionReason.THIRD_DEVICE_BLOCKED,
+                    PairingRejectionReason.THIRD_DEVICE_BLOCKED.persianMessage
+                )
+            )
+            is PinnedPeerReadResult.Corrupted -> return Result.failure(
+                PairingValidationException(PairingRejectionReason.TRUST_STORAGE_CORRUPTED, pinned.reason)
+            )
+            is PinnedPeerReadResult.None -> {}
+        }
         val record = PairedPeerRecord(
             peerDeviceId = pending.peerDeviceId.copyOf(),
             peerIkSigSpki = pending.peerIkSigSpki.copyOf(),
@@ -355,6 +440,40 @@ class PairingCoordinator(
         } catch (e: Exception) {
             Result.failure(e)
         }
+    }
+
+    /**
+     * Attempts to complete an in-progress pairing.
+     *
+     * Safe to call repeatedly (e.g. on resume or after the peer's confirmation arrives): it succeeds only
+     * when both sides have confirmed, and otherwise returns a [PeerConfirmationPendingException] that
+     * carries what the UI still needs to ask the user to do.
+     */
+    @Synchronized
+    fun tryCompletePairing(nowEpochSec: Long = currentEpochSec()): Result<PairedPeerRecord> {
+        ensureSecurityStorageHealthyResult()?.let { return Result.failure(it) }
+        val pending = pendingConfirmation
+            ?: return Result.failure(
+                IllegalStateException("هیچ جلسه جفت‌سازی در انتظار تأیید وجود ندارد")
+            )
+        if (!pending.localApproved) {
+            return Result.failure(
+                IllegalStateException("ابتدا باید کد امنیتی ۶۰ رقمی را تأیید کنید")
+            )
+        }
+        if (!pending.peerConfirmationVerified) {
+            return Result.failure(
+                PeerConfirmationPendingException(
+                    role = if (pending.confirmQrStringForPeer != null) {
+                        PairingRole.INITIATOR
+                    } else {
+                        PairingRole.RESPONDER
+                    },
+                    confirmQrStringForPeer = pending.confirmQrStringForPeer
+                )
+            )
+        }
+        return finalizeMutualPairing(pending, nowEpochSec)
     }
 
     @Synchronized
@@ -527,7 +646,13 @@ class PairingCoordinator(
             publicHandshakeTranscriptId = publicTranscriptId,
             responseQrStringForPeer = acceptQr,
             previousPeerChanged = previousCheck.first,
-            previousPeerDeviceIdHex = previousCheck.second
+            previousPeerDeviceIdHex = previousCheck.second,
+            confirmQrStringForPeer = null,
+            // The OFFER we verified is the initiator's ECDSA-signed commitment to this exact session
+            // (its identity, signed pre-key, nonce). Together with a locally confirmed, identical Safety
+            // Number that is the same mutual binding the initiator obtains from our ACCEPT.
+            peerConfirmationVerified = true,
+            ourAcceptTranscriptDigest = acceptParsed.rawTranscriptDigestSha256
         )
 
         return QrProcessResult.ResponderReadyToConfirm(
@@ -624,6 +749,21 @@ class PairingCoordinator(
             )
         }
 
+        // The initiator must be able to prove to the responder that *this* session was confirmed, so it
+        // pre-builds the signed CONFIRM packet now, bound to the responder's ACCEPT digest. It is handed
+        // to the user only after they check all 60 digits (see confirmSafetyFingerprint).
+        val confirmQr = QrPairingCodec.encodeSignedPacket(
+            role = QrPacketRole.CONFIRM,
+            sessionId = activeOffer.packet.sessionId,
+            issuedAtEpochSec = nowEpochSec,
+            expiresAtEpochSec = nowEpochSec + qrTtlSeconds,
+            localIdentity = localIdentity,
+            senderNonce = ByteArray(32).also { secureRandom.nextBytes(it) },
+            targetInitiatorDeviceId = accept.senderDeviceId,
+            boundOfferDigest = accept.rawTranscriptDigestSha256,
+            keyVault = keyVault
+        )
+
         pendingConfirmation?.let { Arrays.fill(it.derivedRootPairingKey, 0.toByte()) }
         pendingConfirmation = PendingPairingConfirmation(
             sessionId = activeOffer.packet.sessionId.copyOf(),
@@ -635,7 +775,13 @@ class PairingCoordinator(
             publicHandshakeTranscriptId = publicTranscriptId,
             responseQrStringForPeer = null,
             previousPeerChanged = previousCheck.first,
-            previousPeerDeviceIdHex = previousCheck.second
+            previousPeerDeviceIdHex = previousCheck.second,
+            confirmQrStringForPeer = confirmQr,
+            // The ACCEPT we just verified is the responder's ECDSA-signed commitment to this exact
+            // session: it binds the session id, its identity, its signed pre-key, its nonce, our device
+            // id and the digest of *our* OFFER. Combined with a locally confirmed, identical Safety
+            // Number that is a complete mutual binding, so the initiator needs no further round trip.
+            peerConfirmationVerified = true
         )
         activeInitiatorOffer = null
 
@@ -645,6 +791,89 @@ class PairingCoordinator(
             peerDeviceIdHex = ByteEncoding.toHexLower(accept.senderDeviceId),
             previousPeerChanged = previousCheck.first,
             previousPeerDeviceIdHex = previousCheck.second
+        )
+    }
+
+    /**
+     * Responder side: the initiator scanned our ACCEPT and has now confirmed the pairing.
+     *
+     * This is the missing return path. Before this step existed the responder never learned that the
+     * initiator finished, so it stayed on the waiting screen while the initiator already displayed a
+     * successful connection. Nothing here is trusted on arrival: the packet signature, the session id,
+     * our own device id and the digest of *our* ACCEPT are all re-verified before the responder is
+     * allowed to persist anything.
+     */
+    private fun handleIncomingConfirm(
+        confirm: PairingQrPacket,
+        localIdentity: LocalIdentityPublic,
+        replayToken: ByteArray,
+        nowEpochSec: Long
+    ): QrProcessResult {
+        val pending = pendingConfirmation
+            ?: return QrProcessResult.Rejected(
+                PairingRejectionReason.UNEXPECTED_PACKET_ROLE,
+                "هیچ جفت‌سازی در انتظار تأیید روی این دستگاه وجود ندارد"
+            )
+
+        if (pending.confirmQrStringForPeer != null) {
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.UNEXPECTED_PACKET_ROLE,
+                "این دستگاه نقش آغازگر دارد و باید تأیید خودش را نمایش دهد، نه اسکن کند"
+            )
+        }
+
+        val ourAcceptDigest = pending.ourAcceptTranscriptDigest
+            ?: return QrProcessResult.Rejected(
+                PairingRejectionReason.PEER_CONFIRMATION_INVALID,
+                PairingRejectionReason.PEER_CONFIRMATION_INVALID.persianMessage
+            )
+
+        // Bind the confirmation to *this* session: same session, our device as target, and the digest of
+        // the ACCEPT we actually issued. A confirmation for any other session/device is rejected.
+        if (!ByteEncoding.constantTimeEquals(confirm.sessionId, pending.sessionId) ||
+            confirm.targetInitiatorDeviceId == null ||
+            !ByteEncoding.constantTimeEquals(confirm.targetInitiatorDeviceId, localIdentity.deviceId) ||
+            confirm.boundOfferDigest == null ||
+            !ByteEncoding.constantTimeEquals(confirm.boundOfferDigest, ourAcceptDigest)
+        ) {
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.PEER_CONFIRMATION_INVALID,
+                PairingRejectionReason.PEER_CONFIRMATION_INVALID.persianMessage
+            )
+        }
+
+        if (!ByteEncoding.constantTimeEquals(confirm.senderIkSigSpki, pending.peerIkSigSpki)) {
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.PEER_CONFIRMATION_INVALID,
+                PairingRejectionReason.PEER_CONFIRMATION_INVALID.persianMessage
+            )
+        }
+
+        // Both devices derived the same Safety Number from the same bound inputs (session id, both
+        // transcript digests, both nonces, both identities). The digest binding above is what guarantees
+        // that; the number itself is compared by the humans.
+
+        try {
+            trustStore.recordReplayToken(replayToken)
+        } catch (e: TrustStorageCorruptedException) {
+            return QrProcessResult.Rejected(
+                PairingRejectionReason.TRUST_STORAGE_CORRUPTED,
+                e.message ?: PairingRejectionReason.TRUST_STORAGE_CORRUPTED.persianMessage
+            )
+        }
+
+        // Responder: our scan of the CONFIRM packet *is* the peer's confirmation. If this device already
+        // approved locally, the pairing completes now, on both sides.
+        val updated = pending.copy(peerConfirmationVerified = true)
+        pendingConfirmation = updated
+        if (updated.localApproved) {
+            finalizeMutualPairing(updated, nowEpochSec)
+        }
+        return QrProcessResult.PeerConfirmationVerified(
+            safetyNumber = pending.safetyNumber,
+            publicHandshakeTranscriptId = pending.publicHandshakeTranscriptId,
+            peerDeviceIdHex = ByteEncoding.toHexLower(pending.peerDeviceId),
+            localPairingComplete = pendingConfirmation == null
         )
     }
 

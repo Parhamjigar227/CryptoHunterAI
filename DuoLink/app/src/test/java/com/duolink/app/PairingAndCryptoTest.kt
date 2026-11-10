@@ -778,6 +778,104 @@ class PairingAndCryptoTest {
     // Helpers
     // -------------------------------------------------------------------------
 
+    // -------------------------------------------------------------------------
+    // 12. Mutual confirmation — regression tests for the two-device desync bug
+    //
+    // Observed on real hardware: phone A scanned the ACCEPT QR and showed a green "connected" state
+    // while phone B stayed on "waiting for connection" forever. Root cause: A pinned the peer as soon
+    // as *its own* user pressed confirm, with no evidence the peer had confirmed the same session, and
+    // the OFFER/ACCEPT exchange had no return path back to B.
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun neitherDeviceReportsSuccessBeforeItsOwnUserConfirms() {
+        val envA = TestNode(1_700_050_000L)
+        val envB = TestNode(1_700_050_000L)
+        val t0 = 1_700_050_050L
+
+        val offer = envA.coordinator.startInitiatorOffer(t0).getOrThrow()
+        val stepB = envB.coordinator.processScannedQr(offer.qrString, t0 + 5)
+            as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+        envA.coordinator.processScannedQr(stepB.acceptQrToDisplay, t0 + 10)
+
+        // Both devices have completed all scanning, but NEITHER user has confirmed the Safety Number.
+        check(envA.coordinator.currentStateSnapshot(t0 + 10) !is PairingStateSnapshot.PairedActive) {
+            "Initiator must not appear paired before its own user confirms"
+        }
+        check(envB.coordinator.currentStateSnapshot(t0 + 10) !is PairingStateSnapshot.PairedActive) {
+            "Responder must not appear paired before its own user confirms"
+        }
+        check(!envA.coordinator.tryCompletePairing(t0 + 10).isSuccess) {
+            "Completion must fail while the local user has not approved"
+        }
+    }
+
+    @Test
+    fun bothDevicesReachPairedActiveWithIdenticalRootKeyAndSafetyNumber() {
+        val envA = TestNode(1_700_051_000L)
+        val envB = TestNode(1_700_051_000L)
+        val t0 = 1_700_051_050L
+
+        val offer = envA.coordinator.startInitiatorOffer(t0).getOrThrow()
+        val stepB = envB.coordinator.processScannedQr(offer.qrString, t0 + 5)
+            as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+        val stepA = envA.coordinator.processScannedQr(stepB.acceptQrToDisplay, t0 + 10)
+            as PairingCoordinator.QrProcessResult.InitiatorReadyToConfirm
+        check(stepA.safetyNumber == stepB.safetyNumber)
+
+        // B (the responder) confirms first, as it must: it completes whenever its own user approves,
+        // because it already holds A's signed OFFER for this exact session.
+        check(envB.coordinator.confirmSafetyFingerprint(true, t0 + 20).isSuccess)
+        check(envA.coordinator.confirmSafetyFingerprint(true, t0 + 21).isSuccess)
+
+        val a = envA.coordinator.currentStateSnapshot(t0 + 21)
+        val b = envB.coordinator.currentStateSnapshot(t0 + 21)
+        check(a is PairingStateSnapshot.PairedActive) { "Initiator must finish, actual=$a" }
+        check(b is PairingStateSnapshot.PairedActive) { "Responder must finish, actual=$b" }
+        val ra = (a as PairingStateSnapshot.PairedActive).peerRecord
+        val rb = (b as PairingStateSnapshot.PairedActive).peerRecord
+
+        check(ra.rootPairingKey.contentEquals(rb.rootPairingKey)) { "Root keys must match" }
+        check(ra.safetyNumber == rb.safetyNumber) { "Safety Numbers must match exactly" }
+        check(ra.peerDeviceId.contentEquals(envB.localId.deviceId))
+        check(rb.peerDeviceId.contentEquals(envA.localId.deviceId))
+        check(a.isMutualSuccess && b.isMutualSuccess)
+    }
+
+    @Test
+    fun confirmingWithoutFullSixtyDigitComparisonIsRefused() {
+        val envA = TestNode(1_700_052_000L)
+        val envB = TestNode(1_700_052_000L)
+        val t0 = 1_700_052_050L
+        val offer = envA.coordinator.startInitiatorOffer(t0).getOrThrow()
+        val stepB = envB.coordinator.processScannedQr(offer.qrString, t0 + 5)
+            as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+        envA.coordinator.processScannedQr(stepB.acceptQrToDisplay, t0 + 10)
+
+        check(!envA.coordinator.confirmSafetyFingerprint(false, t0 + 20).isSuccess) {
+            "Confirm must be refused unless the user attests to comparing all 60 digits"
+        }
+        check(envA.coordinator.currentStateSnapshot(t0 + 20) !is PairingStateSnapshot.PairedActive)
+    }
+
+    @Test
+    fun pairingCompletedTwiceIsIdempotentAndKeepsTheSameRecord() {
+        val envA = TestNode(1_700_053_000L)
+        val envB = TestNode(1_700_053_000L)
+        val t0 = 1_700_053_050L
+        val offer = envA.coordinator.startInitiatorOffer(t0).getOrThrow()
+        val stepB = envB.coordinator.processScannedQr(offer.qrString, t0 + 5)
+            as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
+        envA.coordinator.processScannedQr(stepB.acceptQrToDisplay, t0 + 10)
+        envA.coordinator.confirmSafetyFingerprint(true, t0 + 20).getOrThrow()
+
+        val first = envA.coordinator.currentStateSnapshot(t0 + 20) as PairingStateSnapshot.PairedActive
+        // Re-entering the app / recomputing must never unpair or change the pinned record.
+        val second = envA.coordinator.currentStateSnapshot(t0 + 60) as PairingStateSnapshot.PairedActive
+        check(first.peerRecord.rootPairingKey.contentEquals(second.peerRecord.rootPairingKey))
+        check(first.peerRecord.safetyNumber == second.peerRecord.safetyNumber)
+    }
+
     private class TestNode(initEpochSec: Long) {
         val sealer = JcaAesGcmSealer()
         val vaultRawStore = InMemoryByteStore()

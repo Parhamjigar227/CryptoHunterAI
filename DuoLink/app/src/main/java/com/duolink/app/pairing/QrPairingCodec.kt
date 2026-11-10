@@ -66,9 +66,13 @@ object QrPairingCodec {
         writeShortChunk(out, spk.publicKeySpki)
         writeShortChunk(out, spk.signatureByIdentityKey)
         out.write(senderNonce)
-        if (role == QrPacketRole.ACCEPT) {
-            val targetId = requireNotNull(targetInitiatorDeviceId) { "ACCEPT requires targetInitiatorDeviceId" }
-            val offerDigest = requireNotNull(boundOfferDigest) { "ACCEPT requires boundOfferDigest" }
+        // ACCEPT binds the OFFER it answers; CONFIRM binds the ACCEPT it answers. Both carry the same
+        // two fields (peer device id + peer transcript digest) so the wire layout stays uniform.
+        if (role == QrPacketRole.ACCEPT || role == QrPacketRole.CONFIRM) {
+            val targetId = requireNotNull(targetInitiatorDeviceId) {
+                "${role.name} requires targetInitiatorDeviceId"
+            }
+            val offerDigest = requireNotNull(boundOfferDigest) { "${role.name} requires boundOfferDigest" }
             require(targetId.size == 16) { "targetInitiatorDeviceId must be 16 bytes" }
             require(offerDigest.size == SHA256_BYTES) { "boundOfferDigest must be 32 bytes" }
             out.write(targetId)
@@ -150,7 +154,7 @@ object QrPairingCodec {
                 createdAtEpochSec = spkCreatedAt
             )
             senderNonce = readFixed(buf, NONCE_BYTES)
-            if (role == QrPacketRole.ACCEPT) {
+            if (role == QrPacketRole.ACCEPT || role == QrPacketRole.CONFIRM) {
                 targetInitId = readFixed(buf, 16)
                 boundOfferDigest = readFixed(buf, SHA256_BYTES)
             } else {
@@ -248,7 +252,13 @@ object QrPairingCodec {
         boundOfferDigest: ByteArray?
     ): ByteArray {
         val tb = TranscriptBuilder()
-            .putUtf8(if (role == QrPacketRole.OFFER) "DUOLINK-QR-OFFER-V1" else "DUOLINK-QR-ACCEPT-V1")
+            .putUtf8(
+                when (role) {
+                    QrPacketRole.OFFER -> "DUOLINK-QR-OFFER-V1"
+                    QrPacketRole.ACCEPT -> "DUOLINK-QR-ACCEPT-V1"
+                    QrPacketRole.CONFIRM -> "DUOLINK-QR-CONFIRM-V1"
+                }
+            )
             .putBytes(sessionId)
             .putInt64(issuedAtEpochSec)
             .putInt64(expiresAtEpochSec)
@@ -259,7 +269,7 @@ object QrPairingCodec {
             .putBytes(senderSpk.publicKeySpki)
             .putBytes(senderSpk.signatureByIdentityKey)
             .putBytes(senderNonce)
-        if (role == QrPacketRole.ACCEPT) {
+        if (role == QrPacketRole.ACCEPT || role == QrPacketRole.CONFIRM) {
             tb.putBytes(requireNotNull(targetInitiatorDeviceId))
             tb.putBytes(requireNotNull(boundOfferDigest))
         }

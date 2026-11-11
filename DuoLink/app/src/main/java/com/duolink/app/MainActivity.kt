@@ -23,10 +23,9 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.QrCodeScanner
-import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -38,6 +37,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -147,6 +147,15 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
+/**
+ * Main screen — deliberately minimal.
+ *
+ * The user asked for a private messenger, not a configuration tool. Only four things are here: the
+ * portrait/logo, one plain-language status line, one primary action, and a small settings entry.
+ * Cryptography, key ids, device fingerprints and storage diagnostics live behind [onOpenSecurity],
+ * which is the "small settings option" — they are never shown on this screen.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun HomeScreen(
     uiState: DuoLinkUiState,
@@ -154,20 +163,24 @@ private fun HomeScreen(
     onOpenSecurity: () -> Unit,
     onOpenAbout: () -> Unit
 ) {
-    val isPaired = uiState.pairingState is PairingStateSnapshot.PairedActive
-    val isCorrupted = uiState.pairingState is PairingStateSnapshot.TrustStorageCorrupted
+    val paired = uiState.pairingState as? PairingStateSnapshot.PairedActive
+    val corrupted = uiState.pairingState is PairingStateSnapshot.TrustStorageCorrupted
+    val inProgress = when (val snap = uiState.pairingState) {
+        is PairingStateSnapshot.AwaitingUserConfirmation -> !snap.localApproved
+        is PairingStateSnapshot.InitiatorOfferReady -> true
+        else -> false
+    }
 
     Scaffold(
+        containerColor = ObsidianBackground,
         topBar = {
             TopAppBar(
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Image(
                             painter = painterResource(id = R.drawable.duolink_logo),
-                            contentDescription = "لوگوی دوولینک",
-                            modifier = Modifier
-                                .size(34.dp)
-                                .clip(CircleShape),
+                            contentDescription = null,
+                            modifier = Modifier.size(32.dp).clip(CircleShape),
                             contentScale = ContentScale.Crop
                         )
                         Spacer(modifier = Modifier.width(10.dp))
@@ -175,136 +188,128 @@ private fun HomeScreen(
                     }
                 },
                 actions = {
+                    // The only secondary entry point: one small settings icon.
                     IconButton(onClick = onOpenSecurity) {
                         Icon(
-                            Icons.Default.Shield,
-                            contentDescription = "امنیت و اثرانگشت",
-                            tint = if (isCorrupted) ErrorCrimson else GoldPrimary
+                            Icons.Default.Settings,
+                            contentDescription = "تنظیمات و امنیت",
+                            tint = if (corrupted) ErrorCrimson else GoldPrimary
                         )
-                    }
-                    IconButton(onClick = onOpenAbout) {
-                        Icon(Icons.Default.Info, contentDescription = "درباره برنامه", tint = GoldPrimary)
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = SurfaceCharcoal,
+                    containerColor = ObsidianBackground,
                     titleContentColor = GoldPrimary
                 )
             )
-        },
-        containerColor = ObsidianBackground
+        }
     ) { padding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+                .padding(horizontal = 24.dp, vertical = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Card(
+            Spacer(modifier = Modifier.height(28.dp))
+
+            Image(
+                painter = painterResource(id = R.drawable.nasrin_portrait),
+                contentDescription = "نسرین خانم",
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        if (isPaired) onOpenSecurity() else onOpenPairing()
-                    },
-                colors = CardDefaults.cardColors(containerColor = SurfaceElevated),
-                shape = RoundedCornerShape(18.dp)
-            ) {
-                Row(
+                    .size(132.dp)
+                    .clip(CircleShape)
+                    .border(2.dp, GoldPrimary, CircleShape),
+                contentScale = ContentScale.Crop
+            )
+            Spacer(modifier = Modifier.height(18.dp))
+            Text(
+                text = "نسرین خانم",
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Bold,
+                color = TextIvory
+            )
+
+            Spacer(modifier = Modifier.height(28.dp))
+
+            // Plain-language status. No device ids, no key names, no server addresses.
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Image(
-                        painter = painterResource(id = R.drawable.nasrin_portrait),
-                        contentDescription = "تصویر پروفایل نسرین خانم",
-                        modifier = Modifier
-                            .size(72.dp)
-                            .clip(CircleShape)
-                            .border(2.dp, GoldPrimary, CircleShape),
-                        contentScale = ContentScale.Crop
-                    )
-                    Spacer(modifier = Modifier.width(14.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "نسرین خانم",
-                            fontSize = 20.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = TextIvory
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = when {
-                                isCorrupted -> "مسدودسازی امنیتی — نیازمند بازیابی ذخیره‌سازی امن"
-                                isPaired -> "جفت‌سازی امن تأییدشده • آماده اتصال مستقیم"
-                                else -> "در انتظار جفت‌سازی امن دوطرفه با کد QR"
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = when {
-                                isCorrupted -> ErrorCrimson
-                                isPaired -> SuccessEmerald
-                                else -> WarningAmber
+                        .size(10.dp)
+                        .clip(CircleShape)
+                        .background(
+                            when {
+                                corrupted -> ErrorCrimson
+                                paired != null -> SuccessEmerald
+                                inProgress -> WarningAmber
+                                else -> TextMuted
                             }
                         )
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text = when {
+                        corrupted -> "نیازمند بررسی امنیتی"
+                        paired != null -> "متصل به گوشی مقابل"
+                        inProgress -> "در حال اتصال…"
+                        else -> "متصل نیست"
+                    },
+                    fontSize = 17.sp,
+                    color = when {
+                        corrupted -> ErrorCrimson
+                        paired != null -> SuccessEmerald
+                        inProgress -> WarningAmber
+                        else -> TextMuted
                     }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(36.dp))
+
+            Button(
+                onClick = { if (corrupted) onOpenSecurity() else onOpenPairing() },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (corrupted) ErrorCrimson else GoldPrimary,
+                    contentColor = if (corrupted) Color.White else Color.Black
+                )
+            ) {
+                Icon(Icons.Default.QrCodeScanner, contentDescription = null)
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text = when {
+                        corrupted -> "بررسی و بازیابی"
+                        paired != null -> "مشاهده اتصال"
+                        else -> "اتصال به گوشی دیگر"
+                    },
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+
+            if (paired != null) {
+                Spacer(modifier = Modifier.height(14.dp))
+                OutlinedButton(
+                    onClick = onOpenSecurity,
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Icon(Icons.Default.Lock, contentDescription = null, tint = GoldPrimary)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("گفتگوی خصوصی", color = GoldPrimary)
                 }
             }
 
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = SurfaceCharcoal),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            Icons.Default.Lock,
-                            contentDescription = null,
-                            tint = if (isCorrupted) ErrorCrimson else GoldPrimary
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "حریم خصوصی سراسری فعال است",
-                            fontWeight = FontWeight.SemiBold,
-                            color = TextIvory
-                        )
-                    }
-                    Text(
-                        text = "کلید امضای هویت و کلید پوششی در Android Keystore نگهداری می‌شوند، اسکرین‌شات سطح سیستم غیرفعال است، پشتیبان‌گیری ابری بسته است و هیچ سروری کلید یا پیامی ذخیره نمی‌کند.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = TextMuted,
-                        lineHeight = 20.sp
-                    )
-                    Button(
-                        onClick = onOpenPairing,
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isCorrupted) ErrorCrimson else GoldPrimary,
-                            contentColor = if (isCorrupted) Color.White else Color.Black
-                        )
-                    ) {
-                        Icon(Icons.Default.QrCodeScanner, contentDescription = null)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            when {
-                                isCorrupted -> "بررسی خطای امنیتی و بازیابی صریح"
-                                isPaired -> "مشاهده وضعیت جفت‌سازی"
-                                else -> "شروع جفت‌سازی امن با کد QR"
-                            }
-                        )
-                    }
-                    OutlinedButton(
-                        onClick = onOpenSecurity,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("بررسی کد امنیتی ۶۰ رقمی و وضعیت کلیدها", color = GoldPrimary)
-                    }
-                }
+            Spacer(modifier = Modifier.weight(1f))
+
+            TextButton(onClick = onOpenAbout) {
+                Text("درباره", color = TextMuted, fontSize = 13.sp)
             }
+            Spacer(modifier = Modifier.height(8.dp))
         }
     }
 }

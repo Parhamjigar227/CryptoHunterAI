@@ -1,8 +1,15 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Milestone 2: Camera permission strictly for offline QR identity pairing -->
+    <!-- Method A (QR) pairing is fully offline and needs only the camera. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!--
+      Method B (remote pairing) talks to the user's own self-hosted signalling server.
+      No push/FCM dependency: the app polls that server over TLS while it is open.
+      Cleartext (http://) is explicitly disabled below, so the permission cannot be used
+      to downgrade the transport.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-feature
         android:name="android.hardware.camera"
         android:required="false" />
@@ -14,6 +21,7 @@
         android:icon="@drawable/duolink_logo"
         android:label="DuoLink"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="false"
         android:theme="@android:style/Theme.Material.NoActionBar"
         tools:targetApi="35">
         <activity

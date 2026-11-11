@@ -151,7 +151,7 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
                     _uiState.update {
                         it.copy(
                             cameraScannerOpen = false,
-                            statusBannerPersian = "کد درخواست معتبر بود. کد پاسخ زیر را به مخاطب نشان دهید و تمام ۶۰ رقم کد امنیتی را از طریق کانال مستقل مقایسه کنید.",
+                            statusBannerPersian = "کد پذیرفته شد. اکنون هر ۶۰ رقم کد امنیتی را با گوشی مقابل مقایسه کنید.",
                             isErrorBanner = false
                         )
                     }
@@ -160,7 +160,16 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
                     _uiState.update {
                         it.copy(
                             cameraScannerOpen = false,
-                            statusBannerPersian = "کد پاسخ معتبر بود. اکنون تمام ۶۰ رقم کد امنیتی را از طریق کانال مستقل با نسرین خانم مقایسه و تأیید کنید.",
+                            statusBannerPersian = "کد پاسخ پذیرفته شد. اکنون هر ۶۰ رقم کد امنیتی را با گوشی مقابل مقایسه کنید.",
+                            isErrorBanner = false
+                        )
+                    }
+                }
+                is PairingCoordinator.QrProcessResult.PeerConfirmationVerified -> {
+                    _uiState.update {
+                        it.copy(
+                            cameraScannerOpen = false,
+                            statusBannerPersian = "گوشی مقابل این اتصال را تأیید کرد.",
                             isErrorBanner = false
                         )
                     }
@@ -194,7 +203,7 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
                 onSuccess = {
                     _uiState.update {
                         it.copy(
-                            statusBannerPersian = "جفت‌سازی دوطرفه با موفقیت تأیید و کلید امنیتی مخاطب پین شد.",
+                            statusBannerPersian = "اتصال با موفقیت برقرار شد و کلید امنیتی گوشی مقابل ذخیره شد.",
                             isErrorBanner = false
                         )
                     }

@@ -120,7 +120,7 @@ class PairingCoordinator(
                 previousPeerChanged = pending.previousPeerChanged,
                 previousPeerDeviceIdHex = pending.previousPeerDeviceIdHex,
                 localApproved = pending.localApproved,
-                peerConfirmed = pending.peerConfirmationVerified,
+                peerSessionVerified = pending.peerSessionBindingVerified,
                 confirmQrPayloadForPeer = pending.confirmQrStringForPeer
             )
         }
@@ -369,7 +369,7 @@ class PairingCoordinator(
         // MUTUAL GATE. A pairing may only be reported as successful once the *peer* has also confirmed
         // this exact session. Previously this function pinned the peer immediately, so the initiator
         // displayed a green "connected" state while the responder was still waiting — a false success.
-        if (!pending.peerConfirmationVerified) {
+        if (!pending.peerSessionBindingVerified) {
             return Result.failure(
                 PeerConfirmationPendingException(
                     role = if (pending.confirmQrStringForPeer != null) {
@@ -400,7 +400,7 @@ class PairingCoordinator(
      * fact in the app.
      */
     private fun finalizeMutualPairing(pending: PendingPairingConfirmation, nowEpochSec: Long): Result<PairedPeerRecord> {
-        if (!pending.localApproved || !pending.peerConfirmationVerified) {
+        if (!pending.localApproved || !pending.peerSessionBindingVerified) {
             return Result.failure(
                 IllegalStateException(
                     "جفت‌سازی تنها زمانی کامل می‌شود که هر دو دستگاه تأیید کرده باشند"
@@ -461,7 +461,7 @@ class PairingCoordinator(
                 IllegalStateException("ابتدا باید کد امنیتی ۶۰ رقمی را تأیید کنید")
             )
         }
-        if (!pending.peerConfirmationVerified) {
+        if (!pending.peerSessionBindingVerified) {
             return Result.failure(
                 PeerConfirmationPendingException(
                     role = if (pending.confirmQrStringForPeer != null) {
@@ -651,7 +651,7 @@ class PairingCoordinator(
             // The OFFER we verified is the initiator's ECDSA-signed commitment to this exact session
             // (its identity, signed pre-key, nonce). Together with a locally confirmed, identical Safety
             // Number that is the same mutual binding the initiator obtains from our ACCEPT.
-            peerConfirmationVerified = true,
+            peerSessionBindingVerified = true,
             ourAcceptTranscriptDigest = acceptParsed.rawTranscriptDigestSha256
         )
 
@@ -781,7 +781,7 @@ class PairingCoordinator(
             // session: it binds the session id, its identity, its signed pre-key, its nonce, our device
             // id and the digest of *our* OFFER. Combined with a locally confirmed, identical Safety
             // Number that is a complete mutual binding, so the initiator needs no further round trip.
-            peerConfirmationVerified = true
+            peerSessionBindingVerified = true
         )
         activeInitiatorOffer = null
 
@@ -864,7 +864,7 @@ class PairingCoordinator(
 
         // Responder: our scan of the CONFIRM packet *is* the peer's confirmation. If this device already
         // approved locally, the pairing completes now, on both sides.
-        val updated = pending.copy(peerConfirmationVerified = true)
+        val updated = pending.copy(peerSessionBindingVerified = true)
         pendingConfirmation = updated
         if (updated.localApproved) {
             finalizeMutualPairing(updated, nowEpochSec)

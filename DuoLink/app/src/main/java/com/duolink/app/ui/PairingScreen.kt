@@ -9,6 +9,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -41,6 +42,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -64,6 +66,16 @@ import androidx.core.content.ContextCompat
 import com.duolink.app.pairing.PairingStateSnapshot
 import com.duolink.app.pairing.TrustStoreComponent
 
+/**
+ * Pairing screen — two steps, plain language.
+ *
+ * The whole handshake is presented as: scan/generate a code, then confirm. OFFER/ACCEPT packet names,
+ * session ids, transcript digests and key ids are *not* shown; they are reachable on purpose under
+ * «جزئیات فنی» for debugging, and they never gate the flow.
+ *
+ * The security gate is unchanged and still mandatory: the user must attest to comparing all 60 digits of
+ * the Safety Number through an independent trusted channel before either device persists a pairing.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PairingScreen(
@@ -81,6 +93,7 @@ fun PairingScreen(
     val context = LocalContext.current
     var manualPayloadInput by remember { mutableStateOf("") }
     var showManualInput by remember { mutableStateOf(false) }
+    var showTechnicalDetails by remember { mutableStateOf(false) }
     var fullSafetyNumberChecked by remember(uiState.pairingState) { mutableStateOf(false) }
     var acknowledgeKeyChange by remember(uiState.pairingState) { mutableStateOf(false) }
     var confirmDestructiveRecovery by remember(uiState.pairingState) { mutableStateOf(false) }
@@ -88,9 +101,7 @@ fun PairingScreen(
     val cameraPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (granted) {
-            onOpenScanner(true)
-        }
+        if (granted) onOpenScanner(true)
     }
 
     fun requestCameraAndOpenScanner() {
@@ -98,24 +109,20 @@ fun PairingScreen(
             context,
             Manifest.permission.CAMERA
         ) == PackageManager.PERMISSION_GRANTED
-        if (granted) {
-            onOpenScanner(true)
-        } else {
-            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
-        }
+        if (granted) onOpenScanner(true) else cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
     }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("جفت‌سازی امن دوطرفه (QR)") },
+                title = { Text("اتصال به گوشی دیگر") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "بازگشت")
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = SurfaceCharcoal,
+                    containerColor = ObsidianBackground,
                     titleContentColor = GoldPrimary,
                     navigationIconContentColor = GoldPrimary
                 )
@@ -128,73 +135,11 @@ fun PairingScreen(
                 .fillMaxSize()
                 .padding(padding)
                 .verticalScroll(rememberScrollState())
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
+                .padding(horizontal = 20.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             uiState.statusBannerPersian?.let { msg ->
-                StatusBannerCard(
-                    message = msg,
-                    isError = uiState.isErrorBanner,
-                    onDismiss = onDismissBanner
-                )
-            }
-
-            // Local device identity card with separate per-key protection summary
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = SurfaceCharcoal),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Security, contentDescription = null, tint = GoldPrimary)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "هویت رمزنگاری این دستگاه",
-                            fontWeight = FontWeight.Bold,
-                            color = TextIvory
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = if (uiState.localDeviceIdHex.isNotEmpty()) {
-                            "شناسه دستگاه: ${uiState.localDeviceIdHex}"
-                        } else {
-                            "شناسه دستگاه: غیرفعال تا رفع خطای ذخیره‌سازی امن"
-                        },
-                        style = MaterialTheme.typography.bodySmall.copy(
-                            fontFamily = FontFamily.Monospace,
-                            textDirection = TextDirection.Ltr
-                        ),
-                        color = GoldSoft
-                    )
-                    uiState.keyProtectionReport?.let { report ->
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = "• امضای هویت (IK_sig): ${report.identitySigningKey.persianDescription}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextMuted
-                        )
-                        Text(
-                            text = "• کلید پوششی (MSK): ${report.storageWrappingKey.persianDescription}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextMuted
-                        )
-                        Text(
-                            text = "• پیش‌کلید (SPK_dh): ${report.activeSignedPreKey.persianDescription}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextMuted
-                        )
-                    }
-                }
-            }
-
-            if (uiState.cameraScannerOpen && uiState.pairingState !is PairingStateSnapshot.TrustStorageCorrupted) {
-                CameraQrScannerBox(
-                    promptText = "دوربین را مقابل کد QR گوشی مقابل بگیرید",
-                    onQrDecoded = onQrScanned,
-                    onClose = { onOpenScanner(false) }
-                )
+                StatusBannerCard(message = msg, isError = uiState.isErrorBanner, onDismiss = onDismissBanner)
             }
 
             when (val snap = uiState.pairingState) {
@@ -209,292 +154,320 @@ fun PairingScreen(
                 }
 
                 is PairingStateSnapshot.UnpairedIdle -> {
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(containerColor = SurfaceElevated),
-                        shape = RoundedCornerShape(16.dp)
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(16.dp),
-                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                    StepCard(step = "گام ۱ از ۲") {
+                        Text(
+                            text = "کدام کار را انجام می‌دهید؟",
+                            fontSize = 19.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = TextIvory
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "یکی از دو گوشی کد می‌سازد و گوشی دیگر آن را اسکن می‌کند. " +
+                                "این انتخاب فقط یک بار لازم است.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TextMuted
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Button(
+                            onClick = onCreateOfferQr,
+                            modifier = Modifier.fillMaxWidth().height(54.dp),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = GoldPrimary,
+                                contentColor = Color.Black
+                            )
                         ) {
-                            Text(
-                                text = "مراحل جفت‌سازی اختصاصی دو نفره",
-                                fontWeight = FontWeight.Bold,
-                                color = GoldPrimary
-                            )
-                            Text(
-                                text = "۱. یکی از دو گوشی گزینه «ساخت کد QR درخواست» را می‌زند.\n" +
-                                    "۲. گوشی دوم آن کد را اسکن می‌کند تا «کد QR پاسخ» تولید شود.\n" +
-                                    "۳. گوشی اول کد پاسخ را اسکن می‌کند.\n" +
-                                    "۴. هر دو نفر تمام ۶۰ رقم کد امنیتی را از طریق یک کانال مستقل و مورد اعتماد (حضوری یا تماس صوتی مستقیم) مقایسه و تأیید می‌کنند.",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = TextIvory,
-                                lineHeight = 24.sp
-                            )
-                            Button(
-                                onClick = onCreateOfferQr,
-                                modifier = Modifier.fillMaxWidth(),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = GoldPrimary,
-                                    contentColor = Color.Black
-                                )
-                            ) {
-                                Icon(Icons.Default.QrCode2, contentDescription = null)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("گام ۱: ساخت کد QR درخواست (دستگاه شروع‌کننده)")
-                            }
-                            OutlinedButton(
-                                onClick = ::requestCameraAndOpenScanner,
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Icon(Icons.Default.CameraAlt, contentDescription = null, tint = GoldPrimary)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("اسکن کد QR درخواست از گوشی مقابل", color = GoldPrimary)
-                            }
+                            Icon(Icons.Default.QrCode2, contentDescription = null)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("نمایش کد QR در این گوشی", fontWeight = FontWeight.SemiBold)
+                        }
+                        Spacer(modifier = Modifier.height(10.dp))
+                        OutlinedButton(
+                            onClick = ::requestCameraAndOpenScanner,
+                            modifier = Modifier.fillMaxWidth().height(54.dp),
+                            shape = RoundedCornerShape(14.dp)
+                        ) {
+                            Icon(Icons.Default.CameraAlt, contentDescription = null, tint = GoldPrimary)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("اسکن کد QR گوشی مقابل", color = GoldPrimary)
                         }
                     }
                 }
 
                 is PairingStateSnapshot.InitiatorOfferReady -> {
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(containerColor = SurfaceElevated),
-                        shape = RoundedCornerShape(16.dp)
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(16.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                    StepCard(step = "گام ۱ از ۲") {
+                        Text(
+                            text = "این کد را با گوشی مقابل اسکن کنید",
+                            fontSize = 19.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = TextIvory
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        uiState.qrBitmap?.let { bmp ->
+                            Image(
+                                bitmap = bmp.asImageBitmap(),
+                                contentDescription = "کد QR اتصال",
+                                modifier = Modifier
+                                    .size(240.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(Color.White)
+                                    .padding(10.dp)
+                                    .align(Alignment.CenterHorizontally)
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text(
+                            text = "پس از اسکن، گوشی مقابل یک کد پاسخ نشان می‌دهد؛ آن را با همین گوشی اسکن کنید.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextMuted
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Button(
+                            onClick = ::requestCameraAndOpenScanner,
+                            modifier = Modifier.fillMaxWidth().height(54.dp),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = GoldPrimary,
+                                contentColor = Color.Black
+                            )
                         ) {
-                            Text(
-                                text = "کد QR درخواست جفت‌سازی (گام ۱ از ۲)",
-                                fontWeight = FontWeight.Bold,
-                                color = GoldPrimary
-                            )
-                            Text(
-                                text = "از نسرین خانم بخواهید این کد را اسکن کند؛ سپس دکمه «اسکن کد پاسخ» را بزنید.",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = TextIvory,
-                                textAlign = TextAlign.Center
-                            )
-                            uiState.qrBitmap?.let { bmp ->
-                                Image(
-                                    bitmap = bmp.asImageBitmap(),
-                                    contentDescription = "کد QR درخواست جفت‌سازی",
-                                    modifier = Modifier
-                                        .size(250.dp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(Color.White)
-                                        .padding(8.dp)
-                                )
-                            }
-                            Button(
-                                onClick = ::requestCameraAndOpenScanner,
-                                modifier = Modifier.fillMaxWidth(),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = GoldPrimary,
-                                    contentColor = Color.Black
-                                )
-                            ) {
-                                Icon(Icons.Default.CameraAlt, contentDescription = null)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("گام ۲: اسکن کد QR پاسخ از گوشی مقابل")
-                            }
-                            OutlinedButton(
-                                onClick = onCancelHandshake,
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text("لغو این درخواست", color = TextMuted)
-                            }
+                            Icon(Icons.Default.CameraAlt, contentDescription = null)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("گام ۲: اسکن کد پاسخ", fontWeight = FontWeight.SemiBold)
+                        }
+                        Spacer(modifier = Modifier.height(10.dp))
+                        TextButton(
+                            onClick = onCancelHandshake,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("لغو", color = TextMuted)
                         }
                     }
                 }
 
                 is PairingStateSnapshot.AwaitingUserConfirmation -> {
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(containerColor = SurfaceElevated),
-                        shape = RoundedCornerShape(16.dp)
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(16.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            if (snap.responseAcceptQrPayload != null && uiState.qrBitmap != null) {
-                                Text(
-                                    text = "کد QR پاسخ (به گوشی شروع‌کننده نشان دهید)",
-                                    fontWeight = FontWeight.Bold,
-                                    color = GoldPrimary
-                                )
-                                Image(
-                                    bitmap = uiState.qrBitmap.asImageBitmap(),
-                                    contentDescription = "کد QR پاسخ جفت‌سازی",
-                                    modifier = Modifier
-                                        .size(240.dp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(Color.White)
-                                        .padding(8.dp)
-                                )
-                            }
+                    StepCard(step = "گام ۲ از ۲") {
+                        Text(
+                            text = "تأیید اتصال",
+                            fontSize = 19.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = TextIvory
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "این کد باید در هر دو گوشی دقیقاً یکسان باشد. " +
+                                "آن را با صدای بلند یا حضوری، رقم به رقم مقایسه کنید.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TextMuted
+                        )
+                        Spacer(modifier = Modifier.height(14.dp))
+                        SafetyNumberBox(safetyNumber = snap.safetyNumber)
 
-                            if (snap.previousPeerChanged) {
-                                KeyChangeWarningBox(previousDeviceIdHex = snap.previousPeerDeviceIdHex)
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Checkbox(
-                                        checked = acknowledgeKeyChange,
-                                        onCheckedChange = { acknowledgeKeyChange = it },
-                                        colors = CheckboxDefaults.colors(checkedColor = GoldPrimary)
-                                    )
-                                    Text(
-                                        text = "تغییر کلید امنیتی مخاطب را حضوری یا با تماس صوتی مستقیم بررسی و تأیید می‌کنم.",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = WarningAmber
-                                    )
-                                }
-                            }
-
-                            Text(
-                                text = "کد امنیتی کامل ۶۰ رقمی (مقایسه کامل الزامی است)",
-                                fontWeight = FontWeight.Bold,
-                                color = GoldPrimary
-                            )
-                            SafetyNumberBox(safetyNumber = snap.safetyNumber)
-
-                            Text(
-                                text = "شناسه تشخیصی عمومی بسته QR (محاسبه از داده‌های علنی؛ رمز یا جایگزین مقایسه ۶۰ رقم کد امنیتی نیست): ${snap.publicHandshakeTranscriptId}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = TextMuted,
-                                textAlign = TextAlign.Center
-                            )
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
+                        if (snap.previousPeerChanged) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                            KeyChangeWarningBox(previousDeviceIdHex = snap.previousPeerDeviceIdHex)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
                                 Checkbox(
-                                    checked = fullSafetyNumberChecked,
-                                    onCheckedChange = { fullSafetyNumberChecked = it },
+                                    checked = acknowledgeKeyChange,
+                                    onCheckedChange = { acknowledgeKeyChange = it },
                                     colors = CheckboxDefaults.colors(checkedColor = GoldPrimary)
                                 )
                                 Text(
-                                    text = "تمام ۶۰ رقم کد امنیتی بالا (هر ۱۲ گروه پنج‌رقمی) را از طریق یک کانال مستقل و مورد اعتماد (حضوری یا تماس صوتی مستقیم) رقم‌به‌رقم مقایسه کردم و یکسان بودن کامل آن را تأیید می‌کنم.",
+                                    text = "تغییر کلید مخاطب را بررسی و تأیید می‌کنم.",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = TextIvory,
-                                    lineHeight = 20.sp
+                                    color = WarningAmber
                                 )
                             }
+                        }
 
-                            val canConfirm = fullSafetyNumberChecked &&
-                                (!snap.previousPeerChanged || acknowledgeKeyChange)
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(
+                                checked = fullSafetyNumberChecked,
+                                onCheckedChange = { fullSafetyNumberChecked = it },
+                                colors = CheckboxDefaults.colors(checkedColor = GoldPrimary)
+                            )
+                            Text(
+                                text = "هر ۶۰ رقم را در دو گوشی یکسان دیدم.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = TextIvory
+                            )
+                        }
 
-                            Button(
-                                onClick = {
-                                    onConfirmPairing(fullSafetyNumberChecked, acknowledgeKeyChange)
-                                },
-                                enabled = canConfirm,
-                                modifier = Modifier.fillMaxWidth(),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = GoldPrimary,
-                                    contentColor = Color.Black
-                                )
-                            ) {
-                                Icon(Icons.Default.CheckCircle, contentDescription = null)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("تأیید نهایی ۶۰ رقم و قفل جفت‌سازی روبرو")
-                            }
-                            OutlinedButton(
-                                onClick = onCancelHandshake,
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text("رد و لغو جفت‌سازی", color = ErrorCrimson)
-                            }
+                        val canConfirm = fullSafetyNumberChecked &&
+                            (!snap.previousPeerChanged || acknowledgeKeyChange)
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Button(
+                            onClick = { onConfirmPairing(fullSafetyNumberChecked, acknowledgeKeyChange) },
+                            enabled = canConfirm,
+                            modifier = Modifier.fillMaxWidth().height(54.dp),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (snap.localApproved) SuccessEmerald else GoldPrimary,
+                                contentColor = Color.Black
+                            )
+                        ) {
+                            Icon(Icons.Default.CheckCircle, contentDescription = null)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = if (snap.localApproved) "تأیید شد" else "تأیید اتصال",
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(10.dp))
+                        TextButton(onClick = onCancelHandshake, modifier = Modifier.fillMaxWidth()) {
+                            Text("لغو", color = TextMuted)
                         }
                     }
                 }
 
                 is PairingStateSnapshot.PairedActive -> {
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(containerColor = SurfaceElevated),
-                        shape = RoundedCornerShape(16.dp)
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(16.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                    StepCard(step = null) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = SuccessEmerald)
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = "اتصال با موفقیت برقرار شد",
+                                fontSize = 19.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = SuccessEmerald
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            text = "هر دو گوشی همین اتصال را تأیید کرده‌اند.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TextIvory
+                        )
+                        Spacer(modifier = Modifier.height(14.dp))
+                        SafetyNumberBox(safetyNumber = snap.peerRecord.safetyNumber)
+                        Spacer(modifier = Modifier.height(14.dp))
+                        OutlinedButton(
+                            onClick = onOpenSecurityDetails,
+                            modifier = Modifier.fillMaxWidth().height(50.dp),
+                            shape = RoundedCornerShape(14.dp)
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(Icons.Default.CheckCircle, contentDescription = null, tint = SuccessEmerald)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "جفت‌سازی امن فعال و پین‌شده است",
-                                    fontWeight = FontWeight.Bold,
-                                    color = SuccessEmerald
-                                )
-                            }
-                            Text(
-                                text = "شناسه دستگاه مخاطب: ${snap.peerRecord.peerDeviceIdHex}",
-                                style = MaterialTheme.typography.bodySmall.copy(
-                                    fontFamily = FontFamily.Monospace,
-                                    textDirection = TextDirection.Ltr
-                                ),
-                                color = GoldSoft
-                            )
-                            Text(
-                                text = "هرگونه درخواست جفت‌سازی از دستگاه سوم به‌طور خودکار رد می‌شود.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = TextMuted
-                            )
-                            SafetyNumberBox(safetyNumber = snap.peerRecord.safetyNumber)
-                            Button(
-                                onClick = onOpenSecurityDetails,
-                                modifier = Modifier.fillMaxWidth(),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = GoldPrimary,
-                                    contentColor = Color.Black
-                                )
-                            ) {
-                                Text("مدیریت اثرانگشت امنیتی و جفت‌سازی مجدد")
-                            }
+                            Text("جزئیات امنیتی", color = GoldPrimary)
                         }
                     }
                 }
             }
 
-            if (uiState.pairingState !is PairingStateSnapshot.PairedActive &&
-                uiState.pairingState !is PairingStateSnapshot.TrustStorageCorrupted
-            ) {
-                OutlinedButton(
-                    onClick = { showManualInput = !showManualInput },
+            if (uiState.pairingState !is PairingStateSnapshot.TrustStorageCorrupted) {
+                TechnicalDetailsSection(
+                    expanded = showTechnicalDetails,
+                    onToggle = { showTechnicalDetails = !showTechnicalDetails },
+                    uiState = uiState,
+                    manualPayloadInput = manualPayloadInput,
+                    onManualPayloadChange = { manualPayloadInput = it },
+                    showManualInput = showManualInput,
+                    onToggleManualInput = { showManualInput = !showManualInput },
+                    onQrScanned = onQrScanned
+                )
+            }
+        }
+    }
+}
+
+/** A single, quiet card wrapper so every step looks the same. */
+@Composable
+private fun StepCard(step: String?, content: @Composable ColumnScope.() -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = SurfaceElevated),
+        shape = RoundedCornerShape(18.dp)
+    ) {
+        Column(modifier = Modifier.padding(18.dp)) {
+            if (step != null) {
+                Text(
+                    text = step,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = GoldSoft
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+            }
+            content()
+        }
+    }
+}
+
+/**
+ * Everything a normal user should never need: device id, key-protection report, transcript id and the
+ * manual QR entry fallback. Collapsed by default; available for debugging on request.
+ */
+@Composable
+private fun TechnicalDetailsSection(
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    uiState: DuoLinkUiState,
+    manualPayloadInput: String,
+    onManualPayloadChange: (String) -> Unit,
+    showManualInput: Boolean,
+    onToggleManualInput: () -> Unit,
+    onQrScanned: (String) -> Unit
+) {
+    TextButton(onClick = onToggle, modifier = Modifier.fillMaxWidth()) {
+        Text(
+            text = if (expanded) "بستن جزئیات فنی" else "جزئیات فنی (برای عیب‌یابی)",
+            style = MaterialTheme.typography.bodySmall,
+            color = TextMuted
+        )
+    }
+    if (!expanded) return
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        if (uiState.localDeviceIdHex.isNotEmpty()) {
+            Text(
+                text = "شناسه دستگاه این گوشی: ${uiState.localDeviceIdHex}",
+                style = MaterialTheme.typography.bodySmall.copy(
+                    fontFamily = FontFamily.Monospace,
+                    textDirection = TextDirection.Ltr
+                ),
+                color = GoldSoft
+            )
+        }
+        uiState.keyProtectionReport?.let { report ->
+            Text(
+                text = "کلید امضا: ${report.identitySigningKey.persianDescription}",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextMuted
+            )
+            Text(
+                text = "پیش‌کلید: ${report.activeSignedPreKey.persianDescription}",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextMuted
+            )
+        }
+        (uiState.pairingState as? PairingStateSnapshot.AwaitingUserConfirmation)?.let { snap ->
+            Text(
+                text = "شناسه فنی گفت‌وگو: ${snap.publicHandshakeTranscriptId}",
+                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                color = TextMuted
+            )
+        }
+        if (uiState.pairingState !is PairingStateSnapshot.PairedActive) {
+            TextButton(onClick = onToggleManualInput) {
+                Text(
+                    text = if (showManualInput) "بستن ورود دستی" else "ورود دستی کد (بدون دوربین)",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextMuted
+                )
+            }
+            if (showManualInput) {
+                OutlinedTextField(
+                    value = manualPayloadInput,
+                    onValueChange = onManualPayloadChange,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("رشته کد جفت‌سازی") },
+                    singleLine = true
+                )
+                Button(
+                    onClick = { onQrScanned(manualPayloadInput); onManualPayloadChange("") },
+                    enabled = manualPayloadInput.isNotBlank(),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text(
-                        text = if (showManualInput) "بستن ورود متنی کد جفت‌سازی" else "ورود دستی رشته QR (در صورت نبود دوربین)",
-                        color = TextMuted
-                    )
-                }
-                if (showManualInput) {
-                    OutlinedTextField(
-                        value = manualPayloadInput,
-                        onValueChange = { manualPayloadInput = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        label = { Text("رشته dlpair://v1/...") },
-                        singleLine = true
-                    )
-                    Button(
-                        onClick = {
-                            onQrScanned(manualPayloadInput)
-                            manualPayloadInput = ""
-                        },
-                        enabled = manualPayloadInput.isNotBlank(),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("بررسی و اعتبارسنجی رشته جفت‌سازی")
-                    }
+                    Text("بررسی کد")
                 }
             }
         }

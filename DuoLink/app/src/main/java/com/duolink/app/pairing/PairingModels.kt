@@ -172,8 +172,15 @@ data class PendingPairingConfirmation(
      * responder. `null` on the responder, whose confirmation arrives by scanning.
      */
     val confirmQrStringForPeer: String? = null,
-    /** True once the *peer's* explicit confirmation has been verified in this session. */
-    val peerConfirmationVerified: Boolean = false,
+    /**
+     * True once this device holds the peer's ECDSA-signed commitment to *this exact session* — its
+     * identity, signed pre-key, nonce, the session id and the digest of the packet we sent.
+     *
+     * This is what the protocol can actually prove. It does NOT prove that the peer's human checked the
+     * Safety Number; that is unknowable remotely, which is why the local 60-digit attestation
+     * ([localApproved]) is a separate, mandatory condition.
+     */
+    val peerSessionBindingVerified: Boolean = false,
     /** This device's own user confirmed the 60 digits (does not imply the peer did). */
     val localApproved: Boolean = false,
     val localApprovedAtEpochSec: Long? = null,
@@ -230,8 +237,12 @@ sealed class PairingStateSnapshot {
         val previousPeerDeviceIdHex: String?,
         /** This device's own user has checked the 60 digits and pressed confirm. */
         val localApproved: Boolean = false,
-        /** The peer's explicit confirmation for this exact session has been verified. */
-        val peerConfirmed: Boolean = false,
+        /**
+         * The peer's signed commitment to this exact session has been verified (see
+         * [PendingPairingConfirmation.peerSessionBindingVerified]). Does not imply the peer's user has
+         * checked the digits — that is never knowable from here and is not claimed.
+         */
+        val peerSessionVerified: Boolean = false,
         /**
          * Initiator only: the signed CONFIRM packet to show the responder after local approval.
          * Displaying it is what lets the responder finish, so this is the return path of the handshake.

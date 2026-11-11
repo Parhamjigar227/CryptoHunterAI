@@ -36,11 +36,12 @@ class RemoteTranscriptParityTest {
 
     @Test
     fun spkTranscriptMatchesServerVectors() {
-        // Method A layout: raw domain prefix, no length prefix on the numeric fields.
-        val expected = "44756f4c696e6b2d53504b2d763100112233445566778899aabbccddeeff"
-            "00000007000000006553f1000000005b"
-            "3059301306072a8648ce3d020106082a8648ce3d03010703420004"
-            "77".repeat(64)
+        // Method A layout: raw domain prefix, NO length prefix on the numeric fields, length-prefixed SPKI.
+        // The full 274-hex-char value is emitted by `parityVectors().spk.hex`; an earlier revision of this
+        // test compared against a truncated 88-char prefix, which failed while the encoder was correct.
+        val expected =
+            "44756f4c696e6b2d53504b2d763100112233445566778899aabbccddeeff00000007000000006553f1000000005b3059301306072a8648ce3d020106082a8648ce" +
+            "3d0301070342000477777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777"
         assertEquals(expected, hex(RemoteTranscripts.spkTranscript(deviceId, spkId, createdAt, spkSpki)))
     }
 

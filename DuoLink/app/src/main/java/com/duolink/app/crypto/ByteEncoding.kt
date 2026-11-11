@@ -105,6 +105,19 @@ class TranscriptBuilder {
     fun putUtf8(value: String): TranscriptBuilder =
         putBytes(value.toByteArray(StandardCharsets.UTF_8))
 
+    /**
+     * Writes UTF-8 bytes with **no** length prefix.
+     *
+     * Needed only for protocol domain separators, which the Method B server emits verbatim
+     * (`Buffer.concat([utf8(domain), ...])` in `server/src/protocol.js`). Purely additive: it changes no
+     * existing Method A encoding, and every data field must keep using [putBytes]/[putUtf8] so field
+     * boundaries stay unambiguous.
+     */
+    fun putRawUtf8(value: String): TranscriptBuilder {
+        out.write(value.toByteArray(StandardCharsets.UTF_8))
+        return this
+    }
+
     fun putInt32(value: Int): TranscriptBuilder {
         out.write(ByteBuffer.allocate(4).putInt(value).array())
         return this

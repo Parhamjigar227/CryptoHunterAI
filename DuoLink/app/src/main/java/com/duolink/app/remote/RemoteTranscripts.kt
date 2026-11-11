@@ -7,6 +7,12 @@ import java.nio.charset.StandardCharsets
 /**
  * Canonical, domain-separated transcripts for Method B remote pairing.
  *
+ * ENCODING CONVENTION — the domain string is written **raw** (no length prefix), because
+ * `buildTranscript()` in `server/src/protocol.js` does `Buffer.concat([utf8(domain), ...parts])`.
+ * Every *data* field after it is length-prefixed. An earlier revision used `.putUtf8(domain)`, which
+ * prepends a 4-byte length and made every transcript differ from the server by 4 bytes — the two sides
+ * would then sign and derive different values while each looked locally consistent.
+ *
  * MIRROR CONTRACT: every constructor here must produce byte-identical output to its counterpart in
  * `DuoLink/server/src/protocol.js`. `RemoteTranscriptParityTest` pins golden hex vectors emitted by
  * the server's `parityVectors()` so a unilateral change on either side fails a test rather than a
@@ -61,7 +67,7 @@ object RemoteTranscripts {
             "commit digests must be 32 bytes"
         }
         return TranscriptBuilder()
-            .putUtf8(DOMAIN_ACK)
+            .putRawUtf8(DOMAIN_ACK)
             .putInt32(PROTOCOL_VERSION)
             .putUtf8(invitationId)
             .putUtf8(role)
@@ -85,7 +91,7 @@ object RemoteTranscripts {
         commitDigestRecipient: ByteArray,
         ackDigest: ByteArray
     ): ByteArray = TranscriptBuilder()
-        .putUtf8(DOMAIN_RECEIPT)
+        .putRawUtf8(DOMAIN_RECEIPT)
         .putInt32(PROTOCOL_VERSION)
         .putUtf8(invitationId)
         .putUtf8(role)
@@ -118,7 +124,7 @@ object RemoteTranscripts {
         require(deviceId.size == 16 && peerDeviceId.size == 16) { "deviceIds must be 16 bytes" }
         require(rootKey.size == 32) { "root key must be 32 bytes" }
         return TranscriptBuilder()
-            .putUtf8(DOMAIN_COMMIT)
+            .putRawUtf8(DOMAIN_COMMIT)
             .putInt32(PROTOCOL_VERSION)
             .putUtf8(invitationId)
             .putUtf8(role)
@@ -187,7 +193,7 @@ object RemoteTranscripts {
         require(deviceId.size == 16) { "deviceId must be 16 bytes" }
         require(nonce.size == NONCE_BYTES) { "nonce must be $NONCE_BYTES bytes" }
         return TranscriptBuilder()
-            .putUtf8(DOMAIN_INVITATION_QR)
+            .putRawUtf8(DOMAIN_INVITATION_QR)
             .putInt32(PROTOCOL_VERSION)
             .putUtf8(invitationId)
             .putBytes(activationCodeHash)
@@ -227,7 +233,7 @@ object RemoteTranscripts {
         require(deviceId.size == 16) { "deviceId must be 16 bytes" }
         require(nonce.size == NONCE_BYTES) { "nonce must be $NONCE_BYTES bytes" }
         return TranscriptBuilder()
-            .putUtf8(DOMAIN_REDEEM)
+            .putRawUtf8(DOMAIN_REDEEM)
             .putInt32(PROTOCOL_VERSION)
             .putUtf8(invitationId)
             .putBytes(deviceId)

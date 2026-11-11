@@ -146,7 +146,6 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 /**
  * Main screen — deliberately minimal.
  *

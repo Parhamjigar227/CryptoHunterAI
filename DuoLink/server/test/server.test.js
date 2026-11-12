@@ -883,6 +883,10 @@ test('server-info advertises exactly what the server can and cannot verify', asy
     decryptsCommitCiphertext: false,
     storesPlaintextActivationCode: false,
     storesPrivateKeys: false,
+    // Decision A: the server relays each device's signed-pre-key self-signature so the *peer* can
+    // verify it, and states plainly that it does not verify that signature itself.
+    relaysSpkSignatureWithoutVerification: true,
+    verifiesSpkSignature: false,
   });
   assert.equal(Buffer.from(info.receiptPublicKeySpkiB64u, 'base64url').length, 91);
 });

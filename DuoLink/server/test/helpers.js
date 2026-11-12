@@ -17,7 +17,14 @@ import { createDuoLinkServer } from '../src/server.js';
 import { InvitationStore } from '../src/store.js';
 import { createApp } from '../src/app.js';
 import { generateServerSigningKeyPair, loadServerSigningKey, signReceipt } from '../src/crypto.js';
-import { ackTranscript } from '../src/protocol.js';
+import {
+  LIMITS,
+  ackTranscript,
+  invitationTranscript,
+  redeemTranscript,
+  spkTranscript,
+} from '../src/protocol.js';
+import { hashActivationCode, normaliseActivationCode } from '../src/crypto.js';
 import { createPrivateKey } from 'node:crypto';
 
 export const b64u = (buf) => Buffer.from(buf).toString('base64url');
@@ -47,6 +54,83 @@ export function makeParticipant() {
   const ackKey = generateParticipantKeys();
   const spk = generateParticipantKeys();
   const ephemeral = generateParticipantKeys();
+  const spkId = 1;
+  const spkCreatedAtEpochSec = 1_700_000_000;
+  const nonce = randomBytes(LIMITS.nonceBytes);
+
+  /**
+   * Builds the exact participant payload the frozen contract requires.
+   *
+   * The four fields that used to be missing here (`nonce`, `identitySignature`, `spkId`,
+   * `spkCreatedAtEpochSec`, `spkSignature`) are what made 35 of 42 server tests fail with
+   * "owner.nonce is not canonical base64url": the fixtures simply were not speaking the protocol the
+   * server had already been hardened to enforce. They are generated cryptographically here (real ECDSA
+   * signatures over the real canonical transcripts), not stubbed, so the tests exercise the genuine
+   * validation path.
+   *
+   * `invitationId` must be known to sign the invitation transcript (it binds the activation-code hash
+   * and the invitation id), so callers that need a *verifiable* owner signature pass it in.
+   */
+  function spkSignature() {
+    return identity.sign(
+      spkTranscript({ deviceId: identity.deviceId, spkId, spkCreatedAtEpochSec, spkPublicKeySpki: spk.spki })
+    );
+  }
+
+  function wire({ invitationId = null, activationCode = null, expiresAtEpochSec = 0, role = 'owner' } = {}) {
+    const spkSig = spkSignature();
+    let identitySignature;
+    if (role === 'owner' && invitationId && activationCode) {
+      identitySignature = identity.sign(
+        invitationTranscript({
+          invitationId,
+          activationCodeHash: hashActivationCode(normaliseActivationCode(activationCode)),
+          deviceId: identity.deviceId,
+          spkId,
+          spkCreatedAtEpochSec,
+          spkSignature: spkSig,
+          identitySpki: identity.spki,
+          ackSpki: ackKey.spki,
+          spkSpki: spk.spki,
+          ephemeralSpki: ephemeral.spki,
+          nonce,
+          expiresAtEpochSec,
+        })
+      );
+    } else if (invitationId) {
+      identitySignature = identity.sign(
+        redeemTranscript({
+          invitationId,
+          deviceId: identity.deviceId,
+          spkId,
+          spkCreatedAtEpochSec,
+          spkSignature: spkSig,
+          identitySpki: identity.spki,
+          ackSpki: ackKey.spki,
+          spkSpki: spk.spki,
+          ephemeralSpki: ephemeral.spki,
+          nonce,
+        })
+      );
+    } else {
+      // No invitation context (e.g. negative tests that only probe field validation): still emit a
+      // well-formed DER signature so the server's *structural* checks are what get exercised.
+      identitySignature = identity.sign(Buffer.from('duolink-test-participant-v1', 'utf8'));
+    }
+    return {
+      deviceId: b64u(identity.deviceId),
+      identitySpki: b64u(identity.spki),
+      ackSpki: b64u(ackKey.spki),
+      spkSpki: b64u(spk.spki),
+      ephemeralSpki: b64u(ephemeral.spki),
+      nonce: b64u(nonce),
+      identitySignature: b64u(identitySignature),
+      spkId,
+      spkCreatedAtEpochSec,
+      spkSignature: b64u(spkSig),
+    };
+  }
+
   return {
     identity,
     ackKey,
@@ -58,15 +142,11 @@ export function makeParticipant() {
     ackSpkiB64u: b64u(ackKey.spki),
     spkSpkiB64u: b64u(spk.spki),
     ephemeralSpkiB64u: b64u(ephemeral.spki),
-    wire() {
-      return {
-        deviceId: b64u(identity.deviceId),
-        identitySpki: b64u(identity.spki),
-        ackSpki: b64u(ackKey.spki),
-        spkSpki: b64u(spk.spki),
-        ephemeralSpki: b64u(ephemeral.spki),
-      };
-    },
+    nonceB64u: b64u(nonce),
+    spkId,
+    spkCreatedAtEpochSec,
+    spkSignature,
+    wire,
   };
 }
 

@@ -1,5 +1,6 @@
 package com.duolink.app.ui
 
+import com.duolink.app.remote.ServerEndpointStore
 import android.app.Application
 import com.duolink.app.BuildConfig
 import com.duolink.app.crypto.ByteEncoding
@@ -117,7 +118,7 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
      * Stored in the same sealed byte store as the trust records, so it inherits the app-private,
      * backup-disabled location rather than adding a second storage mechanism.
      */
-    private val endpointStore = com.duolink.app.remote.ServerEndpointStore(byteStore)
+    private val endpointStore = ServerEndpointStore(byteStore)
     private val coordinator = PairingCoordinator(keyVault = keyVault, trustStore = trustStore)
 
     /** App-lock gate. The record is stored only as an AES-256-GCM sealed blob. */

@@ -61,6 +61,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.duolink.app.pairing.PairingStateSnapshot
+import com.duolink.app.ui.ServerSettingsScreen
 import com.duolink.app.ui.DuoLinkTheme
 import com.duolink.app.ui.DuoLinkUiState
 import com.duolink.app.ui.DuoLinkViewModel

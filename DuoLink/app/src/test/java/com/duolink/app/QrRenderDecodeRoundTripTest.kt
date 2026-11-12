@@ -121,12 +121,23 @@ class QrRenderDecodeRoundTripTest {
     /** The window that real payloads occupy, from observed CI runs plus margin on both sides. */
     private val lengthWindow = 560..700
 
+    /**
+     * The size the conversation UI actually renders at (`DuoLinkViewModel` calls
+     * `renderQrBitmap(it, 680)`). Tests must exercise this, not a smaller size that happens to be more
+     * fragile: a 651-character handshake needs a version-20 symbol of ~105 modules, so 420px leaves
+     * only 4 pixels per module - the minimum a decoder can work with. Measured against ZXing Core
+     * 3.5.4, that minimum is where the Java detector starts returning null on some mask patterns,
+     * while the same bitmaps decode fine in a second, independent decoder (zxing-cpp). At 680px the
+     * symbol has ~6 pixels per module and the failures disappear.
+     */
+    private val productionSizePx = 680
+
     @Test
     fun everyPayloadLengthInTheRealisticWindowRoundTripsThroughTheCameraPlane() {
         val failures = mutableListOf<String>()
         for (length in lengthWindow) {
             val payload = payloadOfLength(length)
-            val matrix = encode(payload, sizePx = 420, margin = appMargin)
+            val matrix = encode(payload, sizePx = productionSizePx, margin = appMargin)
             val luminance = throughCameraPlane(matrix, pixelStride = 2, extraRowBytes = 32)
             val decoded = decodeLuminance(luminance, matrix.width, matrix.height)
             if (decoded != payload) {
@@ -146,7 +157,7 @@ class QrRenderDecodeRoundTripTest {
         // A payload long enough to need a larger QR version must still round trip, or a future longer
         // handshake transcript would fail in the field rather than at build time.
         val payload = payloadOfLength(900)
-        val matrix = encode(payload, sizePx = 420, margin = appMargin)
+        val matrix = encode(payload, sizePx = productionSizePx, margin = appMargin)
         val luminance = throughCameraPlane(matrix, pixelStride = 2, extraRowBytes = 32)
         val decoded = decodeLuminance(luminance, matrix.width, matrix.height)
         assertNotNull(decoded, "A 900-char payload must decode; got null at ${matrix.width}px")
@@ -188,7 +199,7 @@ class QrRenderDecodeRoundTripTest {
         for (length in lengthWindow) {
             val payload = payloadOfLength(length)
             // Deliberately the old strategy: request exactly 420px and let ZXing divide.
-            val matrix = encodeDivided(payload, sizePx = 420, margin = appMargin)
+            val matrix = encodeDivided(payload, sizePx = productionSizePx, margin = appMargin)
             val luminance = throughCameraPlane(matrix, pixelStride = 2, extraRowBytes = 32)
             if (decodeLuminance(luminance, matrix.width, matrix.height) != payload) failures += length
         }

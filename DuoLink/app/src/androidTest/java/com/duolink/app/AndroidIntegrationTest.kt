@@ -336,7 +336,12 @@ class AndroidIntegrationTest {
         val t0 = 1_735_000_500L
         val offer = coordA.startInitiatorOffer(t0).getOrThrow()
 
-        val renderSizePx = 420
+        // The size the conversation UI actually uses (DuoLinkViewModel renders at 680). This test used
+        // to render at 420, which for a ~105-module symbol is only 4 pixels per module - the minimum a
+        // detector can work with, and where ZXing's Java detector intermittently returns null depending
+        // on the mask pattern. Testing at a size the product never uses made a production-safe path look
+        // broken. The assertion is unchanged; only the configuration now matches the shipped app.
+        val renderSizePx = 680
         val offerBitmap = QrBitmapCodec.renderQrBitmap(offer.qrString, sizePx = renderSizePx)
 
         // ROOT CAUSE, NOW ESTABLISHED (was recorded here as "known flakiness" before).

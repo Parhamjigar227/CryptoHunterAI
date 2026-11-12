@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write   # required to attach the built APK to a GitHub Release
   checks: write
 
 jobs:
@@ -362,3 +362,174 @@ jobs:
               check=True,
           )
           PY
+
+  publish-release:
+    name: Publish GitHub Release with the real APK
+    runs-on: ubuntu-24.04
+    # Publishes only when the build AND the on-device suites on all three API levels passed. A release
+    # that ships an APK the instrumentation matrix never vetted would be exactly the "green CI but
+    # unverified" claim this project refuses to make.
+    needs:
+      - gradle-build-and-unit-tests
+      - server-tests
+      - connected-android-test
+    if: github.ref == 'refs/heads/arena/c7250baa-cryptohunterai'
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download the APK built by the Gradle job
+        uses: actions/download-artifact@v4
+        with:
+          name: DuoLink-v0.4.0-Android-APK
+          path: /tmp/release
+
+      # The report artifacts live in the OTHER jobs' output, so they must be fetched explicitly.
+      # Without this the release notes could only say "no report found", or worse, a hand-typed count.
+      - name: Download test reports so the notes can state measured counts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: androidTest-results-*
+          path: /tmp/instr-reports
+          # merge-multiple puts every API level's XML into one tree; without it each artifact gets its
+          # own subdirectory and the glob below would still work, but the flattened form is easier to
+          # reason about and avoids three identically-named files colliding later.
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Download unit test reports
+        uses: actions/download-artifact@v4
+        with:
+          name: duolink-debug-apk-and-unit-reports
+          path: /tmp/unit-reports
+        continue-on-error: true
+
+      - name: Verify the artifact is an APK, not a source archive
+        run: |
+          set -euo pipefail
+          ls -l /tmp/release
+          APK=/tmp/release/DuoLink-v0.4.0.apk
+          test -f "$APK" || { echo "APK missing from the artifact"; exit 1; }
+          # An APK is a ZIP whose first entry is normally AndroidManifest.xml and which contains
+          # classes.dex. Assert both, so a mis-uploaded source tarball can never be published as an app.
+          python3 - "$APK" <<'PY'
+          import sys, zipfile
+          path = sys.argv[1]
+          with zipfile.ZipFile(path) as z:
+              names = z.namelist()
+          assert "AndroidManifest.xml" in names, "artifact has no AndroidManifest.xml - not an APK"
+          assert "classes.dex" in names, "artifact has no classes.dex - not an APK"
+          print(f"OK: {path} is a real APK ({len(names)} entries, has manifest + classes.dex)")
+          PY
+          sha256sum "$APK" | tee /tmp/release/SHA256.txt
+          stat -c '%s bytes' "$APK" | tee /tmp/release/SIZE.txt
+
+      - name: Create or update the release and attach the APK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          APK=/tmp/release/DuoLink-v0.4.0.apk
+          SHA=$(cut -d' ' -f1 /tmp/release/SHA256.txt)
+          SIZE=$(cat /tmp/release/SIZE.txt)
+          COMMIT=$(git rev-parse HEAD)
+          TAG=v0.4.0
+
+          # Release notes are written with a quoted heredoc to a FILE rather than to a shell variable.
+          # Command substitution strips trailing newlines and re-splits on IFS, and the notes contain
+          # backticks, pipes and a markdown table - exactly the characters that turn "$(cat <<EOF ...)"
+          # into a subtly mangled payload. `--notes-file` avoids the whole class of problem.
+          cat > /tmp/notes.md <<'NOTES'
+          ## DuoLink 0.4.0 — اتصال از راه دور با کد
+
+          فایل ضمیمه‌شده یک APK نصب‌شدنی واقعی است (debug-signed)، که در همین workflow ساخته و روی سه نسخه اندروید تست شده است.
+
+          | | |
+          |---|---|
+          | **نسخه** | `0.4.0` (versionCode 4) |
+          | **کامیت** | `COMMIT_SHA_PLACEHOLDER` |
+          | **حجم فایل** | `SIZE_PLACEHOLDER` |
+          | **SHA-256** | `SHA_PLACEHOLDER` |
+
+          ### نتیجه تست‌ها در این اجرا
+          - تست‌های واحد Kotlin: `UNIT_COUNT_PLACEHOLDER`
+          - تست‌های سرور Node: در جاب «Signaling server tests» اجرا و سبز شده است
+          - تست‌های روی دستگاه (API 29 و 33 و 34): `INSTRUMENTED_COUNT_PLACEHOLDER`
+
+          ### نصب
+          راهنمای کامل فارسی: `DuoLink/docs/INSTALL.fa.md`
+          راهنمای ساخت کد و اتصال گوشی دوم: `DuoLink/docs/REMOTE-CODE.fa.md`
+
+          ### مهم
+          «اتصال با QR» بدون هیچ سروری کار می‌کند.
+          «اتصال از راه دور با کد» به یک سرور signaling نیاز دارد که هنوز به‌صورت عمومی میزبانی نشده است؛
+          تا آن زمان این گزینه فقط با تنظیم دستی آدرس سرور کار می‌کند. این محدودیت در توضیح بالا پنهان نشده است.
+          NOTES
+
+          # Inject the build-specific values (no shell interpretation inside the notes).
+          # Test counts are READ FROM THE REPORTS this run produced, not typed in by hand: a hard-coded
+          # "N tests" is a claim that silently becomes false the first time somebody adds a test.
+          python3 - "$SHA" "$SIZE" "$COMMIT" <<'PY'
+          import glob, pathlib, sys, xml.etree.ElementTree as ET
+
+          sha, size, commit = sys.argv[1], sys.argv[2], sys.argv[3]
+
+          def count(xml_glob):
+              total = failures = errors = 0
+              for path in glob.glob(xml_glob, recursive=True):
+                  try:
+                      root = ET.parse(path).getroot()
+                  except Exception:
+                      continue
+                  total += int(root.get('tests', 0))
+                  failures += int(root.get('failures', 0))
+                  errors += int(root.get('errors', 0))
+              return total, failures, errors
+
+          # Prefer the downloaded artifact; fall back to the in-workspace build output.
+          unit_total, unit_fail, unit_err = count('/tmp/unit-reports/**/*.xml')
+          if unit_total == 0:
+              unit_total, unit_fail, unit_err = count('DuoLink/app/build/test-results/testDebugUnitTest/*.xml')
+          instr_total, instr_fail, instr_err = count('/tmp/instr-reports/**/*.xml')
+          if instr_total == 0:
+              instr_total, instr_fail, instr_err = count('DuoLink/app/build/outputs/androidTest-results/connected/**/*.xml')
+
+          p = pathlib.Path('/tmp/notes.md')
+          text = p.read_text()
+          text = text.replace('COMMIT_SHA_PLACEHOLDER', commit)
+          text = text.replace('SIZE_PLACEHOLDER', size)
+          text = text.replace('SHA_PLACEHOLDER', sha)
+          text = text.replace(
+              'UNIT_COUNT_PLACEHOLDER',
+              f'{unit_total} تست، {unit_fail + unit_err} ناموفق' if unit_total else 'گزارش تست یافت نشد',
+          )
+          text = text.replace(
+              'INSTRUMENTED_COUNT_PLACEHOLDER',
+              f'{instr_total} تست، {instr_fail + instr_err} ناموفق' if instr_total else 'گزارش تست یافت نشد',
+          )
+          p.write_text(text)
+          print(f'unit={unit_total} (fail={unit_fail + unit_err}) instrumented={instr_total} (fail={instr_fail + instr_err})')
+          PY
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists; uploading (clobber) the verified APK."
+            gh release upload "$TAG" "$APK" --clobber
+            gh release edit "$TAG" --notes-file /tmp/notes.md
+          else
+            gh release create "$TAG" "$APK" \
+              --title "DuoLink 0.4.0" \
+              --notes-file /tmp/notes.md \
+              --target "$COMMIT"
+          fi
+
+      - name: Confirm the published download URL works
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ASSET=$(gh release view v0.4.0 --json assets --jq '.assets[] | select(.name=="DuoLink-v0.4.0.apk") | .url')
+          echo "asset api url: $ASSET"
+          test -n "$ASSET" || { echo "asset not attached"; exit 1; }
+          gh api "$ASSET" --jq '.name, .size, .state' 
+          echo "Browser download URL: https://github.com/Parhamjigar227/CryptoHunterAI/releases/download/v0.4.0/DuoLink-v0.4.0.apk"

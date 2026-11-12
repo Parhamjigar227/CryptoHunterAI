@@ -67,11 +67,21 @@ class ServerEndpointStoreTest {
     @Test
     fun theOverrideIsNormalisedBeforeItIsReturned() {
         val s = store()
-        // Trailing path and slash are not part of a base URL; normalise() drops them.
-        assertTrue(s.saveOverride("https://relay.example.com/some/path/").isSuccess)
+        // A trailing slash is dropped; an uppercase host is lowercased. Both are normalisations, not
+        // rejections, so this pins that the stored form is canonical.
+        assertTrue(s.saveOverride("https://Relay.Example.COM/").isSuccess)
         val resolution = s.resolve()
         assertIs<ServerEndpointStore.Resolution.Ready>(resolution)
         assertEquals("https://relay.example.com", resolution.baseUrl)
+    }
+
+    @Test
+    fun anAddressWithAPathIsRejectedRatherThanSilentlyTruncated() {
+        // The policy requires a bare origin: the client appends its own paths (/v1/invitations etc.),
+        // so silently keeping only the host would hide a user's typo instead of reporting it.
+        val s = store()
+        assertTrue(s.saveOverride("https://relay.example.com/some/path").isFailure)
+        assertNull(s.readSavedOverride())
     }
 
     @Test

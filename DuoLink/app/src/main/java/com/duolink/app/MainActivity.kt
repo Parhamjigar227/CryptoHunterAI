@@ -87,6 +87,9 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.duolink.app.lock.BiometricUnlockGate
 import com.duolink.app.ui.AppLockScreen
+import com.duolink.app.ui.AttachmentViewerScreen
+import com.duolink.app.ui.PrivateVideoPlayer
+import com.duolink.app.ui.rememberAttachmentPickers
 import com.duolink.app.ui.AppLockUiState
 import com.duolink.app.ui.ConversationScreen
 import com.duolink.app.ui.LockScreenMode
@@ -207,7 +210,7 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
             }
             // System picker: one-item grant, no media permission requested at all.
             val pickers = rememberAttachmentPickers(
-                onPicked = { uri -> duoViewModel.attachPickedMedia(uri) },
+                onPicked = { uri: android.net.Uri -> duoViewModel.attachPickedMedia(uri) },
                 onCancelled = { /* user backed out; nothing to report */ }
             )
 

@@ -11,6 +11,7 @@ import com.duolink.app.lock.SealedAppLockStore
 import com.duolink.app.media.MediaKeyManager
 import com.duolink.app.media.MediaVault
 import com.duolink.app.messaging.ChatMessage
+import com.duolink.app.pairing.PairedPeerRecord
 import com.duolink.app.messaging.ConnectionState
 import com.duolink.app.messaging.ConversationEngine
 import com.duolink.app.messaging.ConversationKeySchedule
@@ -33,7 +34,6 @@ import com.duolink.app.crypto.KeyProtectionReport
 import com.duolink.app.pairing.PairingCoordinator
 import com.duolink.app.pairing.PairingStateSnapshot
 import com.duolink.app.pairing.PeerTrustStore
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow

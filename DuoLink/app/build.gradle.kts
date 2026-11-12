@@ -65,6 +65,12 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.navigation:navigation-compose:2.8.5")
+    // BiometricPrompt + BiometricManager. Required by the app-lock gate (strong biometrics only).
+    // Pulls in androidx.fragment; MainActivity therefore extends FragmentActivity so the prompt has
+    // a FragmentManager to attach to.
+    implementation("androidx.biometric:biometric:1.2.0-alpha05")
+    // Activity Result API contract for the system photo/video picker (image + video sharing).
+    implementation("androidx.activity:activity-ktx:1.10.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("io.coil-kt:coil-compose:2.7.0")

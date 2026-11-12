@@ -17,6 +17,20 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // Which signaling server the APK talks to by default.
+    //
+    // The value is NOT a secret - it is a public URL every client must know - so compiling it in is
+    // correct and keeps the first-run experience to zero typing. Override per build without editing
+    // this file:
+    //     ./gradlew assembleDebug -Pduolink.signalingEndpoint=https://my-relay.example.com
+    // or put `duolink.signalingEndpoint=https://my-relay.example.com` in `local.properties` (git-ignored).
+    //
+    // Deliberately left empty by default. An empty value makes the app ask the user for an address
+    // instead of attempting a request to a placeholder such as `relay.duolink.invalid`, which is a
+    // reserved TLD that never resolves and produced a misleading "network error" in 0.4.0.
+    val signalingEndpoint: String =
+        providers.gradleProperty("duolink.signalingEndpoint").getOrElse("")
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -25,6 +39,12 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            buildConfigField("String", "DEFAULT_SIGNALING_ENDPOINT", "\"$signalingEndpoint\"")
+        }
+        debug {
+            // Debug builds may also point at a loopback server, which the endpoint policy permits.
+            val debugDefault = signalingEndpoint.ifEmpty { "http://127.0.0.1:8787" }
+            buildConfigField("String", "DEFAULT_SIGNALING_ENDPOINT", "\"$debugDefault\"")
         }
     }
 

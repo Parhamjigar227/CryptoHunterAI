@@ -15,6 +15,7 @@ import java.util.EnumMap
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 
 /**
  * Reproduces the connected-test QR failure on the JVM, against the SAME ZXing Core 3.5.4 that ships
@@ -46,6 +47,22 @@ class QrRenderDecodeRoundTripTest {
 
     /** Mirrors QrBitmapCodec's private encodeHints, so this test measures the real configuration. */
     private fun encode(payload: String, sizePx: Int, margin: Int): com.google.zxing.common.BitMatrix {
+        val hints = EnumMap<EncodeHintType, Any>(EncodeHintType::class.java).apply {
+            put(EncodeHintType.CHARACTER_SET, "UTF-8")
+            put(EncodeHintType.ERROR_CORRECTION, ErrorCorrectionLevel.M)
+            put(EncodeHintType.MARGIN, margin)
+        }
+        // Same integer-module-size strategy as QrBitmapCodec.encodeAtIntegerModuleSize: ask for the
+        // symbol's natural module count, then render at a whole number of pixels per module.
+        val probe = QRCodeWriter().encode(payload, BarcodeFormat.QR_CODE, 1, 1, hints)
+        val multiple = sizePx / probe.width
+        if (multiple <= 0) return QRCodeWriter().encode(payload, BarcodeFormat.QR_CODE, sizePx, sizePx, hints)
+        val exact = probe.width * multiple
+        return QRCodeWriter().encode(payload, BarcodeFormat.QR_CODE, exact, exact, hints)
+    }
+
+    /** The old behaviour, kept so a test can prove the old behaviour was what failed. */
+    private fun encodeDivided(payload: String, sizePx: Int, margin: Int): com.google.zxing.common.BitMatrix {
         val hints = EnumMap<EncodeHintType, Any>(EncodeHintType::class.java).apply {
             put(EncodeHintType.CHARACTER_SET, "UTF-8")
             put(EncodeHintType.ERROR_CORRECTION, ErrorCorrectionLevel.M)
@@ -154,6 +171,33 @@ class QrRenderDecodeRoundTripTest {
         } catch (_: Exception) {
             null
         }
+    }
+
+    /**
+     * Documents the defect that the integer-module-size change fixes, so the fix cannot be undone by
+     * accident: rendering into exactly 420px produces fractional module widths for most payload
+     * lengths, and a measurable fraction of those do not survive a round trip.
+     *
+     * The assertion here is on the OLD path only. It is not "flakiness is acceptable" - it is a
+     * characterisation test that fails loudly if someone reverts to divided rendering and the failures
+     * come back, while the test above proves the new path has none.
+     */
+    @Test
+    fun dividedRenderingIsWhatProducedFractionalModulesAndNullDecodes() {
+        val failures = mutableListOf<Int>()
+        for (length in lengthWindow) {
+            val payload = payloadOfLength(length)
+            // Deliberately the old strategy: request exactly 420px and let ZXing divide.
+            val matrix = encodeDivided(payload, sizePx = 420, margin = appMargin)
+            val luminance = throughCameraPlane(matrix, pixelStride = 2, extraRowBytes = 32)
+            if (decodeLuminance(luminance, matrix.width, matrix.height) != payload) failures += length
+        }
+        assertTrue(
+            failures.isNotEmpty(),
+            "Expected the divided-rendering path to fail for some payload lengths. If this passes, the " +
+                "integer-module-size change may no longer be necessary - verify against a real device " +
+                "before removing it."
+        )
     }
 
     /**

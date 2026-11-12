@@ -12,6 +12,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { InvitationStore } from './store.js';
 import { createApp } from './app.js';
+import { attachWebSocket } from './ws.js';
 import {
   generateServerSigningKeyPair,
   loadServerSigningKey,
@@ -79,10 +80,120 @@ export function createDuoLinkServer(options = {}) {
   // request, so correctness never depends on this timer firing.
   let sweeper = null;
 
+  /**
+   * WebSocket endpoint for the encrypted relay.
+   *
+   * Protocol (JSON text frames, all of it ciphertext or routing metadata — never plaintext):
+   *   client -> server  { "type": "hello",   "deviceId": "<b64u>" }
+   *   server -> client  { "type": "ready",   "online": bool, "queued": n }
+   *   client -> server  { "type": "send",    "envelope": { id, from, to, seq, iv, ct } }
+   *   server -> client  { "type": "stored",  "id": "...", "duplicate": bool }
+   *   client -> server  { "type": "ack",     "messageId": "..." }
+   *   client -> server  { "type": "receipt", "kind": "delivered"|"read", "messageId": "...", "to": "..." }
+   *   server -> client  { "type": "message", "envelope": {...} }        (pushed)
+   *   server -> client  { "type": "receipt", "kind": ..., "messageId": ... }
+   *   server -> client  { "type": "error",   "code": "...", "message": "..." }
+   *
+   * `hello` binds the connection to one device id. Everything the connection sends is then checked
+   * against that id, so an open socket cannot be used to read or acknowledge another device's mail.
+   */
+  const detachWebSocket = attachWebSocket(httpServer, {
+    path: '/v1/ws',
+    onConnection: (connection) => {
+      /** The device this connection authenticated as, or null before `hello`. */
+      let boundDeviceId = null;
+      let unsubscribe = null;
+
+      const reply = (frame) => connection.sendJson(frame);
+      const fail = (code, message) => reply({ type: 'error', code, message });
+
+      connection.onMessage((_conn, raw) => {
+        if (typeof raw !== 'string') {
+          return fail('binary_not_supported', 'send JSON text frames only');
+        }
+        let frame;
+        try {
+          frame = JSON.parse(raw);
+        } catch {
+          return fail('malformed_json', 'frame is not valid JSON');
+        }
+        if (!frame || typeof frame.type !== 'string') {
+          return fail('malformed_frame', 'frame needs a type');
+        }
+
+        if (frame.type === 'hello') {
+          if (boundDeviceId !== null) {
+            return fail('already_bound', 'this connection is already bound to a device');
+          }
+          if (typeof frame.deviceId !== 'string' || Buffer.from(frame.deviceId, 'base64url').length !== 16) {
+            return fail('malformed_frame', 'deviceId must be a 16-byte base64url string');
+          }
+          boundDeviceId = frame.deviceId;
+          // Push anything that arrived while the device was offline, then keep streaming.
+          unsubscribe = app.relay.subscribe(boundDeviceId, (pushed) => reply(pushed));
+          const backlog = app.relay.fetchSince(boundDeviceId, 0);
+          reply({ type: 'ready', online: true, queued: backlog.length });
+          for (const envelope of backlog) reply({ type: 'message', envelope });
+          return undefined;
+        }
+
+        // Every other frame requires a bound device.
+        if (boundDeviceId === null) return fail('not_ready', 'send hello first');
+
+        try {
+          if (frame.type === 'send') {
+            const envelope = frame.envelope;
+            if (!envelope || typeof envelope.to !== 'string') {
+              return fail('malformed_frame', 'envelope.to is required');
+            }
+            if (envelope.from !== boundDeviceId) {
+              // A device may only send as itself. This is not attribution — the recipient still
+              // verifies the AEAD — but it stops a socket from spoofing a third device's id.
+              return fail('sender_mismatch', 'envelope.from must equal the bound device id');
+            }
+            const result = app.relay.enqueue(envelope, {
+              expectedRecipientDeviceIdB64u: envelope.to,
+            });
+            return reply({ type: 'stored', id: envelope.id, duplicate: result.duplicate });
+          }
+
+          if (frame.type === 'ack') {
+            const acknowledged = app.relay.acknowledge(boundDeviceId, String(frame.messageId ?? ''));
+            return reply({ type: 'acked', messageId: frame.messageId, acknowledged });
+          }
+
+          if (frame.type === 'receipt') {
+            app.relay.recordReceipt({
+              kind: frame.kind,
+              messageId: String(frame.messageId ?? ''),
+              from: boundDeviceId,
+              to: String(frame.to ?? ''),
+            });
+            return reply({ type: 'receipt_stored' });
+          }
+
+          return fail('unknown_type', `unsupported frame type '${frame.type}'`);
+        } catch (error) {
+          if (error instanceof Error && typeof error.code === 'string') {
+            return fail(error.code, error.message);
+          }
+          return fail('internal_error', 'relay operation failed');
+        }
+      });
+
+      connection.onClose(() => {
+        if (unsubscribe) unsubscribe();
+      });
+    },
+  });
+
   return {
     store,
     app,
     httpServer,
+    /** The encrypted-message relay, shared by the WebSocket path and the HTTP fallback. */
+    relay: app.relay,
+    detachWebSocket,
     protocolVersion: PROTOCOL_VERSION,
     receiptPublicKeyB64u: publicKeyDer.toString('base64url'),
     async listen({ host = '127.0.0.1', port = 0, sweepIntervalMs = 30_000 } = {}) {
@@ -114,6 +225,7 @@ export function createDuoLinkServer(options = {}) {
       };
     },
     async close() {
+      detachWebSocket?.();
       if (sweeper) {
         clearInterval(sweeper);
         sweeper = null;

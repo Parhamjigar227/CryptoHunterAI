@@ -17,6 +17,7 @@
  *   GET  /healthz                               -> liveness + aggregate counts
  */
 
+import { MessageRelay, RelayError } from './relay.js';
 import {
   INVITATION_TTL_SECONDS,
   LIMITS,
@@ -371,6 +372,86 @@ export function createApp({ store, serverKeys, clock = () => Date.now(), limits 
         }
       }
 
+      // ---- encrypted relay: HTTP fallback path -------------------------------------
+      // These exist so a client that cannot hold a WebSocket open (hostile network, aggressive
+      // doze, or simply no upgrade support in front of a proxy) can still send and receive. They
+      // share one queue with the socket, so the two paths are interchangeable, not divergent.
+      if (method === 'POST' && path === '/v1/relay/messages') {
+        // The sending device must be named in the body; the recipient is bound by the envelope and
+        // cannot be redirected by the caller.
+        const from = request.body?.fromDeviceId;
+        if (typeof from !== 'string') {
+          return json(400, { error: 'malformed_payload', message: 'fromDeviceId is required' });
+        }
+        try {
+          const result = relay.enqueue(request.body?.envelope, {
+            expectedRecipientDeviceIdB64u: request.body?.envelope?.to ?? null,
+          });
+          return json(202, { accepted: true, duplicate: result.duplicate, queued: result.queued });
+        } catch (error) {
+          return relayErrorResponse(error);
+        }
+      }
+
+      if (method === 'GET' && path.startsWith('/v1/relay/messages')) {
+        // Fetching requires the caller to identify itself; the relay only ever returns envelopes
+        // addressed to that exact device id.
+        const deviceId = url.searchParams.get('deviceId');
+        const sinceSeq = Number(url.searchParams.get('sinceSeq') ?? '0');
+        if (!deviceId) {
+          return json(400, { error: 'malformed_payload', message: 'deviceId is required' });
+        }
+        if (!Number.isSafeInteger(sinceSeq) || sinceSeq < 0) {
+          return json(400, { error: 'malformed_payload', message: 'sinceSeq must be a non-negative integer' });
+        }
+        let waiting;
+        try {
+          waiting = relay.fetchSince(deviceId, sinceSeq);
+        } catch (error) {
+          return relayErrorResponse(error);
+        }
+        return json(200, {
+          envelopes: waiting,
+          // `online` lets the client decide whether to keep the socket or lean on polling.
+          online: relay.isOnline(deviceId),
+        });
+      }
+
+      if (method === 'POST' && path === '/v1/relay/ack') {
+        const deviceId = request.body?.deviceId;
+        const messageId = request.body?.messageId;
+        if (typeof deviceId !== 'string' || typeof messageId !== 'string') {
+          return json(400, { error: 'malformed_payload', message: 'deviceId and messageId are required' });
+        }
+        return json(200, { acknowledged: relay.acknowledge(deviceId, messageId) });
+      }
+
+      if (method === 'POST' && path === '/v1/relay/receipts') {
+        try {
+          const result = relay.recordReceipt({
+            kind: request.body?.kind,
+            messageId: request.body?.messageId,
+            from: request.body?.from,
+            to: request.body?.to,
+          });
+          return json(202, { accepted: true, duplicate: result.duplicate, downgraded: result.downgraded });
+        } catch (error) {
+          return relayErrorResponse(error);
+        }
+      }
+
+      if (method === 'GET' && path === '/v1/relay-status') {
+        return json(200, {
+          relay: relay.stats(),
+          capabilities: {
+            webSocket: true,
+            httpPollingFallback: true,
+            storesPlaintextMessages: false,
+            canDecryptMessages: false,
+          },
+        });
+      }
+
       return json(404, { error: 'not_found', message: `No route for ${method} ${path}` });
     } catch (error) {
       if (error instanceof ProtocolError) {
@@ -389,6 +470,24 @@ export function createApp({ store, serverKeys, clock = () => Date.now(), limits 
    * Normalises a raw transport request (streams, headers, body buffer) into the shape `handle`
    * expects, enforcing the body-size limit before any JSON parsing happens.
    */
+  /**
+   * The encrypted-message relay.
+   *
+   * Deliberately created here (not in server.js) so the HTTP fallback routes and the WebSocket upgrade
+   * handler share exactly one queue: a message sent over the socket is visible to a client that
+   * reconnects over plain HTTP polling, which is the whole point of having both.
+   */
+  const relay = new MessageRelay({ clock });
+
+  /** Shared JSON error translation for relay operations used by both transports. */
+  const relayErrorResponse = (error) => {
+    if (error instanceof RelayError) {
+      const status = error.code === 'recipient_mismatch' ? 403 : 400;
+      return json(status, { error: error.code, message: error.message });
+    }
+    throw error;
+  };
+
   const handleTransport = async (rawRequest) => {
     const chunks = [];
     let total = 0;
@@ -420,5 +519,5 @@ export function createApp({ store, serverKeys, clock = () => Date.now(), limits 
     });
   };
 
-  return { handle, handleTransport, rateLimits, hashActivationCode, deviceSpki };
+  return { handle, handleTransport, rateLimits, hashActivationCode, deviceSpki, relay };
 }

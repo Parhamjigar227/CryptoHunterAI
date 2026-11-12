@@ -5,11 +5,6 @@ import com.duolink.app.remote.RemotePairingController
 import com.duolink.app.remote.RemotePairingController.Step
 import com.duolink.app.remote.SignalingApi
 import com.duolink.app.remote.SignalingHttpClient
-import com.sun.net.httpserver.HttpExchange
-import com.sun.net.httpserver.HttpServer
-import java.net.InetSocketAddress
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -28,8 +23,8 @@ import kotlin.test.assertTrue
  *  - showing a countdown that disagrees with the server,
  *  - telling a user their code was wrong when the real problem was rate limiting.
  *
- * These tests drive the real controller and the real SignalingApi over HTTP to a local HttpServer that
- * returns the exact JSON the Node server produces. Only the server is simulated; every line of client
+ * These tests drive the real controller and the real SignalingApi over HTTP to a local [MiniHttpServer]
+ * that returns the exact JSON the Node server produces. Only the server is simulated; every line of client
  * logic under test is production code.
  */
 class RemotePairingControllerTest {
@@ -38,43 +33,40 @@ class RemotePairingControllerTest {
     // A small programmable stand-in for the Node signaling server.
     // -----------------------------------------------------------------------------------------
 
+    /**
+     * A programmable stand-in for the Node signaling server, built on [MiniHttpServer] so it compiles for
+     * `testDebugUnitTest` (which excludes `com.sun.*`).
+     *
+     * Each endpoint has a swappable response, so a test can make exactly one call fail without touching the
+     * others - which is how the interesting failure orderings are exercised.
+     */
     private class FakeSignalingServer {
-        val server: HttpServer = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
-        val hits = AtomicInteger(0)
-        var resolveResponse: () -> Pair<Int, String> = { 200 to """{"invitationId":"inv_test12345678","expiresAtEpochSec":${now + 600}}""" }
-        var redeemResponse: () -> Pair<Int, String> = {
-            200 to """{"invitationId":"inv_test12345678","recipientToken":"dG9rZW4","expiresAtEpochSec":${now + 600}}"""
-        }
-        var createResponse: () -> Pair<Int, String> = {
-            201 to """{"invitationId":"inv_test12345678","activationCode":"482-913-7462","ownerToken":"b3duZXI","protocolVersion":1,"createdAtEpochSec":$now,"expiresAtEpochSec":${now + 600}}"""
+        @Volatile var resolveResponse: () -> Pair<Int, String> =
+            { 200 to """{"invitationId":"inv_test12345678","expiresAtEpochSec":${now + 600}}""" }
+        @Volatile var redeemResponse: () -> Pair<Int, String> =
+            { 200 to """{"invitationId":"inv_test12345678","recipientToken":"dG9rZW4","expiresAtEpochSec":${now + 600}}""" }
+        @Volatile var createResponse: () -> Pair<Int, String> =
+            { 201 to """{"invitationId":"inv_test12345678","activationCode":"482-913-7462","ownerToken":"b3duZXI","protocolVersion":1,"createdAtEpochSec":$now,"expiresAtEpochSec":${now + 600}}""" }
+
+        private val server = MiniHttpServer { request ->
+            val (status, body) = when {
+                request.path.endsWith("/resolve") -> resolveResponse()
+                request.path.endsWith("/redeem") -> redeemResponse()
+                request.path.endsWith("/v1/invitations") -> createResponse()
+                else -> 404 to """{"error":"not_found"}"""
+            }
+            MiniHttpServer.Response(status, body)
         }
 
         fun start(): FakeSignalingServer {
-            server.createContext("/") { exchange ->
-                hits.incrementAndGet()
-                val (status, body) = when {
-                    exchange.requestURI.path.endsWith("/resolve") -> resolveResponse()
-                    exchange.requestURI.path.endsWith("/redeem") -> redeemResponse()
-                    exchange.requestURI.path.endsWith("/v1/invitations") -> createResponse()
-                    else -> 404 to """{"error":"not_found"}"""
-                }
-                respond(exchange, status, body)
-            }
-            server.executor = null
             server.start()
             return this
         }
 
-        val baseUrl: String get() = "http://127.0.0.1:${server.address.port}"
+        val baseUrl: String get() = server.baseUrl
+        val hits: Int get() = server.requests.size
 
-        private fun respond(exchange: HttpExchange, status: Int, body: String) {
-            val bytes = body.toByteArray(Charsets.UTF_8)
-            exchange.responseHeaders.add("Content-Type", "application/json; charset=utf-8")
-            exchange.sendResponseHeaders(status, bytes.size.toLong())
-            exchange.responseBody.use { it.write(bytes) }
-        }
-
-        fun stop() = server.stop(0)
+        fun stop() = server.close()
 
         companion object {
             val now: Long get() = System.currentTimeMillis() / 1000L
@@ -134,7 +126,7 @@ class RemotePairingControllerTest {
                 // No code, no traffic: entering the screen is not an attempt and must not spend the
                 // server's global attempt budget.
                 assertNull(state.codeDisplay)
-                assertEquals(0, fake.hits.get())
+                assertEquals(0, fake.hits)
             } finally {
                 device.destroy()
             }
@@ -152,7 +144,7 @@ class RemotePairingControllerTest {
                     assertEquals(Step.JOINER_ENTERING_CODE, state.step, "should stay on the entry screen for '$bad'")
                     assertNotNull(state.failurePersian, "the user must be told the code is malformed")
                 }
-                assertEquals(0, fake.hits.get(), "no malformed input may reach the server")
+                assertEquals(0, fake.hits, "no malformed input may reach the server")
             } finally {
                 device.destroy()
             }
@@ -310,7 +302,7 @@ class RemotePairingControllerTest {
                 assertNotNull(state.failurePersian)
                 assertTrue(state.failureIsSecurityAlarming)
                 // And the controller did make both calls, in the required order.
-                assertEquals(2, fake.hits.get(), "resolve must precede redeem")
+                assertEquals(2, fake.hits, "resolve must precede redeem")
             } finally {
                 device.destroy()
             }
@@ -349,7 +341,7 @@ class RemotePairingControllerTest {
             try {
                 val state = ctrl.startAsOwner(fake.baseUrl)
                 assertEquals(Step.FAILED, state.step)
-                assertEquals(0, fake.hits.get(), "a release build must not even connect to a plain-http endpoint")
+                assertEquals(0, fake.hits, "a release build must not even connect to a plain-http endpoint")
             } finally {
                 device.destroy()
             }

@@ -6,8 +6,6 @@ import com.duolink.app.remote.RemotePairingException
 import com.duolink.app.remote.SignalingApi
 import com.duolink.app.remote.SignalingEndpointPolicy
 import com.duolink.app.remote.SignalingHttpClient
-import com.sun.net.httpserver.HttpExchange
-import com.sun.net.httpserver.HttpServer
 import java.net.InetSocketAddress
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -32,51 +30,23 @@ import kotlin.test.assertTrue
 class NumericCodeResolutionTest {
 
     private fun <T> withServer(
-        handler: (HttpExchange) -> Unit,
-        body: (baseUrl: String, recorder: ServerRecorder) -> T
+        handler: (MiniHttpServer.Request) -> MiniHttpServer.Response,
+        body: (baseUrl: String, recorder: MiniHttpServer) -> T
     ): T {
-        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
-        val recorder = ServerRecorder()
-        server.createContext("/") { exchange ->
-            recorder.record(exchange)
-            try {
-                handler(exchange)
-            } finally {
-                exchange.close()
-            }
-        }
-        server.executor = null
-        server.start()
+        val server = MiniHttpServer(handler).start()
         try {
-            return body("http://127.0.0.1:${server.address.port}", recorder)
+            return body(server.baseUrl, server)
         } finally {
-            server.stop(0)
+            server.close()
         }
     }
 
-    /** Captures what the client actually sent, so we can assert on the request and not just the reply. */
-    private class ServerRecorder {
-        val path = AtomicReference<String?>(null)
-        val method = AtomicReference<String?>(null)
-        val body = AtomicReference<String?>(null)
-        val authHeader = AtomicReference<String?>(null)
-        val requestCount = AtomicInteger(0)
-
-        fun record(exchange: HttpExchange) {
-            requestCount.incrementAndGet()
-            path.set(exchange.requestURI.path)
-            method.set(exchange.requestMethod)
-            authHeader.set(exchange.requestHeaders.getFirst("Authorization"))
-            body.set(exchange.requestBody.readBytes().toString(Charsets.UTF_8))
-        }
-    }
-
-    private fun HttpExchange.respond(status: Int, json: String) {
-        val bytes = json.toByteArray(Charsets.UTF_8)
-        responseHeaders.add("Content-Type", "application/json; charset=utf-8")
-        sendResponseHeaders(status, bytes.size.toLong())
-        responseBody.use { it.write(bytes) }
-    }
+    /** Convenience: a server that always answers the same way. */
+    private fun <T> withConstServer(
+        status: Int,
+        json: String,
+        body: (baseUrl: String, recorder: MiniHttpServer) -> T
+    ): T = withServer({ MiniHttpServer.Response(status, json) }, body)
 
     private fun api(isDebug: Boolean = true) =
         SignalingApi(SignalingHttpClient(isDebugBuild = isDebug, connectTimeoutMs = 5000, readTimeoutMs = 5000))
@@ -85,36 +55,29 @@ class NumericCodeResolutionTest {
 
     @Test
     fun resolveSendsTheCanonicalGroupedCodeAndReturnsTheInvitationId() {
-        withServer(
-            handler = { exchange ->
-                exchange.respond(
-                    200,
-                    """{"invitationId":"inv_AbCdEfGh12345678","expiresAtEpochSec":1767225600,"note":"read-only lookup"}"""
-                )
-            }
-        ) { baseUrl, recorder ->
+        withConstServer(200, """{"invitationId":"inv_AbCdEfGh12345678","expiresAtEpochSec":1767225600,"note":"read-only lookup"}""") { baseUrl, recorder ->
             val resolved = api().resolveInvitationByCode(baseUrl, "4829137462")
 
             assertEquals("inv_AbCdEfGh12345678", resolved.invitationId)
             assertEquals(1767225600L, resolved.expiresAtEpochSec)
 
             // The request must hit the resolve endpoint...
-            assertEquals("/v1/invitations/resolve", recorder.path.get())
-            assertEquals("POST", recorder.method.get())
+            assertEquals("/v1/invitations/resolve", recorder.requests.last().path)
+            assertEquals("POST", recorder.requests.last().method)
             // ...with the canonical, grouped form, not whatever the user typed.
-            val sent = recorder.body.get().orEmpty()
+            val sent = recorder.requests.last().body.orEmpty()
             assertTrue(sent.contains("482-913-7462"), "expected the canonical grouped code, got: $sent")
             assertTrue(!sent.contains("4829137462\""), "the ungrouped form must not be sent")
             // ...and without any bearer token: resolution is unauthenticated by design.
-            assertEquals(null, recorder.authHeader.get(), "resolve must not send an authorization header")
+            assertEquals(null, recorder.requests.last().headers["authorization"], "resolve must not send an authorization header")
         }
     }
 
     @Test
     fun resolveNeverSendsKeyMaterialOrTokens() {
-        withServer(handler = { it.respond(200, """{"invitationId":"inv_ab","expiresAtEpochSec":1}""") }) { baseUrl, recorder ->
+        withConstServer(200, """{"invitationId":"inv_ab","expiresAtEpochSec":1}""") { baseUrl, recorder ->
             api().resolveInvitationByCode(baseUrl, "482-913-7462")
-            val sent = recorder.body.get().orEmpty()
+            val sent = recorder.requests.last().body.orEmpty()
             // The request should carry the code and nothing else. No device ids, no public keys.
             val keys = Regex("\"([A-Za-z]+)\"\\s*:").findAll(sent).map { it.groupValues[1] }.toSet()
             assertEquals(setOf("activationCode"), keys, "resolve request leaked extra fields: $keys")
@@ -125,9 +88,7 @@ class NumericCodeResolutionTest {
 
     @Test
     fun unknownCodeMapsToInvitationNotFound() {
-        withServer(handler = { exchange ->
-            exchange.respond(404, """{"error":"invalid_activation_code","message":"Activation code is invalid or already used"}""")
-        }) { baseUrl, _ ->
+        withConstServer(404, """{"error":"invalid_activation_code","message":"Activation code is invalid or already used"}""") { baseUrl, _ ->
             val failure = assertFailsWith<RemotePairingException> {
                 api().resolveInvitationByCode(baseUrl, "482-913-7462")
             }
@@ -137,9 +98,7 @@ class NumericCodeResolutionTest {
 
     @Test
     fun expiredCodeMapsToInvitationExpired() {
-        withServer(handler = { exchange ->
-            exchange.respond(404, """{"error":"expired","message":"This invitation has expired"}""")
-        }) { baseUrl, _ ->
+        withConstServer(404, """{"error":"expired","message":"This invitation has expired"}""") { baseUrl, _ ->
             val failure = assertFailsWith<RemotePairingException> {
                 api().resolveInvitationByCode(baseUrl, "482-913-7462")
             }
@@ -151,9 +110,7 @@ class NumericCodeResolutionTest {
     fun alreadyRedeemedCodeIsSurfacedAsAFailureNotAnId() {
         // Mirrors the server's store-level gate: resolving a redeemed invitation is a 409, so a joiner can
         // never be handed an id it would then fail to redeem (or worse, read as "still available").
-        withServer(handler = { exchange ->
-            exchange.respond(409, """{"error":"already_redeemed","message":"This invitation has already been redeemed"}""")
-        }) { baseUrl, _ ->
+        withConstServer(409, """{"error":"already_redeemed","message":"This invitation has already been redeemed"}""") { baseUrl, _ ->
             val failure = assertFailsWith<RemotePairingException> {
                 api().resolveInvitationByCode(baseUrl, "482-913-7462")
             }
@@ -166,9 +123,7 @@ class NumericCodeResolutionTest {
 
     @Test
     fun rateLimitedResolutionIsReportedAsRetryable() {
-        withServer(handler = { exchange ->
-            exchange.respond(429, """{"error":"rate_limited","message":"Too many attempts"}""")
-        }) { baseUrl, _ ->
+        withConstServer(429, """{"error":"rate_limited","message":"Too many attempts"}""") { baseUrl, _ ->
             val failure = assertFailsWith<RemotePairingException> {
                 api().resolveInvitationByCode(baseUrl, "482-913-7462")
             }
@@ -192,9 +147,7 @@ class NumericCodeResolutionTest {
 
     @Test
     fun resolveRejectsAnEmptyInvitationIdFromTheServer() {
-        withServer(handler = { exchange ->
-            exchange.respond(200, """{"invitationId":"","expiresAtEpochSec":1}""")
-        }) { baseUrl, _ ->
+        withConstServer(200, """{"invitationId":"","expiresAtEpochSec":1}""") { baseUrl, _ ->
             // SignalingApi itself must not manufacture a usable id out of an empty field.
             val api = api()
             val resolved = api.resolveInvitationByCode(baseUrl, "482-913-7462")
@@ -213,10 +166,10 @@ class NumericCodeResolutionTest {
         // could disagree about which code is being redeemed.
         val variants = listOf("4829137462", "482-913-7462", " 482 913 7462 ", "482.913.7462")
         val sentBodies = mutableListOf<String>()
-        withServer(handler = { it.respond(200, """{"invitationId":"inv_x","expiresAtEpochSec":1}""") }) { baseUrl, recorder ->
+        withConstServer(200, """{"invitationId":"inv_x","expiresAtEpochSec":1}""") { baseUrl, recorder ->
             variants.forEach { variant ->
                 api().resolveInvitationByCode(baseUrl, variant)
-                sentBodies += recorder.body.get().orEmpty()
+                sentBodies += recorder.requests.last().body.orEmpty()
             }
         }
         assertEquals(1, sentBodies.distinct().size, "variants produced different requests: $sentBodies")
@@ -227,11 +180,11 @@ class NumericCodeResolutionTest {
     fun malformedInputIsRejectedBeforeAnyRequestIsMade() {
         // A code that cannot be an invitation must never reach the network: the attempt budget is global
         // and shared, so spending a slot on obvious garbage is a self-inflicted denial of service.
-        withServer(handler = { it.respond(200, """{"invitationId":"inv_x","expiresAtEpochSec":1}""") }) { baseUrl, recorder ->
+        withConstServer(200, """{"invitationId":"inv_x","expiresAtEpochSec":1}""") { baseUrl, recorder ->
             assertFailsWith<RemotePairingException> {
                 api().resolveInvitationByCode(baseUrl, "123")
             }
-            assertEquals(0, recorder.requestCount.get(), "a malformed code must not be sent to the server")
+            assertEquals(0, recorder.requests.size, "a malformed code must not be sent to the server")
         }
     }
 

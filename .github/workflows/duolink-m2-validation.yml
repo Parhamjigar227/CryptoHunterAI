@@ -10,6 +10,11 @@ permissions:
   contents: write   # required to attach the built APK to a GitHub Release
   checks: write
 
+# Single source of truth for the release version in this workflow. Bump it here and everywhere -
+# artifact names, the release tag, the download URL and the verification assertion - follows.
+env:
+  VERSION: "0.5.0"
+
 jobs:
   gradle-build-and-unit-tests:
     name: Gradle 8.9 (JDK 17, SDK 35) + testDebugUnitTest + assembleDebug
@@ -71,7 +76,7 @@ jobs:
           echo "=== Debug APK Badging Metadata (aapt2) ==="
           "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK_PATH" | head -n 25
           mkdir -p /tmp/apk-only
-          cp "$APK_PATH" /tmp/apk-only/DuoLink-v0.4.0.apk
+          cp "$APK_PATH" /tmp/apk-only/DuoLink-v${VERSION}.apk
           EOS
           bash /tmp/run_build.sh 2>&1 | tee /tmp/job1.log
           exit "${PIPESTATUS[0]}"
@@ -80,8 +85,8 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: DuoLink-v0.4.0-Android-APK
-          path: /tmp/apk-only/DuoLink-v0.4.0.apk
+          name: DuoLink-v${VERSION}-Android-APK
+          path: /tmp/apk-only/DuoLink-v${VERSION}.apk
 
       - name: Upload Debug APK, SHA-256 & Unit Test Reports
         if: always()
@@ -382,7 +387,7 @@ jobs:
       - name: Download the APK built by the Gradle job
         uses: actions/download-artifact@v4
         with:
-          name: DuoLink-v0.4.0-Android-APK
+          name: DuoLink-v${VERSION}-Android-APK
           path: /tmp/release
 
       # The report artifacts live in the OTHER jobs' output, so they must be fetched explicitly.
@@ -409,7 +414,7 @@ jobs:
         run: |
           set -euo pipefail
           ls -l /tmp/release
-          APK=/tmp/release/DuoLink-v0.4.0.apk
+          APK=/tmp/release/DuoLink-v${VERSION}.apk
           test -f "$APK" || { echo "APK missing from the artifact"; exit 1; }
           # An APK is a ZIP whose first entry is normally AndroidManifest.xml and which contains
           # classes.dex. Assert both, so a mis-uploaded source tarball can never be published as an app.
@@ -430,11 +435,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          APK=/tmp/release/DuoLink-v0.4.0.apk
+          APK=/tmp/release/DuoLink-v${VERSION}.apk
           SHA=$(cut -d' ' -f1 /tmp/release/SHA256.txt)
           SIZE=$(cat /tmp/release/SIZE.txt)
           COMMIT=$(git rev-parse HEAD)
-          TAG=v0.4.0
+          TAG=v${VERSION}
 
           # Release notes are written with a quoted heredoc to a FILE rather than to a shell variable.
           # Command substitution strips trailing newlines and re-splits on IFS, and the notes contain
@@ -532,21 +537,21 @@ jobs:
           # The previous version resolved `.url`, which is the human download link, and then passed it to
           # `gh api` - which expects an API endpoint. That made a job whose releasing work had already
           # SUCCEEDED report failure purely because of how it verified itself.
-          gh release view v0.4.0 --json assets \
+          gh release view "v${VERSION}" --json assets \
             --jq '.assets[] | "attached: \(.name)  \(.size) bytes  state=\(.state)"'
 
-          NAME=$(gh release view v0.4.0 --json assets --jq '.assets[0].name')
-          SIZE=$(gh release view v0.4.0 --json assets --jq '.assets[0].size')
-          STATE=$(gh release view v0.4.0 --json assets --jq '.assets[0].state')
+          NAME=$(gh release view "v${VERSION}" --json assets --jq '.assets[0].name')
+          SIZE=$(gh release view "v${VERSION}" --json assets --jq '.assets[0].size')
+          STATE=$(gh release view "v${VERSION}" --json assets --jq '.assets[0].state')
 
-          test "$NAME" = "DuoLink-v0.4.0.apk" || { echo "unexpected asset name: $NAME"; exit 1; }
+          test "$NAME" = "DuoLink-v${VERSION}.apk" || { echo "unexpected asset name: $NAME"; exit 1; }
           test "$STATE" = "uploaded" || { echo "asset state is $STATE, expected uploaded"; exit 1; }
           # An APK this project builds is ~20 MB. A tiny asset would mean the upload truncated.
           test "$SIZE" -gt 10000000 || { echo "asset is implausibly small ($SIZE bytes)"; exit 1; }
 
           # Prove the browser download URL actually serves bytes, not just that an asset row exists.
           # GitHub redirects release downloads to a CDN, so follow redirects and inspect what comes back.
-          URL="https://github.com/Parhamjigar227/CryptoHunterAI/releases/download/v0.4.0/DuoLink-v0.4.0.apk"
+          URL="https://github.com/Parhamjigar227/CryptoHunterAI/releases/download/v${VERSION}/DuoLink-v${VERSION}.apk"
           CODE=$(curl -sS -L -o /tmp/downloaded.apk -w '%{http_code}' "$URL")
           echo "download HTTP status: $CODE"
           test "$CODE" = "200" || { echo "download URL did not return 200"; exit 1; }

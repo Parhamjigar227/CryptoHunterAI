@@ -25,11 +25,11 @@
 **https://github.com/Parhamjigar227/CryptoHunterAI/releases/latest**
 
 1. صفحهٔ Release را باز کنید.
-2. در بخش **Assets**، روی فایل `DuoLink-v0.4.0.apk` بزنید.
+2. در بخش **Assets**، روی فایل `DuoLink-v0.5.0.apk` بزنید.
 3. دانلود آغاز می‌شود. این فایل **خودِ برنامهٔ نصب‌شدنی** است، نه فایل ZIP سورس‌کد.
 
 > اگر آدرس بالا باز نشد، از لینک مستقیم زیر استفاده کنید:
-> `https://github.com/Parhamjigar227/CryptoHunterAI/releases/download/v0.4.0/DuoLink-v0.4.0.apk`
+> `https://github.com/Parhamjigar227/CryptoHunterAI/releases/download/v0.5.0/DuoLink-v0.5.0.apk`
 
 ### روش جایگزین: صفحهٔ Actions
 
@@ -37,7 +37,7 @@
 
 1. به صفحهٔ مخزن در GitHub بروید و زبانهٔ **Actions** را باز کنید.
 2. جدیدترین اجرای موفق را انتخاب کنید.
-3. در بخش **Artifacts**، روی `DuoLink-v0.4.0-Android-APK` بزنید.
+3. در بخش **Artifacts**، روی `DuoLink-v0.5.0-Android-APK` بزنید.
 4. فایل ZIP را خارج کنید؛ داخل آن فایل `.apk` وجود دارد.
 
 > **توجه:** این نسخه «debug» است و برای آزمایش ساخته شده است. امضای آن با نسخهٔ نهایی
@@ -50,9 +50,9 @@
 
 ```bash
 # Linux / macOS
-sha256sum DuoLink-v0.4.0.apk
+sha256sum DuoLink-v0.5.0.apk
 # Windows PowerShell
-Get-FileHash DuoLink-v0.4.0.apk -Algorithm SHA256
+Get-FileHash DuoLink-v0.5.0.apk -Algorithm SHA256
 ```
 
 مقدار چاپ‌شده باید دقیقاً با مقداری که در گزارش Actions آمده یکسان باشد.
@@ -93,7 +93,7 @@ Get-FileHash DuoLink-v0.4.0.apk -Algorithm SHA256
 ## ۴. نصب
 
 1. با فایل‌منیجر گوشی به پوشه‌ای که APK را در آن گذاشته‌اید بروید.
-2. روی فایل `DuoLink-v0.4.0.apk` بزنید.
+2. روی فایل `DuoLink-v0.5.0.apk` بزنید.
 3. اگر پیام «فایل نصب توسط Play Protect بررسی نشده است» دیدید، گزینهٔ `نصب کن` (Install anyway) را انتخاب کنید.
 4. منتظر بمانید تا نصب تمام شود و سپس `باز کردن` را بزنید.
 

@@ -140,33 +140,53 @@ test('legacy base32 hashing is byte-identical to the pre-existing formula', () =
 // ---- fail-closed configuration -----------------------------------------
 
 test('hashing a numeric code without a pepper fails closed with a clear error', () => {
+  // Deliberately independent of the ambient environment: an operator who HAS configured a pepper still
+  // needs proof that a MISSING one is a hard error rather than a silent downgrade.
   setActivationPepperForTesting(null);
   resetActivationPepperCache();
-  assert.throws(
-    () => hashActivationCode('482-913-7462'),
-    (error) => {
-      assert.equal(error.code, 'server_misconfigured');
-      assert.match(error.message, /DUOLINK_ACTIVATION_PEPPER/);
-      return true;
-    },
-    'a missing pepper must never silently fall back to an unkeyed hash',
-  );
+  const savedEnv = process.env.DUOLINK_ACTIVATION_PEPPER;
+  delete process.env.DUOLINK_ACTIVATION_PEPPER;
+  try {
+      assert.throws(
+        () => hashActivationCode('482-913-7462'),
+        (error) => {
+          assert.equal(error.code, 'server_misconfigured');
+          assert.match(error.message, /DUOLINK_ACTIVATION_PEPPER/);
+          return true;
+        },
+      'a missing pepper must never silently fall back to an unkeyed hash',
+    );
+  } finally {
+    if (savedEnv === undefined) delete process.env.DUOLINK_ACTIVATION_PEPPER;
+    else process.env.DUOLINK_ACTIVATION_PEPPER = savedEnv;
+    setActivationPepperForTesting(null);
+    resetActivationPepperCache();
+  }
 });
 
 test('a too-short pepper is rejected rather than accepted silently', () => {
+  resetActivationPepperCache();
   assert.throws(
     () => resolveActivationPepper({ DUOLINK_ACTIVATION_PEPPER: 'short' }),
     (error) => error.code === 'server_misconfigured',
   );
+  resetActivationPepperCache();
 });
 
 test('an absent pepper is rejected', () => {
+  // A brand-new process with no pepper configured must refuse numeric codes outright.
+  resetActivationPepperCache();
   assert.throws(() => resolveActivationPepper({}), (error) => error.code === 'server_misconfigured');
+  resetActivationPepperCache();
 });
 
 test('a sufficiently long pepper is accepted', () => {
+  // Explicit env object, never the ambient process environment, so this asserts the function's contract
+  // rather than whatever the machine happens to have configured.
+  resetActivationPepperCache();
   const pepper = resolveActivationPepper({ DUOLINK_ACTIVATION_PEPPER: PEPPER_A });
   assert.equal(pepper.toString('utf8'), PEPPER_A);
+  resetActivationPepperCache();
 });
 
 // ---- the residual offline-oracle risk, measured rather than asserted --------------------

@@ -377,3 +377,33 @@ test('resolve rejects a code for an invitation that never existed', async () => 
     assert.equal(res.json.error, 'invalid_activation_code');
   });
 });
+
+// ---- fail-closed deployment behaviour ------------------------------------
+
+test('an unconfigured server refuses numeric codes instead of storing an unkeyed hash', async () => {
+  // This is the single most important configuration test: an operator who deploys without setting
+  // DUOLINK_ACTIVATION_PEPPER must get a hard failure, because the alternative - silently storing a
+  // bare SHA-256 of a 10-digit code - is exactly the offline-enumerable weakness the pepper exists to
+  // prevent, and it would be invisible in production until the database leaked.
+  const { setActivationPepperForTesting, resetActivationPepperCache } = await import('../src/crypto.js');
+  setActivationPepperForTesting(null);
+  resetActivationPepperCache();
+  const saved = process.env.DUOLINK_ACTIVATION_PEPPER;
+  delete process.env.DUOLINK_ACTIVATION_PEPPER;
+  try {
+    const { app } = createTestServer();
+    const client = new TestClient(app);
+    const res = await client.call('POST', '/v1/invitations', {
+      body: { owner: makeParticipant().wire(), activationCode: '482-913-7462' },
+    });
+    assert.equal(res.status, 503, `a missing pepper must be a hard error, got ${res.status}: ${JSON.stringify(res.json)}`);
+    assert.equal(res.json.error, 'server_misconfigured');
+    // And the message must name the variable, so the operator can actually fix it.
+    assert.match(JSON.stringify(res.json), /DUOLINK_ACTIVATION_PEPPER/);
+  } finally {
+    if (saved === undefined) delete process.env.DUOLINK_ACTIVATION_PEPPER;
+    else process.env.DUOLINK_ACTIVATION_PEPPER = saved;
+    setActivationPepperForTesting(null);
+    resetActivationPepperCache();
+  }
+});

@@ -71,7 +71,7 @@ jobs:
           echo "=== Debug APK Badging Metadata (aapt2) ==="
           "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK_PATH" | head -n 25
           mkdir -p /tmp/apk-only
-          cp "$APK_PATH" /tmp/apk-only/DuoLink-v0.3.0.apk
+          cp "$APK_PATH" /tmp/apk-only/DuoLink-v0.4.0.apk
           EOS
           bash /tmp/run_build.sh 2>&1 | tee /tmp/job1.log
           exit "${PIPESTATUS[0]}"
@@ -80,8 +80,8 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: DuoLink-v0.3.0-Android-APK
-          path: /tmp/apk-only/DuoLink-v0.3.0.apk
+          name: DuoLink-v0.4.0-Android-APK
+          path: /tmp/apk-only/DuoLink-v0.4.0.apk
 
       - name: Upload Debug APK, SHA-256 & Unit Test Reports
         if: always()
@@ -137,6 +137,41 @@ jobs:
               check=True,
           )
           PY
+
+  server-tests:
+    name: Signaling server tests (Node 22, node:sqlite)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # The peppered activation-code hash refuses to run without a pepper, by design. CI supplies a
+      # throwaway one so the numeric-code tests exercise the real code path instead of skipping it.
+      # This value is NOT a secret and must never be reused by a real deployment.
+      - name: Run server test suite
+        working-directory: DuoLink/server
+        env:
+          DUOLINK_ACTIVATION_PEPPER: "ci-only-throwaway-pepper-0123456789abcdef0123456789abcdef"
+        run: |
+          set -o pipefail
+          node --version
+          node --test "test/*.test.js" 2>&1 | tee /tmp/server-tests.log
+          echo "--- summary ---"
+          grep -E "^# (tests|pass|fail)" /tmp/server-tests.log
+
+      - name: Upload server test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: duolink-server-test-log
+          path: /tmp/server-tests.log
+          retention-days: 30
 
   connected-android-test:
     name: connectedDebugAndroidTest (API ${{ matrix.api }})

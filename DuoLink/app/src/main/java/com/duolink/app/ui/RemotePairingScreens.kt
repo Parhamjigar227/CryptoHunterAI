@@ -85,7 +85,8 @@ import com.duolink.app.remote.RemotePairingController
 fun ConnectMethodPickerScreen(
     onBack: () -> Unit,
     onChooseQr: () -> Unit,
-    onChooseNumeric: () -> Unit
+    onChooseNumeric: () -> Unit,
+    onOpenServerSettings: () -> Unit = {}
 ) {
     Scaffold(
         topBar = { RemoteTopBar(title = "اتصال به گوشی دیگر", onBack = onBack) },
@@ -133,6 +134,13 @@ fun ConnectMethodPickerScreen(
                 style = MaterialTheme.typography.bodySmall,
                 color = TextMuted
             )
+
+            // The remote method needs a signaling server; QR does not (it is fully offline). Surfacing
+            // this here means a user who cannot get the code method to work can find the cause instead
+            // of seeing a network error with nowhere to go.
+            OutlinedButton(onClick = onOpenServerSettings, modifier = Modifier.fillMaxWidth()) {
+                Text("تنظیمات سرور ارتباط (برای روش کد)")
+            }
         }
     }
 }

@@ -111,6 +111,13 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
         byteStore = byteStore
     )
     private val trustStore = PeerTrustStore(store = byteStore, sealer = sealer)
+
+    /**
+     * Resolves the signaling server: a saved override wins, otherwise the build-time default.
+     * Stored in the same sealed byte store as the trust records, so it inherits the app-private,
+     * backup-disabled location rather than adding a second storage mechanism.
+     */
+    private val endpointStore = com.duolink.app.remote.ServerEndpointStore(byteStore)
     private val coordinator = PairingCoordinator(keyVault = keyVault, trustStore = trustStore)
 
     /** App-lock gate. The record is stored only as an AES-256-GCM sealed blob. */
@@ -148,6 +155,57 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
 
     private val _remoteState = MutableStateFlow(RemotePairingController.RemotePairingState())
     val remoteState: StateFlow<RemotePairingController.RemotePairingState> = _remoteState.asStateFlow()
+
+    /** What the settings screen shows: the current endpoint and whether it needs configuring. */
+    private val _serverSettings = MutableStateFlow(ServerSettingsUiState())
+    val serverSettings: StateFlow<ServerSettingsUiState> = _serverSettings.asStateFlow()
+
+    /** Snapshot of the endpoint configuration, refreshed on demand and after every save. */
+    fun refreshServerSettings() {
+        val resolution = endpointStore.resolve()
+        _serverSettings.value = when (resolution) {
+            is ServerEndpointStore.Resolution.Ready -> ServerSettingsUiState(
+                currentUrl = resolution.baseUrl,
+                isFromBuild = resolution.source == ServerEndpointStore.Source.BUILD_TIME,
+                lastError = null
+            )
+            is ServerEndpointStore.Resolution.NeedsConfiguration -> ServerSettingsUiState(
+                currentUrl = null,
+                isFromBuild = false,
+                lastError = resolution.reason
+            )
+        }
+    }
+
+    /** Saves a user-supplied server address. Returns the validation message on failure, or null. */
+    fun saveServerEndpoint(rawUrl: String): String? {
+        val result = endpointStore.saveOverride(rawUrl)
+        refreshServerSettings()
+        val error = result.exceptionOrNull()?.message
+        if (error != null) {
+            _serverSettings.value = _serverSettings.value.copy(lastError = error)
+        }
+        return error
+    }
+
+    /** Clears the override so the build-time default applies again. */
+    fun clearServerEndpoint() {
+        endpointStore.clearOverride()
+        refreshServerSettings()
+    }
+
+    /** The base URL to use for remote pairing, or null when the user must configure one first. */
+    fun currentServerBaseUrl(): String? = when (val r = endpointStore.resolve()) {
+        is ServerEndpointStore.Resolution.Ready -> r.baseUrl
+        is ServerEndpointStore.Resolution.NeedsConfiguration -> null
+    }
+
+    /** State shown by the server-settings screen. */
+    data class ServerSettingsUiState(
+        val currentUrl: String? = null,
+        val isFromBuild: Boolean = false,
+        val lastError: String? = null
+    )
 
     /** Expiry of the live invitation, so the UI can drive the countdown from the server's own value. */
     private var remoteExpiresAtEpochSec: Long? = null

@@ -161,6 +161,18 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
         return
     }
 
+    // Every remote-pairing entry point needs a server URL. Rather than a compiled-in placeholder
+    // (0.4.0 used `https://relay.duolink.invalid`, which can never resolve), resolve it at the moment
+    // of use and, when it is missing, send the user to the settings screen that can fix it.
+    val requireServer: (onReady: (String) -> Unit) -> Unit = { onReady ->
+        val base = duoViewModel.currentServerBaseUrl()
+        if (base != null) {
+            onReady(base)
+        } else {
+            navController.navigate("server-settings") { launchSingleTop = true }
+        }
+    }
+
     NavHost(navController = navController, startDestination = "home") {
         composable("home") {
             HomeScreen(
@@ -179,7 +191,20 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
                 onChooseNumeric = {
                     duoViewModel.resetRemotePairing()
                     navController.navigate("remote-select-role") { launchSingleTop = true }
-                }
+                },
+                onOpenServerSettings = { navController.navigate("server-settings") { launchSingleTop = true } }
+            )
+        }
+
+        // Reachable from the method picker and from any remote action that finds no server configured.
+        composable("server-settings") {
+            val settings by duoViewModel.serverSettings.collectAsState()
+            ServerSettingsScreen(
+                state = settings,
+                onBack = { navController.popBackStack() },
+                onSave = { url -> duoViewModel.saveServerEndpoint(url) },
+                onClear = { duoViewModel.clearServerEndpoint() },
+                onRefresh = { duoViewModel.refreshServerSettings() }
             )
         }
 
@@ -187,8 +212,10 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
             RemoteRoleChooserScreen(
                 onBack = { navController.popBackStack() },
                 onGenerate = {
-                    duoViewModel.startRemoteInvitation(DEFAULT_RELAY_BASE_URL)
-                    navController.navigate("remote-owner") { launchSingleTop = true }
+                    requireServer { base ->
+                        duoViewModel.startRemoteInvitation(base)
+                        navController.navigate("remote-owner") { launchSingleTop = true }
+                    }
                 },
                 onEnterCode = {
                     navController.navigate("remote-join") { launchSingleTop = true }
@@ -209,7 +236,7 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
             // protocol call, so it runs on the ViewModel's IO dispatcher, never on the composition thread.
             LaunchedEffect(remote.step) {
                 if (remote.step == RemotePairingController.Step.OWNER_SHOWING_CODE) {
-                    duoViewModel.awaitRemoteRedemption(DEFAULT_RELAY_BASE_URL)
+                    duoViewModel.currentServerBaseUrl()?.let { duoViewModel.awaitRemoteRedemption(it) }
                 }
             }
             // When the Safety Number exists, move to the mutual-approval screen.
@@ -225,7 +252,7 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
                     duoViewModel.cancelRemotePairing(isOwner = true)
                     navController.popBackStack("connect", inclusive = false)
                 },
-                onGenerateNew = { duoViewModel.startRemoteInvitation(DEFAULT_RELAY_BASE_URL) },
+                onGenerateNew = { requireServer { base -> duoViewModel.startRemoteInvitation(base) } },
                 onDismissFailure = { duoViewModel.resetRemotePairing() },
                 onBack = {
                     duoViewModel.cancelRemotePairing(isOwner = true)
@@ -244,7 +271,7 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
             NumericCodeJoinScreen(
                 state = remote,
                 onCodeChanged = { },
-                onSubmit = { code -> duoViewModel.joinWithRemoteCode(DEFAULT_RELAY_BASE_URL, code) },
+                onSubmit = { code -> requireServer { base -> duoViewModel.joinWithRemoteCode(base, code) } },
                 onRetry = { duoViewModel.resetRemotePairing() },
                 onCancel = {
                     duoViewModel.cancelRemotePairing(isOwner = false)
@@ -313,7 +340,7 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
         }
         composable("conversation") {
             LaunchedEffect(Unit) {
-                duoViewModel.openConversation(DEFAULT_RELAY_BASE_URL)
+                duoViewModel.currentServerBaseUrl()?.let { duoViewModel.openConversation(it) }
                 duoViewModel.markConversationRead()
             }
             // Polling fallback: the WebSocket pushes when available, this guarantees progress when it
@@ -619,7 +646,6 @@ private fun AboutScreen(onBack: () -> Unit) {
 }
 
 /** Default relay base URL. Loopback is allowed for adb-reverse development; a real deployment is wss. */
-private const val DEFAULT_RELAY_BASE_URL = "https://relay.duolink.invalid"
 
 /** How often the fallback poll runs while the chat screen is open. */
 private const val CONVERSATION_POLL_INTERVAL_MS = 5_000L

@@ -76,7 +76,11 @@ jobs:
           echo "=== Debug APK Badging Metadata (aapt2) ==="
           "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK_PATH" | head -n 25
           mkdir -p /tmp/apk-only
-          cp "$APK_PATH" /tmp/apk-only/DuoLink-v${VERSION}.apk
+          # Version-less inside the artifact: `uses:` inputs are not shell-expanded, so the file that
+          # the workflow downloads must have a fixed name. The release job renames it to the final
+          # versioned filename right before upload.
+          cp "$APK_PATH" /tmp/apk-only/DuoLink-Android-APK.apk
+          ls -l /tmp/apk-only/DuoLink-Android-APK.apk
           EOS
           bash /tmp/run_build.sh 2>&1 | tee /tmp/job1.log
           exit "${PIPESTATUS[0]}"
@@ -86,7 +90,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: DuoLink-Android-APK
-          path: /tmp/apk-only/DuoLink-v${VERSION}.apk
+          path: /tmp/apk-only/DuoLink-Android-APK.apk
 
       - name: Upload Debug APK, SHA-256 & Unit Test Reports
         if: always()
@@ -409,6 +413,17 @@ jobs:
           name: duolink-debug-apk-and-unit-reports
           path: /tmp/unit-reports
         continue-on-error: true
+
+      - name: Name the APK for this version
+        run: |
+          set -euo pipefail
+          # The artifact ships a fixed filename because `uses:` inputs are not shell-expanded, and the
+          # name the user ends up downloading should carry the version. Rename here, where $VERSION
+          # does expand, and keep the path the rest of the job uses in one place.
+          test -f /tmp/release/DuoLink-Android-APK.apk || {
+            echo "downloaded artifact does not contain DuoLink-Android-APK.apk"; ls -l /tmp/release; exit 1; }
+          mv /tmp/release/DuoLink-Android-APK.apk "/tmp/release/DuoLink-v${VERSION}.apk"
+          ls -l "/tmp/release/DuoLink-v${VERSION}.apk"
 
       - name: Verify the artifact is an APK, not a source archive
         run: |

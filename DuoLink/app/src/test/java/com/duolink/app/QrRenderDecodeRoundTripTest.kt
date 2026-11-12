@@ -183,6 +183,18 @@ class QrRenderDecodeRoundTripTest {
                 })
             }
             val dump = compact?.let { dumpRows(it) }.orEmpty()
+            // Also write it next to the test reports, which the workflow uploads as an artifact. The
+            // assertion message is truncated by the JUnit XML writer, so the file is the reliable copy.
+            runCatching {
+                val dir = java.io.File("build/test-results/testDebugUnitTest")
+                dir.mkdirs()
+                java.io.File(dir, "qr_bad_matrix.txt").writeText(
+                    "payload_length=${firstBadPayload?.length}\n" +
+                        "matrix=${compact?.width}x${compact?.height}\n" +
+                        "payload=${firstBadPayload}\n" +
+                        dump
+                )
+            }
             throw AssertionError(
                 "These payload lengths do not survive a render/decode round trip:\n" +
                     failures.joinToString("\n") +
@@ -218,8 +230,20 @@ class QrRenderDecodeRoundTripTest {
         } catch (_: Exception) {
             reader.reset()
         }
+        try {
+            return reader.decode(BinaryBitmap(GlobalHistogramBinarizer(source)), hints).text
+        } catch (_: Exception) {
+            reader.reset()
+        }
+        // Third pass, mirroring QrBitmapCodec.decodeLuminance: PURE_BARCODE samples the module grid
+        // directly instead of searching for finder patterns.
+        val pureHints = EnumMap<DecodeHintType, Any>(DecodeHintType::class.java).apply {
+            put(DecodeHintType.CHARACTER_SET, "UTF-8")
+            put(DecodeHintType.POSSIBLE_FORMATS, listOf(BarcodeFormat.QR_CODE))
+            put(DecodeHintType.PURE_BARCODE, true)
+        }
         return try {
-            reader.decode(BinaryBitmap(GlobalHistogramBinarizer(source)), hints).text
+            reader.decode(BinaryBitmap(HybridBinarizer(source)), pureHints).text
         } catch (_: Exception) {
             null
         }

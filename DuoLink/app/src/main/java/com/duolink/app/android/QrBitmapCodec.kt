@@ -44,6 +44,26 @@ object QrBitmapCodec {
     }
 
     /**
+     * Hints for a bitmap that is known to be a clean, machine-generated symbol filling its own
+     * coordinate space - a rendered QR on screen, or a screenshot of one.
+     *
+     * [DecodeHintType.PURE_BARCODE] skips the finder-pattern search and samples the module grid
+     * directly from the image bounds. That search is why ZXing's Java detector intermittently fails
+     * here: measured against Core 3.5.4, 10 of 141 payload lengths in the realistic window decode to
+     * null at 680px even though the bitmaps are well formed - an independent decoder (zxing-cpp) reads
+     * every one of them. The failing set is identical at 420px and 680px, so it is not a resolution or
+     * module-size problem; it is the detector's grid fit on certain mask patterns.
+     *
+     * This is a fallback, not a replacement: the normal detector runs first and still handles real
+     * camera frames, which are never pure (perspective, uneven lighting, a quiet zone of unknown size).
+     */
+    private val pureBarcodeHints = EnumMap<DecodeHintType, Any>(DecodeHintType::class.java).apply {
+        put(DecodeHintType.CHARACTER_SET, "UTF-8")
+        put(DecodeHintType.POSSIBLE_FORMATS, listOf(BarcodeFormat.QR_CODE))
+        put(DecodeHintType.PURE_BARCODE, true)
+    }
+
+    /**
      * Encodes at an exact, whole-pixel module size instead of letting the requested size be divided.
      *
      * ZXing's [QRCodeWriter] is given an output width and stretches the symbol to fill it. When the
@@ -175,6 +195,14 @@ object QrBitmapCodec {
 
         try {
             return reader.decode(BinaryBitmap(GlobalHistogramBinarizer(normalSource)), decodeHints).text
+        } catch (_: Exception) {
+            reader.reset()
+        }
+
+        // Pure-barcode pass: treats the input as a bitmap that is exactly one symbol. Worth trying
+        // before the inverted pass, because a correctly-oriented clean render is the common case here.
+        try {
+            return reader.decode(BinaryBitmap(HybridBinarizer(normalSource)), pureBarcodeHints).text
         } catch (_: Exception) {
             reader.reset()
         }

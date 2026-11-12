@@ -39,6 +39,12 @@ android {
 
     buildFeatures {
         compose = true
+        // Required by the remote-pairing endpoint policy: `SignalingEndpointPolicy` accepts plain http://
+        // ONLY for loopback addresses AND only in debug builds, and the caller passes
+        // `BuildConfig.DEBUG` explicitly so the rule is enforced by code rather than by convention.
+        // Without this flag BuildConfig is not generated and the release build would have no way to
+        // tell itself apart from a debug build.
+        buildConfig = true
     }
 
     testOptions {

@@ -85,7 +85,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: DuoLink-v${VERSION}-Android-APK
+          name: DuoLink-Android-APK
           path: /tmp/apk-only/DuoLink-v${VERSION}.apk
 
       - name: Upload Debug APK, SHA-256 & Unit Test Reports
@@ -387,7 +387,7 @@ jobs:
       - name: Download the APK built by the Gradle job
         uses: actions/download-artifact@v4
         with:
-          name: DuoLink-v${VERSION}-Android-APK
+          name: DuoLink-Android-APK
           path: /tmp/release
 
       # The report artifacts live in the OTHER jobs' output, so they must be fetched explicitly.

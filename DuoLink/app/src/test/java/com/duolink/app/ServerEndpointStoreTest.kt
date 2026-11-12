@@ -151,7 +151,7 @@ class ServerEndpointStoreTest {
             } else {
                 MiniHttpServer.Response(status = 404, body = "{}")
             }
-        }.use { server ->
+        }.start().use { server ->
             val client = SignalingHttpClient(isDebugBuild = true)
             // execute() returns the parsed body string (it throws on a non-2xx), so a returned value
             // here already means a 200 came back.

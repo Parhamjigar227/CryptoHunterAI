@@ -108,7 +108,13 @@ class QrRenderDecodeRoundTripTest {
         return out
     }
 
-    /** A payload whose length is exactly [length], shaped like a real `duolink://pair/v1?p=` code. */
+    /**
+     * A payload of exactly [length] characters, filled with base64url-sounding characters.
+     *
+     * NOTE: this is not a real handshake packet - it has no length-prefixed binary structure and no
+     * signature bytes. It exists to sweep the length axis. The connected test and the CI logs are the
+     * authority on what real payloads look like; this is a stand-in whose job is to be reproducible.
+     */
     private fun payloadOfLength(length: Int): String {
         val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
         val prefix = "duolink://pair/v1?p="
@@ -116,6 +122,23 @@ class QrRenderDecodeRoundTripTest {
             repeat(length - prefix.length) { i -> append(alphabet[(i * 29 + length * 13) % alphabet.length]) }
         }
         return prefix + body
+    }
+
+    /**
+     * Dumps the exact matrix ZXing refuses, as rows of '0'/'1', into the assertion message.
+     *
+     * This is how the failure gets diagnosed without a local JVM: CI has ZXing Core 3.5.4 and the
+     * sandbox does not, so the bitmap has to be carried out of the failing build in plain text. A
+     * second, independent decoder (zxing-cpp) can then be pointed at the same bits to decide whether
+     * the symbol is malformed or the detector is at fault.
+     */
+    private fun dumpRows(matrix: com.google.zxing.common.BitMatrix): String {
+        val sb = StringBuilder()
+        for (y in 0 until matrix.height) {
+            for (x in 0 until matrix.width) sb.append(if (matrix.get(x, y)) '1' else '0')
+            if (y < matrix.height - 1) sb.append('\n')
+        }
+        return sb.toString()
     }
 
     /** The window that real payloads occupy, from observed CI runs plus margin on both sides. */
@@ -135,6 +158,7 @@ class QrRenderDecodeRoundTripTest {
     @Test
     fun everyPayloadLengthInTheRealisticWindowRoundTripsThroughTheCameraPlane() {
         val failures = mutableListOf<String>()
+        var firstBadPayload: String? = null
         for (length in lengthWindow) {
             val payload = payloadOfLength(length)
             val matrix = encode(payload, sizePx = productionSizePx, margin = appMargin)
@@ -142,14 +166,31 @@ class QrRenderDecodeRoundTripTest {
             val decoded = decodeLuminance(luminance, matrix.width, matrix.height)
             if (decoded != payload) {
                 failures += "length=$length modules=${matrix.width} decoded=${if (decoded == null) "null" else "${decoded.length} chars"}"
+                if (firstBadPayload == null) firstBadPayload = payload
             }
         }
-        assertEquals(
-            emptyList(),
-            failures,
-            "These payload lengths do not survive a render/decode round trip. The list is the whole point " +
-                "of this test: a CI run that samples one length at random hides the boundary, this shows it."
-        )
+        if (failures.isNotEmpty()) {
+            // Carry the unreadable bitmap out of the build so it can be checked against a second
+            // decoder. Without this the failure is just "null" and the cause stays a guess.
+            // Dump the matrix at 1 pixel per module so it fits in the check-run summary (a 679x679
+            // render is ~460k chars and would be truncated to uselessness). Module structure is what
+            // matters for diagnosis, not the scale factor.
+            val compact = firstBadPayload?.let { p ->
+                QRCodeWriter().encode(p, BarcodeFormat.QR_CODE, 1, 1, EnumMap<EncodeHintType, Any>(EncodeHintType::class.java).apply {
+                    put(EncodeHintType.CHARACTER_SET, "UTF-8")
+                    put(EncodeHintType.ERROR_CORRECTION, ErrorCorrectionLevel.M)
+                    put(EncodeHintType.MARGIN, appMargin)
+                })
+            }
+            val dump = compact?.let { dumpRows(it) }.orEmpty()
+            throw AssertionError(
+                "These payload lengths do not survive a render/decode round trip:\n" +
+                    failures.joinToString("\n") +
+                    "\n\nFirst failing payload length: ${firstBadPayload?.length}" +
+                    "\nFirst failing matrix at 1px/module (${compact?.width}x${compact?.height}), rows of 0/1:" +
+                    "\nBEGIN_MATRIX\n${dump.take(120000)}\nEND_MATRIX"
+            )
+        }
     }
 
     @Test

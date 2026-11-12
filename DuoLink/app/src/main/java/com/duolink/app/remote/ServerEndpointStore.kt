@@ -22,7 +22,7 @@ import com.duolink.app.crypto.RawStoreRead
  */
 class ServerEndpointStore(
     private val store: KeyValueByteStore,
-    private val defaults: EndpointDefaults = EndpointDefaults
+    private val defaults: EndpointDefaults = AndroidDefaults
 ) {
 
     /** The build-time defaults and the platform policy. Injectable so tests do not depend on the build. */

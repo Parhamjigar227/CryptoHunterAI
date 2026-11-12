@@ -22,10 +22,19 @@ import java.util.EnumMap
  */
 object QrBitmapCodec {
 
+    /**
+     * Quiet-zone width in modules. The QR spec (ISO/IEC 18004) requires **4**; this was 2.
+     *
+     * A 2-module quiet zone is what a camera in the field is most likely to break on: the margin is the
+     * empty border the decoder needs to find the symbol's edges, and vendors' ISP sharpening eats into
+     * it first. 4 is the value every conformant encoder emits and what ZXing's own decoder is tuned for.
+     */
+    const val MARGIN = 4
+
     private val encodeHints = EnumMap<EncodeHintType, Any>(EncodeHintType::class.java).apply {
         put(EncodeHintType.CHARACTER_SET, "UTF-8")
         put(EncodeHintType.ERROR_CORRECTION, ErrorCorrectionLevel.M)
-        put(EncodeHintType.MARGIN, 2)
+        put(EncodeHintType.MARGIN, MARGIN)
     }
 
     private val decodeHints = EnumMap<DecodeHintType, Any>(DecodeHintType::class.java).apply {

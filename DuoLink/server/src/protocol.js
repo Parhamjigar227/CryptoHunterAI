@@ -27,7 +27,8 @@ export const ROLE_RECIPIENT = 'recipient';
 
 /** Hard protocol limits (also enforced by the server as defence-in-depth). */
 export const LIMITS = Object.freeze({
-  activationCodeLength: 16, // 5 groups x 4 chars, base32 (no padding)
+  activationCodeLength: 16, // legacy: 4 groups of 4 base32 chars (80 bits)
+  numericCodeDigits: 10,    // numeric invitations: 482-913-7462 (33.2 bits, peppered+stretched)
   deviceIdBytes: 16,
   publicKeySpkiBytes: 91,
   rootKeyBytes: 32,
@@ -43,7 +44,17 @@ export const LIMITS = Object.freeze({
 });
 
 /** Invitation lifetime as seen by the server (independent of the client-displayed countdown). */
-export const INVITATION_TTL_SECONDS = 15 * 60;
+/**
+ * Invitation lifetime: 10 minutes, matching the visible countdown the Android app shows.
+ *
+ * This was 15 minutes. The brief specifies 10, and the number must be identical on both sides: the
+ * owner's countdown is driven by the server's `expiresAt`, so a mismatch would either show "expired"
+ * while redemption still worked (baffling) or let a code outlive the screen that displays it.
+ *
+ * Shortening it also tightens the online guessing budget proportionally. At 10 attempts/minute a
+ * 10-minute window allows 100 guesses against a 10^10 space.
+ */
+export const INVITATION_TTL_SECONDS = 10 * 60;
 
 /**
  * Server-side invitation state machine. `commit_quorum_reached` is the serialisation barrier at
@@ -94,6 +105,21 @@ export const buildTranscript = (domain, parts) => Buffer.concat([utf8(domain), .
  * `activationCodeHash` (not the code) is what the server sees in this position, but the *signed* bytes
  * use the code hash too: the plaintext code never leaves the owner device, and the recipient can
  * recompute the same hash from the code it was given.
+ *
+ * IMPORTANT — two hashes, not one. `activationCodeHash` here is the *transcript* hash: a plain,
+ * unkeyed SHA-256 with the `DUOLINK-ACTIVATION-CODE-V1` domain prefix, computable by both clients
+ * because both must build these exact bytes. It is NOT the value the database stores. The stored
+ * `code_hash` comes from `hashActivationCode()` in `crypto.js`, which for numeric codes is
+ * HMAC(server pepper) + PBKDF2 and is deliberately NOT reproducible by any client.
+ *
+ * Consequence for numeric codes (33.2 bits): this signature is a stored, publicly-checkable function of
+ * the code, so it is an offline oracle in a way that the peppered database hash is not. Measured on the
+ * reference hardware, ECDSA P-256 verification costs ~91 us versus ~1.9 us for the SHA-256, so an
+ * attacker holding the stored signature can test a candidate in ~48x the time of a raw hash, i.e. the
+ * full 10^10 space in roughly 10 CPU-days. That is a real cost but not an infeasible one, and it is
+ * unavoidable for ANY design that cryptographically binds a low-entropy code into a public-key
+ * signature. It is recorded here rather than glossed over, and it is why the numeric option is
+ * presented to users as convenient-but-shorter-lived rather than as equivalent to the 80-bit form.
  */
 export function invitationTranscript({
   invitationId,

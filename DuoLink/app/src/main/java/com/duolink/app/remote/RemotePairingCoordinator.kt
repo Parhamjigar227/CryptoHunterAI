@@ -515,6 +515,49 @@ class RemotePairingCoordinator(
         }
     }
 
+    /**
+     * Recipient step 0 (numeric flow only): turn a typed code into the invitation id.
+     *
+     * WHY THE NUMERIC FLOW NEEDS THIS
+     * The redeem transcript binds `invitationId`, and the recipient signs that transcript as part of the
+     * redeem request. The QR payload carries the id; ten digits cannot. Without a lookup the joiner has
+     * nothing to bind, so it could not produce a signature the owner would accept - the flow is
+     * impossible at the protocol level, not merely inconvenient at the UI level.
+     *
+     * SAFETY
+     *  - Read-only. The invitation remains CREATED and unredeemed, so single use is still decided, once,
+     *    inside the redeem transaction. Resolving twice is harmless; redeeming twice is refused.
+     *  - The response carries no key material, no tokens and no device identifiers - only the id and the
+     *    expiry, which the QR flow already exposes to anyone holding the code.
+     *  - The owner's identity is NOT authenticated by this call. That is by design: the QR flow has the
+     *    same property before redemption. Trust is established later, by the redeem-signature check, the
+     *    SPK signature check, the two-DH transcript and finally the Safety Number that both humans
+     *    compare. This function must never be treated as proof of who the owner is.
+     *
+     * @throws RemotePairingException with [RemoteFailure.ACTIVATION_CODE_MALFORMED] for unparseable
+     *   input, or the server's mapped failure (not-found / already-redeemed / expired) otherwise.
+     */
+    fun resolveCodeToInvitationId(
+        api: SignalingApi,
+        serverBaseUrl: String,
+        activationCodeInput: String,
+        isDebugBuild: Boolean
+    ): String {
+        ensureHealthy()
+        val validation = SignalingEndpointPolicy.validate(serverBaseUrl, isDebugBuild)
+        if (!validation.isValid) {
+            throw failWith(RemoteFailure.SERVER_REJECTED_REQUEST, validation.persianReason)
+        }
+        val normalisedUrl = SignalingEndpointPolicy.normalise(serverBaseUrl)
+        val code = ActivationCode.parse(activationCodeInput)
+            ?: throw failWith(RemoteFailure.ACTIVATION_CODE_MALFORMED)
+        val resolved = api.resolveInvitationByCode(normalisedUrl, code.displayForm)
+        if (resolved.invitationId.isEmpty() || resolved.invitationId.length > 64) {
+            throw failWith(RemoteFailure.INVITATION_QR_MALFORMED, "شناسه دعوت دریافتی از سرور نامعتبر است")
+        }
+        return resolved.invitationId
+    }
+
     // -------------------------------------------------------------------------------------------
     // Recipient: redeem and derive
     // -------------------------------------------------------------------------------------------
@@ -523,10 +566,21 @@ class RemotePairingCoordinator(
     /**
      * Recipient step 1: redeem the activation code and publish this device's material.
      *
-     * [expectedInvitationId] comes from the QR code and is **required**: the frozen redeem transcript
-     * binds the invitation id (Decision B) and the recipient must sign it before uploading anything. The
-     * value returned by the server is compared against it, so a server (or a mismatch between two QR
-     * codes) cannot silently substitute a different invitation.
+     * [expectedInvitationId] is **required by the frozen transcript**: the redeem transcript binds the
+     * invitation id (Decision B) and the recipient must sign it before uploading anything. The value the
+     * server returns is compared against it, so neither a hostile server nor an accidental mismatch can
+     * silently substitute a different invitation.
+     *
+     * Two flows supply it, and the difference is the whole reason [resolveCodeToInvitationId] exists:
+     *
+     *  - **QR flow (Method A / legacy Method B):** the id rides inside the QR payload (`?c=&i=&s=`), so
+     *    the joiner has it before signing. No extra round trip.
+     *  - **Numeric-code flow:** a ten-digit code carries no id. The caller therefore resolves it first
+     *    via [resolveCodeToInvitationId] and passes the result here. Resolving is read-only, so the
+     *    invitation is still unredeemed when this function claims it, and single use remains atomic.
+     *
+     * Callers MUST NOT invent or guess an id: an empty or over-long value fails closed below, and a
+     * value that does not match what the server returns fails the comparison after redemption.
      */
     fun redeemInvitation(
         api: SignalingApi,

@@ -16,6 +16,8 @@
 
 import {
   createHash,
+  createHmac,
+  pbkdf2Sync,
   createPrivateKey,
   createPublicKey,
   generateKeyPairSync,
@@ -118,12 +120,55 @@ export function generateActivationCode(random = randomInt) {
   return `${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}-${raw.slice(12, 16)}`;
 }
 
-/** Normalises user input: strips separators/whitespace, upper-cases, then re-validates strictly. */
+/**
+ * Generates a 10-digit numeric invitation code, grouped `482-913-7462`.
+ *
+ * `random` is injectable so tests can drive the generator deterministically. In production it is
+ * `randomInt`, which is the CSPRNG-backed uniform integer source from `node:crypto`, never `Math.random`.
+ *
+ * The leading digit is drawn from 1..9 rather than 0..9. A leading zero would give the code two
+ * spellings (`0482913746` vs `482913746`) and therefore two chances of a typo matching a live
+ * invitation; it would also make a zero-padded display ambiguous. The loss of entropy is 0.15 bits,
+ * which is immaterial, and the uniformity of the remaining nine digits is unaffected.
+ */
+export function generateNumericActivationCode(random = randomInt) {
+  let raw = String(random(9) + 1); // 1..9
+  for (let i = 1; i < LIMITS.numericCodeDigits; i += 1) raw += String(random(10));
+  return `${raw.slice(0, 3)}-${raw.slice(3, 6)}-${raw.slice(6)}`;
+}
+
+/**
+ * Normalises user input into the canonical grouped form.
+ *
+ * Two accepted shapes, both re-validated strictly after normalisation:
+ *   - **Legacy 16-symbol base32** (80 bits): `ABCD-EFGH-JKMN-PQRS`. Still accepted so that any
+ *     invitation minted before the numeric release keeps working.
+ *   - **10-digit numeric** (33.2 bits): `4829137462`, displayed as `482-913-7462`. This is the
+ *     "Remote Pairing by Numeric Invitation Code" flow.
+ *
+ * Normalisation is deliberately conservative: separators and whitespace are stripped and case is
+ * folded, but nothing is ever "corrected". Persian/Arabic-Indic digits are NOT transliterated,
+ * because guessing at intent is exactly how a user ends up typing a code that silently becomes a
+ * different code. Unrecognised input is rejected.
+ */
 export function normaliseActivationCode(input) {
   if (typeof input !== 'string') {
     throw new ProtocolError('invalid_activation_code', 'activation code must be a string');
   }
-  const compact = input.replace(/[\s-]/g, '').toUpperCase();
+  // Separators are stripped, not interpreted. Only characters that appear in NEITHER alphabet
+  // (whitespace, '-', '.', '_') are removed, so stripping can never make two distinct codes collide -
+  // every accepted spelling still denotes exactly one code. This matches the Android client's parser.
+  const compact = input.replace(/[\s._-]/g, '').toUpperCase();
+
+  // ---- numeric form -------------------------------------------------------------------
+  if (/^[0-9]+$/.test(compact)) {
+    if (compact.length !== LIMITS.numericCodeDigits) {
+      throw new ProtocolError('invalid_activation_code', 'numeric activation code has the wrong length');
+    }
+    return `${compact.slice(0, 3)}-${compact.slice(3, 6)}-${compact.slice(6)}`;
+  }
+
+  // ---- legacy base32 form -------------------------------------------------------------
   if (compact.length !== LIMITS.activationCodeLength) {
     throw new ProtocolError('invalid_activation_code', 'activation code has the wrong length');
   }
@@ -135,8 +180,90 @@ export function normaliseActivationCode(input) {
   return `${compact.slice(0, 4)}-${compact.slice(4, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}`;
 }
 
-/** Salted, domain-separated hash of the activation code. The plaintext code is never persisted. */
+/** True when a canonical code is the numeric form (used to pick the hash parameters). */
+export function isNumericActivationCode(canonicalCode) {
+  return /^[0-9-]+$/.test(canonicalCode);
+}
+
+/**
+ * Server-side secret ("pepper") that keys the activation-code hash.
+ *
+ * WHY THIS EXISTS — the concrete attack it closes:
+ * A 10-digit code carries only 33.2 bits. Hashing it with a bare SHA-256 and storing that digest
+ * means anyone who obtains the database (leak, backup, stolen disk, SQL injection) can enumerate
+ * the entire keyspace OFFLINE, with no server involved, so no rate limit applies. Measured on this
+ * hardware, a bare SHA-256 runs at ~435,000 guesses/sec/core, i.e. all 10^10 codes in about
+ * 6.4 CPU-hours. Every code ever issued inside a retention window would fall out.
+ *
+ * Keying the hash with a secret held ONLY in the process environment (never in the database) makes
+ * that attack impossible from a database copy alone: the attacker would need the pepper too. The
+ * pepper is per-deployment, so one compromised server does not weaken any other.
+ *
+ * Failure mode is deliberately hard: without a pepper we REFUSE to hash numeric codes rather than
+ * silently falling back to the unkeyed digest. A quiet fallback would reintroduce the exact
+ * weakness this function exists to prevent, and nobody would notice.
+ */
+const PEPPER_ENV_VAR = 'DUOLINK_ACTIVATION_PEPPER';
+
+/** Minimum pepper length. 32 bytes of entropy as a 64-char hex string, or any 32+ char secret. */
+const MIN_PEPPER_LENGTH = 32;
+
+/** PBKDF2 work factor for the numeric code. Tuned to stay well under 100 ms server-side. */
+export const NUMERIC_CODE_PBKDF2_ITERATIONS = 120_000;
+
+let cachedPepper = null;
+
+/** Resolves the pepper, or throws if it is missing/too weak. Cached per process. */
+export function resolveActivationPepper(env = process.env) {
+  if (cachedPepper !== null) return cachedPepper;
+  const raw = env[PEPPER_ENV_VAR];
+  if (typeof raw !== 'string' || raw.length < MIN_PEPPER_LENGTH) {
+    throw new ProtocolError(
+      'server_misconfigured',
+      `${PEPPER_ENV_VAR} must be set to a secret of at least ${MIN_PEPPER_LENGTH} characters ` +
+        'before numeric invitation codes can be used (generate with: openssl rand -hex 32)',
+      503,
+    );
+  }
+  cachedPepper = Buffer.from(raw, 'utf8');
+  return cachedPepper;
+}
+
+/** Test/administration hook: clears the cached pepper so a new environment can be picked up. */
+export function resetActivationPepperCache() {
+  cachedPepper = null;
+}
+
+/** Overrides the pepper for tests. Never call this from production code. */
+export function setActivationPepperForTesting(value) {
+  cachedPepper = value === null ? null : Buffer.from(value, 'utf8');
+}
+
+/**
+ * Hash of an activation code, as stored by the server. The plaintext code is never persisted.
+ *
+ * Two parameter sets, chosen by the code shape:
+ *
+ *   numeric (33.2 bits)  -> HMAC-SHA256(pepper, code) stretched with PBKDF2-HMAC-SHA256, 120k rounds.
+ *   legacy base32 (80 bits) -> the original domain-separated SHA-256, unchanged.
+ *
+ * The legacy branch is intentionally NOT changed: 80 bits is not offline-enumerable, and leaving it
+ * byte-identical means every existing transcript, stored row and parity test keeps working. Changing
+ * it would have been churn with no security benefit and real compatibility cost.
+ *
+ * PBKDF2 is applied AFTER the HMAC, so an attacker without the pepper cannot even reach the
+ * stretching step: the cost of a guess is "must already possess the server secret".
+ */
 export function hashActivationCode(code) {
+  if (isNumericActivationCode(code)) {
+    const pepper = resolveActivationPepper();
+    const keyed = createHmac('sha256', pepper)
+      .update(Buffer.from('DUOLINK-NUMERIC-CODE-V1', 'utf8'))
+      .update(Buffer.from(code, 'utf8'))
+      .digest();
+    return pbkdf2Sync(keyed, Buffer.from('DUOLINK-NUMERIC-PBKDF2-SALT-V1', 'utf8'),
+      NUMERIC_CODE_PBKDF2_ITERATIONS, 32, 'sha256');
+  }
   return sha256(Buffer.concat([Buffer.from('DUOLINK-ACTIVATION-CODE-V1', 'utf8'), Buffer.from(code, 'utf8')]));
 }
 

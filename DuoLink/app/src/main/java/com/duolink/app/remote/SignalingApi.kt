@@ -154,9 +154,50 @@ class SignalingApi(private val client: SignalingHttpClient) {
         )
     }
 
-    fun redeemInvitation(baseUrl: String, activationCode: String, recipient: ParticipantMaterial): RedeemedInvitation {
+    /** Result of a read-only code -> invitation-id lookup. Carries no key material by construction. */
+    data class ResolvedInvitation(
+        val invitationId: String,
+        val expiresAtEpochSec: Long
+    )
+
+    /**
+     * Resolves a typed activation code to its invitation id, WITHOUT redeeming.
+     *
+     * The numeric-code flow needs this: the recipient must sign a redeem transcript that binds the
+     * invitation id, but a ten-digit code cannot carry an id the way a QR payload can. The QR flow never
+     * calls this - it already has the id from `?i=`.
+     *
+     * Read-only: the invitation stays CREATED and redeemable. Single-use is still enforced only in
+     * [redeemInvitation], so calling this twice and then redeeming once is the expected sequence.
+     *
+     * Only `invitationId` and `expiresAtEpochSec` are read from the response. Every other field the
+     * server might ever add is ignored here on purpose: the client should not start depending on
+     * unauthenticated data even if the server accidentally starts sending it.
+     */
+    fun resolveInvitationByCode(baseUrl: String, activationCode: String): ResolvedInvitation {
+        // Canonicalise HERE, at the transport boundary, not at each call site. Two devices pairing with
+        // one code must put byte-identical bytes on the wire, and a caller passing "4829137462" while
+        // another passes "482-913-7462" must not produce two semantically different requests. Putting the
+        // canonicalisation in the API means no future caller can forget it.
+        val canonical = canonicalCodeOrThrow(activationCode)
         val body = SignalingHttpClient.jsonObject(
-            "activationCode" to SignalingHttpClient.jsonString(activationCode),
+            "activationCode" to SignalingHttpClient.jsonString(canonical)
+        )
+        val obj = SignalingJson.parseObject(
+            client.execute(baseUrl, "POST", "/v1/invitations/resolve", jsonBody = body)
+        )
+        return ResolvedInvitation(
+            invitationId = SignalingJson.requireString(obj, "invitationId"),
+            expiresAtEpochSec = SignalingJson.requireLong(obj, "expiresAtEpochSec")
+        )
+    }
+
+    fun redeemInvitation(baseUrl: String, activationCode: String, recipient: ParticipantMaterial): RedeemedInvitation {
+        // Same canonicalisation as resolveInvitationByCode: the redemption request must carry exactly the
+        // canonical form the lookup used, so the server cannot see two "different" codes for one secret.
+        val canonical = canonicalCodeOrThrow(activationCode)
+        val body = SignalingHttpClient.jsonObject(
+            "activationCode" to SignalingHttpClient.jsonString(canonical),
             "recipient" to participantJson(recipient)
         )
         val obj = SignalingJson.parseObject(client.execute(baseUrl, "POST", "/v1/invitations/redeem", jsonBody = body))
@@ -166,6 +207,21 @@ class SignalingApi(private val client: SignalingHttpClient) {
             expiresAtEpochSec = SignalingJson.requireLong(obj, "expiresAtEpochSec")
         )
     }
+
+    /**
+     * Parses and canonicalises an activation code for transmission, failing closed on anything that is
+     * not a real code.
+     *
+     * Rejecting at the transport boundary matters for more than tidiness: the server's attempt budget is
+     * GLOBAL and shared by every user, so a caller that sent obvious garbage would burn a slot of that
+     * shared budget and help nobody. Failing locally costs nothing.
+     */
+    private fun canonicalCodeOrThrow(raw: String): String =
+        ActivationCode.parse(raw)?.displayForm
+            ?: throw RemotePairingException(
+                RemoteFailure.ACTIVATION_CODE_MALFORMED,
+                "قالب کد دعوت معتبر نیست"
+            )
 
     fun getInvitation(baseUrl: String, invitationId: String, token: String): InvitationView {
         val obj = SignalingJson.parseObject(

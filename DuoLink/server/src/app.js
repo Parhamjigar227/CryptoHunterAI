@@ -210,19 +210,39 @@ export function createApp({ store, serverKeys, clock = () => Date.now(), limits 
           : generateInvitationId();
         // The activation code is normally chosen by the owner, because the owner's invitation
         // transcript binds its salted hash and that signature must be produced before the upload. The
-        // server still validates the format strictly (16 symbols from the shared alphabet) and falls back
-        // to generating one for clients that do not supply it (the CLI/simulated flow).
-        const activationCode = request.body.activationCode
+        // server still validates the format strictly against the shared alphabets and falls back to
+        // generating one for clients that do not supply it (the CLI/simulated flow).
+        //
+        // Owner-supplied codes are honoured exactly: retrying a collided owner-supplied code would
+        // silently substitute a different secret than the one the owner's signature covers, so a
+        // collision there is a hard 409 the client must resolve. Server-generated codes, by contrast,
+        // are retried, because the server is the only party that knows the code and a retry is
+        // invisible - and with a 10-digit space a collision must never surface as a failed "create
+        // invitation" to a user who did nothing wrong.
+        const ownerSuppliedCode = Boolean(request.body.activationCode);
+        let activationCode = ownerSuppliedCode
           ? normaliseActivationCode(request.body.activationCode)
           : generateActivationCode();
         const ownerToken = generateBearerToken();
-        const created = store.createInvitation({
-          invitationId,
-          activationCode,
-          ownerToken,
-          owner,
-          ttlSeconds: request.body.ttlSeconds ?? INVITATION_TTL_SECONDS,
-        });
+        const MAX_CODE_ATTEMPTS = 5;
+        let created = null;
+        for (let attempt = 0; attempt < MAX_CODE_ATTEMPTS; attempt += 1) {
+          try {
+            created = store.createInvitation({
+              invitationId,
+              activationCode,
+              ownerToken,
+              owner,
+              ttlSeconds: request.body.ttlSeconds ?? INVITATION_TTL_SECONDS,
+            });
+            break;
+          } catch (error) {
+            const isCollision = error instanceof ProtocolError && error.code === 'code_collision';
+            if (!isCollision || ownerSuppliedCode || attempt === MAX_CODE_ATTEMPTS - 1) throw error;
+            // Regenerate and retry. The operator-visible path is unaffected; the user never sees this.
+            activationCode = generateActivationCode();
+          }
+        }
         return json(201, {
           invitationId: created.invitationId,
           activationCode,
@@ -231,6 +251,24 @@ export function createApp({ store, serverKeys, clock = () => Date.now(), limits 
           createdAtEpochSec: created.createdAt,
           expiresAtEpochSec: created.expiresAt,
           note: 'The activation code and owner token are returned exactly once and are never stored in plaintext.',
+        });
+      }
+
+      // Resolves a typed activation code to its invitation id so a joiner that did NOT receive a QR
+      // (numeric-code flow) can build and sign the redeem transcript. Read-only and non-mutating:
+      // redemption itself, including single-use enforcement, still happens only in /redeem below.
+      //
+      // Placed under the same 'activation' bucket as redemption because it is the same guessing surface:
+      // if it had its own budget an attacker would simply probe here instead, and the global cap would
+      // double without buying anything.
+      if (method === 'POST' && path === '/v1/invitations/resolve') {
+        enforceRate(request, 'activation');
+        const code = normaliseActivationCode(request.body?.activationCode);
+        const resolved = store.resolveInvitationByCode({ activationCode: code });
+        return json(200, {
+          invitationId: resolved.invitationId,
+          expiresAtEpochSec: resolved.expiresAtEpochSec,
+          note: 'Read-only lookup. Redemption still happens exactly once via POST /v1/invitations/redeem.',
         });
       }
 

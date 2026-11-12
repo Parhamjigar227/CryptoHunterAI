@@ -387,6 +387,41 @@ export class InvitationStore {
     }
 
     return this.#transaction(() => {
+      // ---- numeric-code collision guard ---------------------------------------------------
+      // A 10-digit space is 10^10, so collisions are not hypothetical once a deployment issues a few
+      // thousand live invitations: birthday-bounded, the odds of at least one clash among N live codes
+      // is roughly N^2 / 2*10^10. If two LIVE invitations shared a code, a joiner typing it could be
+      // silently routed to the wrong owner - precisely the "no silent connection to an unknown device"
+      // guarantee the protocol must uphold. Redemption scans rows and takes the first match, so a
+      // duplicate would not even fail loudly; it would simply pick one.
+      //
+      // Checking here, inside the same transaction as the INSERT, makes minting collision-free by
+      // construction rather than by luck. Cheap: the query is a bounded scan over at most one TTL
+      // window of live rows, and it runs once per mint, not per redemption.
+      const codeHash = hashActivationCode(activationCode);
+      const clash = this.#db
+        .prepare(
+          `SELECT 1 FROM invitations
+            WHERE code_hash = ? AND state IN (?, ?, ?) AND expires_at > ? AND purged_at IS NULL
+            LIMIT 1`
+        )
+        .all(
+          codeHash,
+          InvitationState.CREATED,
+          InvitationState.REDEEMED,
+          InvitationState.COMMITS_PARTIAL,
+          createdAt
+        );
+      if (clash.length > 0) {
+        const error = new ProtocolError(
+          'code_collision',
+          'Generated invitation code collides with a live invitation; retry generation',
+          409
+        );
+        error.retryable = true;
+        throw error;
+      }
+
       this.#db
         .prepare(
           `INSERT INTO invitations (
@@ -403,7 +438,7 @@ export class InvitationStore {
           InvitationState.CREATED,
           createdAt,
           expiresAt,
-          hashActivationCode(activationCode),
+          codeHash,
           hashBearerToken(ownerToken),
           normalised.deviceId,
           normalised.identitySpki,
@@ -424,6 +459,68 @@ export class InvitationStore {
    * Redeems an activation code exactly once. Failed attempts are counted on the invitation so a
    * brute-force loop is throttled even when it rotates source addresses.
    */
+  /**
+   * Resolves an activation code to its invitation id, WITHOUT redeeming, mutating or leaking anything.
+   *
+   * WHY THIS MUST EXIST (and why the numeric flow is impossible without it):
+   * The recipient's redeem transcript binds `invitationId`, and the recipient must SIGN that transcript
+   * before it can call `/v1/invitations/redeem` - the signature is part of the redeem request. The QR
+   * flow carries the invitation id inside the QR payload (`?c=&i=&s=`), so the joiner has it up front.
+   * A ten-digit code cannot carry an id, so without a way to resolve code -> id the joiner cannot
+   * construct a transcript to sign, and redemption is impossible. That is a hard protocol-level
+   * incompatibility, not a UI gap.
+   *
+   * SECURITY PROPERTIES — this method is deliberately the weakest-privileged operation in the store:
+   *   - returns ONLY `{ invitationId, expiresAtEpochSec }`; no keys, no tokens, no device ids, no
+   *     activation code, nothing that could help an attacker beyond confirming a code exists;
+   *   - does NOT change state. Redemption (and therefore single-use enforcement) still happens exactly
+   *     once, later, in the redeem transaction. Resolving twice is harmless; redeeming twice is not;
+   *   - applies the same peppered-hash lookup as redemption, so a stolen database yields no codes;
+   *   - refuses expired and already-redeemed invitations exactly like redemption does, so a lookup can
+   *     never reveal an id for a dead invitation.
+   *
+   * The offline-oracle caveat is unchanged by this endpoint: an attacker who can already call it online
+   * is bounded by the global activation bucket, which is strictly tighter than the database-leak path
+   * documented in `hashActivationCode()`.
+   */
+  resolveInvitationByCode({ activationCode }) {
+    const codeHash = hashActivationCode(activationCode);
+    return this.#transaction(() => {
+      const candidates = this.#db
+        .prepare(
+          `SELECT * FROM invitations
+            WHERE state IN (?, ?, ?) AND expires_at > ? AND purged_at IS NULL`
+        )
+        .all(
+          InvitationState.CREATED,
+          InvitationState.REDEEMED,
+          InvitationState.COMMITS_PARTIAL,
+          nowSec(this.#clock)
+        )
+        .map(InvitationStore.#normaliseRow);
+
+      const match = candidates.find((row) => row && safeEquals(row.code_hash, codeHash));
+      // Identical error shape and status to a failed redemption, so the two endpoints cannot be
+      // distinguished by an attacker probing for "code exists but was already used".
+      if (!match) {
+        throw new ProtocolError('invalid_activation_code', 'Activation code is invalid or already used', 404);
+      }
+      const row = this.#requireLive(match);
+      // Mirror redemption's state gate EXACTLY. Resolving a redeemed or expired invitation must fail
+      // with the same code and status that redeeming it would, otherwise this endpoint becomes a
+      // cheaper, differently-shaped probe: an attacker could distinguish "never existed" from "already
+      // used" here without spending the redeem path's validation work, and the joiner would be told a
+      // dead invitation is still current.
+      if (row.state !== InvitationState.CREATED) {
+        throw new ProtocolError('already_redeemed', 'This invitation has already been redeemed', 409);
+      }
+      if (row.protocol_version !== PROTOCOL_VERSION) {
+        throw new ProtocolError('unsupported_version', 'Invitation uses an unsupported protocol version', 409);
+      }
+      return { invitationId: row.invitation_id, expiresAtEpochSec: row.expires_at };
+    });
+  }
+
   redeemInvitation({ activationCode, recipient, invitationIdHint = null }) {
     const codeHash = hashActivationCode(activationCode);
     if (invitationIdHint) this.#expireIfNeeded(invitationIdHint);

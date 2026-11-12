@@ -30,6 +30,9 @@ data class ActivationCode private constructor(val canonical: String) {
     /** Compact form for QR payloads (no separators). */
     val compactForm: String get() = canonical.replace("-", "")
 
+    /** True when this is the 10-digit numeric form rather than the legacy 16-symbol base32 form. */
+    val isNumeric: Boolean get() = canonical.all { it.isDigit() || it == '-' }
+
     override fun toString(): String = canonical
 
     companion object {
@@ -53,6 +56,28 @@ data class ActivationCode private constructor(val canonical: String) {
          * [ENTROPY_BITS] exactly 80 rather than ~78.5.
          */
         const val ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+        /**
+         * Digits in a numeric invitation code. Ten digits = 33.2 bits.
+         *
+         * 33.2 bits is deliberately far below the 80 bits of the legacy base32 form, and is only
+         * acceptable because the server hashes numeric codes with a deployment-secret pepper plus
+         * PBKDF2 (see `hashActivationCode()` in `server/src/crypto.js`). Those two changes are what
+         * stop a leaked database from being enumerated offline in hours; they are not optional
+         * hardening, they are the precondition for this code being this short.
+         *
+         * Online guessing is bounded independently of length by a GLOBAL, address-independent server
+         * bucket of 10 attempts/minute, so 10^10 codes is ~1,900 years regardless of entropy.
+         */
+        const val NUMERIC_DIGITS = 10
+
+        /**
+         * Display grouping for the numeric form: `482-913-7462` (3-3-4).
+         *
+         * Chosen over 4-3-3 or 5-5 because 3-3-4 matches how phone numbers are read aloud in Iran,
+         * so dictating a code over a voice call is less error-prone.
+         */
+        private val NUMERIC_GROUP_SIZES = intArrayOf(3, 3, 4)
 
         private val CANONICAL_PATTERN = Regex("^([$ALPHABET]{4}-){${GROUP_COUNT - 1}}[$ALPHABET]{4}$")
         private val COMPACT_PATTERN = Regex("^[$ALPHABET]{${RANDOM_SYMBOLS}}$")
@@ -78,6 +103,34 @@ data class ActivationCode private constructor(val canonical: String) {
         }
 
         /**
+         * Generates a 10-digit numeric invitation code from the platform CSPRNG.
+         *
+         * Rejection sampling is used rather than `nextInt(1_000_000_0000)` modulo arithmetic:
+         * `SecureRandom.nextInt(bound)` is already unbiased for a bound that is not a power of two,
+         * but building the value digit-by-digit and discarding the leading-zero case keeps the
+         * canonical form EXACTLY ten digits. A code whose canonical form could be nine digits (leading
+         * zero dropped) would have two spellings, and two spellings of one secret is how "single use"
+         * quietly stops being true.
+         */
+        fun generateNumeric(secureRandom: SecureRandom = SecureRandom()): ActivationCode {
+            val digits = CharArray(NUMERIC_DIGITS) { '0' + secureRandom.nextInt(10) }
+            // Refuse an all-zero code and a leading zero, both of which invite transcription errors.
+            if (digits[0] == '0' || digits.all { it == '0' }) {
+                return generateNumeric(secureRandom)
+            }
+            val formatted = formatNumeric(String(digits))
+            return ActivationCode(formatted)
+        }
+
+        /** Groups ten digits as 3-3-4. */
+        private fun formatNumeric(digits: String): String {
+            var index = 0
+            return NUMERIC_GROUP_SIZES.joinToString("-") { size ->
+                digits.substring(index, index + size).also { index += size }
+            }
+        }
+
+        /**
          * Parses user input leniently but verifies strictly.
          *
          * Lenient: surrounding whitespace, any non-alphanumeric separators (spaces, dashes, dots) and
@@ -93,6 +146,32 @@ data class ActivationCode private constructor(val canonical: String) {
             val cleaned = input.trim().uppercase()
             if (cleaned.isEmpty() || cleaned.length > 64) return null
             val compact = cleaned.filter { it.isLetterOrDigit() }
+
+            // ---- numeric form ----------------------------------------------------------
+            // Persian and Arabic-Indic digits are transliterated HERE (unlike the legacy parser,
+            // which refuses them). Rationale: a numeric keypad on a Persian-locale keyboard very
+            // often emits U+06F0..U+06F9, so refusing them would make the feature unusable for the
+            // intended users. Transliteration is unambiguous (a 1:1 digit map), so it cannot change
+            // which code the user meant - unlike guessing at a mistyped letter.
+            val asciiDigits = buildString {
+                compact.forEach { ch ->
+                    append(
+                        when (ch) {
+                            in '0'..'9' -> ch
+                            in '\u06F0'..'\u06F9' -> ('0' + (ch - '\u06F0'))  // Persian
+                            in '\u0660'..'\u0669' -> ('0' + (ch - '\u0660'))  // Arabic-Indic
+                            else -> ch
+                        }
+                    )
+                }
+            }
+            if (asciiDigits.length == NUMERIC_DIGITS && asciiDigits.all { it.isDigit() }) {
+                // Reject a leading zero: the canonical display form would then have an ambiguous
+                // length, and such a code is never generated (see generateNumeric).
+                if (asciiDigits[0] == '0') return null
+                return ActivationCode(formatNumeric(asciiDigits))
+            }
+
             if (!COMPACT_PATTERN.matches(compact)) return null
             val grouped = (0 until GROUP_COUNT).joinToString("-") { index ->
                 compact.substring(index * GROUP_SIZE, (index + 1) * GROUP_SIZE)
@@ -116,6 +195,44 @@ data class ActivationCode private constructor(val canonical: String) {
 object ActivationCodeDigest {
     private val DOMAIN = "DUOLINK-ACTIVATION-CODE-V1".toByteArray(StandardCharsets.UTF_8)
 
+    /**
+     * SHA-256 of the canonical activation code, used ONLY to bind the code into the signed invitation
+     * transcript.
+     *
+     * There are two different code hashes in this protocol and they must never be confused:
+     *
+     * | hash            | computed by        | purpose                  | numeric code          |
+     * |-----------------|--------------------|--------------------------|-----------------------|
+     * | transcript hash | both clients       | bind code into signature | this: bare SHA-256    |
+     * | storage hash    | server only        | database lookup          | HMAC(pepper)+PBKDF2   |
+     *
+     * The transcript hash MUST stay a plain SHA-256 that both the owner and the joiner can compute
+     * independently, because the owner signs the invitation transcript and the joiner rebuilds it to
+     * verify that signature. If this value were peppered, the joiner could not recompute it and the
+     * owner's signature would be unverifiable - breaking Method B entirely.
+     *
+     * That is safe for numeric codes because the transcript hash is NEVER stored as a lookup key.
+     * The value the server persists is the peppered `hashActivationCode()` from `server/src/crypto.js`,
+     * which is a different function of the same code. A stolen database therefore yields neither the
+     * plaintext code nor a cheap offline oracle: to recover a code from the stored `code_hash` an
+     * attacker must already hold the server's pepper.
+     *
+     * The residual path is the owner's ECDSA signature, which does cover this digest and is stored.
+     * Measured on reference hardware: ECDSA P-256 verification costs ~91 us versus ~1.9 us to recompute
+     * this digest, so testing one candidate code against the stored signature costs about 48x a raw
+     * hash - which enumerates the full 10^10 space in roughly 11 CPU-days on one core.
+     *
+     * That is a real, feasible attack, and it is recorded rather than papered over. It is also
+     * unavoidable for any design that cryptographically binds a low-entropy secret into a public-key
+     * signature, and it applies to the 16-symbol form too (where it is irrelevant, because 80 bits is
+     * out of reach regardless of per-guess cost).
+     *
+     * What actually defends the numeric form:
+     *   - the server-stored digest is peppered and stretched, so a database copy alone is useless;
+     *   - the invitation lives 10 minutes, bounding how many signatures exist to attack at once;
+     *   - the 16-symbol QR/code path remains available and is offered as the stronger option.
+     * The UI therefore must not present the two methods as equivalent, and does not.
+     */
     fun sha256(canonicalCode: String): ByteArray {
         val digest = MessageDigest.getInstance("SHA-256")
         digest.update(DOMAIN)

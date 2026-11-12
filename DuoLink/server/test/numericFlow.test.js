@@ -335,6 +335,28 @@ test('resolve cannot be used to bypass single use', async () => {
   });
 });
 
+test('resolve refuses a cancelled (revoked) invitation', async () => {
+  // The brief requires that a code the owner cancelled stops working immediately. Redemption is
+  // covered elsewhere; resolution is the other way in, and it must apply the same state gate or a
+  // cancelled code would still be resolvable.
+  await withNumericServer(async () => {
+    const { app } = createTestServer();
+    const { client, created } = await mintNumeric(app, '482-913-7462');
+    ok(
+      await client.call('POST', `/v1/invitations/${created.invitationId}/revoke`, {
+        token: created.ownerToken,
+        body: { reason: 'owner_cancelled' },
+      }),
+    );
+
+    const resolver = new TestClient(app);
+    const res = await resolver.call('POST', '/v1/invitations/resolve', {
+      body: { activationCode: '482-913-7462' },
+    });
+    assert.ok(res.status >= 400, `a revoked code must not resolve, got ${res.status}`);
+  });
+});
+
 test('resolve refuses an expired invitation', async () => {
   await withNumericServer(async () => {
     let now = Date.now();

@@ -61,16 +61,6 @@ class QrRenderDecodeRoundTripTest {
         return QRCodeWriter().encode(payload, BarcodeFormat.QR_CODE, exact, exact, hints)
     }
 
-    /** The old behaviour, kept so a test can prove the old behaviour was what failed. */
-    private fun encodeDivided(payload: String, sizePx: Int, margin: Int): com.google.zxing.common.BitMatrix {
-        val hints = EnumMap<EncodeHintType, Any>(EncodeHintType::class.java).apply {
-            put(EncodeHintType.CHARACTER_SET, "UTF-8")
-            put(EncodeHintType.ERROR_CORRECTION, ErrorCorrectionLevel.M)
-            put(EncodeHintType.MARGIN, margin)
-        }
-        return QRCodeWriter().encode(payload, BarcodeFormat.QR_CODE, sizePx, sizePx, hints)
-    }
-
     /**
      * Reproduces what the camera path does: a YUV_420_888 Y plane with an interleaved pixel stride and
      * extra row padding from the ISP, then the contiguous extraction the app performs. The extraction
@@ -250,30 +240,54 @@ class QrRenderDecodeRoundTripTest {
     }
 
     /**
-     * Documents the defect that the integer-module-size change fixes, so the fix cannot be undone by
-     * accident: rendering into exactly 420px produces fractional module widths for most payload
-     * lengths, and a measurable fraction of those do not survive a round trip.
+     * Records WHY the pure-barcode pass exists, without pinning a fragile count.
      *
-     * The assertion here is on the OLD path only. It is not "flakiness is acceptable" - it is a
-     * characterisation test that fails loudly if someone reverts to divided rendering and the failures
-     * come back, while the test above proves the new path has none.
+     * The detector-only path (no PURE_BARCODE) fails for some payload lengths. How many, and which,
+     * depends on ZXing's mask-pattern selection, so asserting "exactly 10 lengths fail" would break on
+     * any ZXing upgrade for no benefit. The direction is what matters: the detector alone is not
+     * sufficient, so deleting the fallback would bring the failure back.
+     *
+     * If this ever reports zero, PURE_BARCODE has become unnecessary - the message says so, instead of
+     * failing in a way that reads like a regression.
      */
     @Test
-    fun dividedRenderingIsWhatProducedFractionalModulesAndNullDecodes() {
-        val failures = mutableListOf<Int>()
+    fun theDetectorAloneIsNotEnoughWhichIsWhyThePureBarcodePassExists() {
+        val detectorOnly = mutableListOf<Int>()
         for (length in lengthWindow) {
             val payload = payloadOfLength(length)
-            // Deliberately the old strategy: request exactly 420px and let ZXing divide.
-            val matrix = encodeDivided(payload, sizePx = productionSizePx, margin = appMargin)
+            val matrix = encode(payload, sizePx = productionSizePx, margin = appMargin)
             val luminance = throughCameraPlane(matrix, pixelStride = 2, extraRowBytes = 32)
-            if (decodeLuminance(luminance, matrix.width, matrix.height) != payload) failures += length
+            if (decodeWithDetectorOnly(luminance, matrix.width, matrix.height) != payload) {
+                detectorOnly += length
+            }
         }
         assertTrue(
-            failures.isNotEmpty(),
-            "Expected the divided-rendering path to fail for some payload lengths. If this passes, the " +
-                "integer-module-size change may no longer be necessary - verify against a real device " +
-                "before removing it."
+            detectorOnly.isNotEmpty(),
+            "The detector-only path now reads every payload length, which means the PURE_BARCODE fallback " +
+                "in QrBitmapCodec.decodeLuminance may be removable. That is a finding to act on deliberately " +
+                "after checking a real device - not something to delete on the strength of one CI run."
         )
+    }
+
+    /** The first two decode passes only, no PURE_BARCODE. Measures the fallback's contribution. */
+    private fun decodeWithDetectorOnly(luminance: ByteArray, width: Int, height: Int): String? {
+        val hints = EnumMap<DecodeHintType, Any>(DecodeHintType::class.java).apply {
+            put(DecodeHintType.CHARACTER_SET, "UTF-8")
+            put(DecodeHintType.TRY_HARDER, true)
+            put(DecodeHintType.POSSIBLE_FORMATS, listOf(BarcodeFormat.QR_CODE))
+        }
+        val source = PlanarYUVLuminanceSource(luminance, width, height, 0, 0, width, height, false)
+        val reader = QRCodeReader()
+        try {
+            return reader.decode(BinaryBitmap(HybridBinarizer(source)), hints).text
+        } catch (_: Exception) {
+            reader.reset()
+        }
+        return try {
+            reader.decode(BinaryBitmap(GlobalHistogramBinarizer(source)), hints).text
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /**

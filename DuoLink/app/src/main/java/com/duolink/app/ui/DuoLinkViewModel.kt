@@ -1,6 +1,27 @@
 package com.duolink.app.ui
 
 import android.app.Application
+import com.duolink.app.crypto.ByteEncoding
+import com.duolink.app.lock.AppLockPolicy
+import com.duolink.app.lock.AppLockRecord
+import com.duolink.app.lock.AppLockVerifier
+import com.duolink.app.lock.PinDerivation
+import com.duolink.app.lock.PinRules
+import com.duolink.app.lock.SealedAppLockStore
+import com.duolink.app.media.MediaKeyManager
+import com.duolink.app.media.MediaVault
+import com.duolink.app.messaging.ChatMessage
+import com.duolink.app.messaging.ConnectionState
+import com.duolink.app.messaging.ConversationEngine
+import com.duolink.app.messaging.ConversationKeySchedule
+import com.duolink.app.messaging.ConversationStore
+import com.duolink.app.messaging.HttpRelayClient
+import com.duolink.app.messaging.MessageType
+import com.duolink.app.messaging.RelayMessageTransport
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import android.graphics.Bitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -33,6 +54,33 @@ data class DuoLinkUiState(
     val isErrorBanner: Boolean = false
 )
 
+/**
+ * What the lock screen must show.
+ *
+ * [isUnlocked] is the only thing the navigation graph checks. Everything else is presentation.
+ * [storageCorrupted] is a distinct, loud state: it means the lock record exists but cannot be
+ * authenticated, so the app must not pretend "there is no lock" and let the user in.
+ */
+data class AppLockUiState(
+    val isConfigured: Boolean = false,
+    val isUnlocked: Boolean = false,
+    val storageCorrupted: Boolean = false,
+    val errorPersian: String? = null,
+    val lockoutRemainingSeconds: Long = 0L,
+    val biometricAvailable: Boolean = false,
+    val isCreating: Boolean = false,
+    val awaitingConfirmation: Boolean = false
+)
+
+/** Everything the chat screen needs. */
+data class ConversationUiState(
+    val messages: List<ChatMessage> = emptyList(),
+    val connectionState: ConnectionState = ConnectionState.OFFLINE,
+    val peerDisplayName: String = "طرف مقابل",
+    val isSending: Boolean = false,
+    val errorPersian: String? = null
+)
+
 class DuoLinkViewModel(application: Application) : AndroidViewModel(application) {
 
     private val trustDir = File(application.filesDir, "duolink_trust_v1")
@@ -45,6 +93,36 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
     )
     private val trustStore = PeerTrustStore(store = byteStore, sealer = sealer)
     private val coordinator = PairingCoordinator(keyVault = keyVault, trustStore = trustStore)
+
+    /** App-lock gate. The record is stored only as an AES-256-GCM sealed blob. */
+    private val appLockStore = SealedAppLockStore(byteStore, sealer)
+
+    /** Encrypted attachment storage, created lazily once the media master key is available. */
+    private val mediaKeyManager = MediaKeyManager(byteStore, sealer)
+    val mediaVault: MediaVault? by lazy {
+        when (val state = mediaKeyManager.obtainOrCreate()) {
+            is MediaKeyManager.KeyState.Ready ->
+                MediaVault(File(application.filesDir, "duolink_media_v1"), state.masterKey)
+            // A corrupted media key is not silently replaced: doing so would orphan every attachment.
+            else -> null
+        }
+    }
+
+    private val relayHttp = HttpRelayClient()
+
+    /** The live conversation engine, present only while paired and unlocked. */
+    private var conversationEngine: ConversationEngine? = null
+    private var relayTransport: RelayMessageTransport? = null
+
+    private val _lockState = MutableStateFlow(AppLockUiState())
+    val lockState: StateFlow<AppLockUiState> = _lockState.asStateFlow()
+
+    private val _conversation = MutableStateFlow(ConversationUiState())
+    val conversation: StateFlow<ConversationUiState> = _conversation.asStateFlow()
+
+    /** Wall-clock of the last successful unlock, used for auto-lock. */
+    private var lastUnlockAtMs: Long = 0L
+    private var pendingNewPin: String? = null
 
     private val _uiState = MutableStateFlow(DuoLinkUiState())
     val uiState: StateFlow<DuoLinkUiState> = _uiState.asStateFlow()
@@ -304,4 +382,340 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
     fun dismissBanner() {
         _uiState.update { it.copy(statusBannerPersian = null) }
     }
+
+    // =====================================================================================
+    // App lock
+    // =====================================================================================
+
+    /** Reads the lock configuration and decides whether the gate must be shown. */
+    fun refreshLockState(biometricAvailable: Boolean) {
+        viewModelScope.launch {
+            val loaded = withContext(Dispatchers.IO) { appLockStore.read() }
+            _lockState.value = when (loaded) {
+                is SealedAppLockStore.LockRead.Absent ->
+                    // No lock yet: the user is asked to create one before any conversation exists.
+                    AppLockUiState(
+                        isConfigured = false,
+                        isUnlocked = false,
+                        isCreating = false,
+                        biometricAvailable = biometricAvailable
+                    )
+                is SealedAppLockStore.LockRead.Configured -> {
+                    val lockedOut = AppLockPolicy.isLockedOut(loaded.record, System.currentTimeMillis())
+                    _lockState.value.copy(
+                        isConfigured = true,
+                        storageCorrupted = false,
+                        biometricAvailable = biometricAvailable,
+                        lockoutRemainingSeconds = if (lockedOut) {
+                            AppLockPolicy.remainingLockoutMs(loaded.record, System.currentTimeMillis()) / 1000
+                        } else {
+                            0L
+                        }
+                    )
+                }
+                is SealedAppLockStore.LockRead.Corrupted ->
+                    // Fail closed: never treat a damaged record as "no lock configured".
+                    _lockState.value.copy(
+                        isConfigured = true,
+                        isUnlocked = false,
+                        storageCorrupted = true,
+                        errorPersian = "پروندهٔ قفل برنامه آسیب دیده است. برای بازگردانی، برنامه را دوباره نصب کنید یا از بازیابی استفاده کنید."
+                    )
+            }
+        }
+    }
+
+    /** Submits a PIN for unlock, or collects the two-step creation flow. */
+    fun submitPin(pin: String) {
+        val state = _lockState.value
+        if (state.isCreating || !state.isConfigured) {
+            handlePinCreation(pin)
+            return
+        }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { attemptUnlock(pin) }
+            _lockState.value = result
+        }
+    }
+
+    private fun attemptUnlock(pin: String): AppLockUiState {
+        val loaded = appLockStore.read()
+        val current = _lockState.value
+        when (loaded) {
+            is SealedAppLockStore.LockRead.Absent -> return current.copy(isUnlocked = true)
+            is SealedAppLockStore.LockRead.Corrupted ->
+                return current.copy(isUnlocked = false, storageCorrupted = true)
+            is SealedAppLockStore.LockRead.Configured -> {
+                val now = System.currentTimeMillis()
+                if (AppLockPolicy.isLockedOut(loaded.record, now)) {
+                    return current.copy(
+                        errorPersian = null,
+                        lockoutRemainingSeconds = AppLockPolicy.remainingLockoutMs(loaded.record, now) / 1000
+                    )
+                }
+                return if (AppLockVerifier.verify(pin, loaded.record)) {
+                    // Clear the failure counter on success, and persist the cleared counter.
+                    appLockStore.write(AppLockPolicy.registerSuccess(loaded.record))
+                    lastUnlockAtMs = now
+                    current.copy(
+                        isUnlocked = true,
+                        errorPersian = null,
+                        lockoutRemainingSeconds = 0L
+                    ).also { onUnlocked() }
+                } else {
+                    val updated = AppLockPolicy.registerFailure(loaded.record, now)
+                    appLockStore.write(updated)
+                    val remaining = AppLockPolicy.remainingLockoutMs(updated, now) / 1000
+                    current.copy(
+                        isUnlocked = false,
+                        errorPersian = "رمز اشتباه است.",
+                        lockoutRemainingSeconds = remaining
+                    )
+                }
+            }
+        }
+    }
+
+    /** Starts the two-step "choose a PIN" flow. */
+    fun beginPinCreation() {
+        _lockState.value = _lockState.value.copy(
+            isCreating = true,
+            awaitingConfirmation = false,
+            errorPersian = null
+        )
+    }
+
+    private fun handlePinCreation(pin: String) {
+        val pending = pendingNewPin
+        if (pending == null) {
+            val rejection = PinRules.rejectionReason(pin)
+            if (rejection != null) {
+                _lockState.value = _lockState.value.copy(errorPersian = rejection)
+                return
+            }
+            pendingNewPin = pin
+            _lockState.value = _lockState.value.copy(
+                isCreating = true,
+                awaitingConfirmation = true,
+                errorPersian = null
+            )
+            return
+        }
+        if (pending != pin) {
+            pendingNewPin = null
+            _lockState.value = _lockState.value.copy(
+                isCreating = true,
+                awaitingConfirmation = false,
+                errorPersian = "رمزها یکسان نبودند. دوباره تلاش کنید."
+            )
+            return
+        }
+        viewModelScope.launch {
+            val record = withContext(Dispatchers.IO) {
+                AppLockVerifier.createRecord(pin, System.currentTimeMillis())
+            }
+            withContext(Dispatchers.IO) { appLockStore.write(record) }
+            pendingNewPin = null
+            lastUnlockAtMs = System.currentTimeMillis()
+            _lockState.value = _lockState.value.copy(
+                isConfigured = true,
+                isUnlocked = true,
+                isCreating = false,
+                awaitingConfirmation = false,
+                errorPersian = null,
+                storageCorrupted = false
+            )
+            withContext(Dispatchers.Main) { onUnlocked() }
+        }
+    }
+
+    /**
+     * Called after a biometric success reported by the platform.
+     *
+     * This does NOT re-verify the PIN: the OS already proved the user is the enrolled biometric holder
+     * and released the auth-bound Keystore key. It also does not weaken the PIN gate — the PIN still
+     * guards a cold start and a biometric failure falls back to it.
+     */
+    fun onBiometricUnlocked() {
+        lastUnlockAtMs = System.currentTimeMillis()
+        _lockState.value = _lockState.value.copy(
+            isUnlocked = true,
+            errorPersian = null,
+            lockoutRemainingSeconds = 0L
+        )
+        onUnlocked()
+    }
+
+    /** Re-arms the gate. Called on a lifecycle stop and when no PIN has been entered for a while. */
+    fun lockNow() {
+        if (!_lockState.value.isConfigured) return
+        conversationEngine?.setConnectionState(ConnectionState.OFFLINE)
+        relayTransport?.disconnectSocket()
+        _lockState.value = _lockState.value.copy(isUnlocked = false)
+    }
+
+    fun autoLockIfIdle(idleThresholdMs: Long = AppLockPolicy.AUTO_LOCK_AFTER_MS) {
+        if (!_lockState.value.isUnlocked) return
+        if (System.currentTimeMillis() - lastUnlockAtMs >= idleThresholdMs) lockNow()
+    }
+
+    fun updateLockoutCountdown(seconds: Long) {
+        if (_lockState.value.lockoutRemainingSeconds == seconds) return
+        _lockState.value = _lockState.value.copy(lockoutRemainingSeconds = seconds)
+    }
+
+    fun clearLockError() {
+        if (_lockState.value.errorPersian == null) return
+        _lockState.value = _lockState.value.copy(errorPersian = null)
+    }
+
+    // =====================================================================================
+    // Conversation
+    // =====================================================================================
+
+    /**
+     * Builds (or rebuilds) the conversation engine for the current paired peer.
+     *
+     * Called only after the app is unlocked and a peer is paired, so key material is never derived
+     * while the gate is closed.
+     */
+    fun openConversation(serverBaseUrl: String) {
+        val paired = _uiState.value.pairingState as? PairingStateSnapshot.PairedActive ?: run {
+            _conversation.value = _conversation.value.copy(
+                errorPersian = "برای گفتگو ابتدا باید با دستگاه دیگر جفت شوید."
+            )
+            return
+        }
+        val localIdHex = _uiState.value.localDeviceIdHex
+        if (localIdHex.isBlank()) {
+            _conversation.value = _conversation.value.copy(
+                errorPersian = "هویت دستگاه در دسترس نیست."
+            )
+            return
+        }
+        viewModelScope.launch {
+            val engine = withContext(Dispatchers.IO) {
+                buildEngine(paired.peerRecord, serverBaseUrl)
+            }
+            if (engine == null) {
+                _conversation.value = _conversation.value.copy(
+                    errorPersian = "کلید گفتگو در دسترس نیست. لطفاً دوباره جفت شوید."
+                )
+                return@launch
+            }
+            engine.addListener { messages, state ->
+                _conversation.value = _conversation.value.copy(
+                    messages = messages,
+                    connectionState = state
+                )
+            }
+            withContext(Dispatchers.IO) {
+                engine.loadHistory()
+                runCatching { engine.syncOnce() }
+            }
+            engine.setConnectionState(
+                if (relayTransport?.socketConnected == true) ConnectionState.ONLINE
+                else ConnectionState.CONNECTING
+            )
+        }
+    }
+
+    private fun buildEngine(peer: PairedPeerRecord, serverBaseUrl: String): ConversationEngine? {
+        val localIdHex = _uiState.value.localDeviceIdHex
+        val localDeviceId = runCatching { ByteEncoding.fromHexStrict(localIdHex) }.getOrNull()
+            ?: return null
+        val peerDeviceId = peer.peerDeviceId
+        val rootKey = peer.rootPairingKey
+
+        // Both devices must agree on which id is the "initiator" so the directional keys line up.
+        val initiatorId: ByteArray
+        val responderId: ByteArray
+        val localIsInitiator =
+            ByteEncoding.compareLexicographically(localDeviceId, peerDeviceId) < 0
+        if (localIsInitiator) {
+            initiatorId = localDeviceId
+            responderId = peerDeviceId
+        } else {
+            initiatorId = peerDeviceId
+            responderId = localDeviceId
+        }
+
+        val i2r = ConversationKeySchedule.initiatorToResponderKey(rootKey, initiatorId, responderId)
+        val r2i = ConversationKeySchedule.responderToInitiatorKey(rootKey, initiatorId, responderId)
+        val ctl = ConversationKeySchedule.controlKey(rootKey, initiatorId, responderId)
+
+        val store = ConversationStore(byteStore, sealer, ByteEncoding.toHexLower(peerDeviceId))
+        val transport = RelayMessageTransport(serverBaseUrl, localDeviceId, relayHttp)
+        relayTransport = transport
+        val engine = ConversationEngine(
+            store = store,
+            transport = transport,
+            localDeviceId = localDeviceId,
+            peerDeviceId = peerDeviceId,
+            sendKey = if (localIsInitiator) i2r else r2i,
+            receiveKey = if (localIsInitiator) r2i else i2r,
+            controlKey = ctl
+        )
+        conversationEngine = engine
+        return engine
+    }
+
+    fun sendMessage(text: String) {
+        val engine = conversationEngine ?: return
+        if (!_lockState.value.isUnlocked) return
+        viewModelScope.launch {
+            _conversation.value = _conversation.value.copy(isSending = true, errorPersian = null)
+            val result = withContext(Dispatchers.IO) { engine.sendText(text) }
+            _conversation.value = _conversation.value.copy(
+                isSending = false,
+                errorPersian = result.exceptionOrNull()?.let { "پیام ارسال نشد. دوباره تلاش کنید." }
+            )
+        }
+    }
+
+    fun retryMessage(messageIdHex: String) {
+        val engine = conversationEngine ?: return
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { engine.retry(messageIdHex) }
+        }
+    }
+
+    fun markConversationRead() {
+        val engine = conversationEngine ?: return
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching { engine.markAllRead() }
+                runCatching { engine.syncOnce() }
+            }
+        }
+    }
+
+    /** One polling tick for the fallback path. The socket, when live, pushes instead. */
+    fun syncConversation() {
+        val engine = conversationEngine ?: return
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { runCatching { engine.syncOnce() } }
+            if (result.isFailure) {
+                val current = _conversation.value.connectionState
+                if (current != ConnectionState.OFFLINE) {
+                    engine.setConnectionState(ConnectionState.RECONNECTING)
+                }
+            } else if (relayTransport?.socketConnected != true) {
+                engine.setConnectionState(ConnectionState.ONLINE)
+            }
+        }
+    }
+
+    fun closeConversation() {
+        relayTransport?.disconnectSocket()
+        conversationEngine?.setConnectionState(ConnectionState.OFFLINE)
+        conversationEngine = null
+        relayTransport = null
+    }
+
+    /** Runs once the gate opens, so nothing heavy happens while the lock screen is up. */
+    private fun onUnlocked() {
+        refreshIdentityAndState()
+    }
+
 }

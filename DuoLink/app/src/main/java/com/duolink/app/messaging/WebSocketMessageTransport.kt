@@ -244,7 +244,7 @@ internal class WsClient(
  * because the socket happened to be reconnecting at that instant. Duplicate delivery is harmless
  * because the engine de-duplicates by message id.
  */
-class RelayMessageTransport(
+internal class RelayMessageTransport(
     baseUrl: String,
     private val localDeviceId: ByteArray,
     private val httpRelay: HttpRelayClient,

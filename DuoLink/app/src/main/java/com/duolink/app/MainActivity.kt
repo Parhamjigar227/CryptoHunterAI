@@ -2,7 +2,7 @@ package com.duolink.app
 
 import android.os.Bundle
 import android.view.WindowManager
-import androidx.activity.ComponentActivity
+import androidx.fragment.app.FragmentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -76,8 +76,22 @@ import com.duolink.app.ui.SurfaceElevated
 import com.duolink.app.ui.TextIvory
 import com.duolink.app.ui.TextMuted
 import com.duolink.app.ui.WarningAmber
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.duolink.app.lock.BiometricUnlockGate
+import com.duolink.app.ui.AppLockScreen
+import com.duolink.app.ui.AppLockUiState
+import com.duolink.app.ui.ConversationScreen
+import com.duolink.app.ui.LockScreenMode
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Global Privacy Mode enabled by default: block OS screenshots & Recents previews.
@@ -99,6 +113,44 @@ class MainActivity : ComponentActivity() {
 fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
     val navController = rememberNavController()
     val uiState by duoViewModel.uiState.collectAsState()
+    val lockState by duoViewModel.lockState.collectAsState()
+    val conversation by duoViewModel.conversation.collectAsState()
+    val activity = LocalContext.current as? FragmentActivity
+
+    // The lock gate is installed the first time the app runs and re-armed on every cold start.
+    LaunchedEffect(Unit) {
+        val biometricAvailable = activity
+            ?.let { BiometricUnlockGate(it).availability() is BiometricUnlockGate.Availability.Available }
+            ?: false
+        duoViewModel.refreshLockState(biometricAvailable)
+    }
+
+    // Re-arm when the app goes to the background, so switching apps does not leave it open.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                duoViewModel.lockNow()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // While locked, nothing else in the graph is reachable.
+    val showLockGate = lockState.isConfigured.let { configured ->
+        configured && !lockState.isUnlocked
+    } || (!lockState.isConfigured && !lockState.isUnlocked && !lockState.storageCorrupted)
+
+    if (showLockGate) {
+        AppLockGate(
+            lockState = lockState,
+            activity = activity,
+            onPinSubmitted = duoViewModel::submitPin,
+            onBiometricUnlocked = duoViewModel::onBiometricUnlocked
+        )
+        return
+    }
 
     NavHost(navController = navController, startDestination = "home") {
         composable("home") {
@@ -138,6 +190,35 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
                         launchSingleTop = true
                     }
                 }
+            )
+        }
+        composable("conversation") {
+            LaunchedEffect(Unit) {
+                duoViewModel.openConversation(DEFAULT_RELAY_BASE_URL)
+                duoViewModel.markConversationRead()
+            }
+            // Polling fallback: the WebSocket pushes when available, this guarantees progress when it
+            // is not. Harmless when the socket is live because the engine de-duplicates by message id.
+            LaunchedEffect(Unit) {
+                while (true) {
+                    kotlinx.coroutines.delay(CONVERSATION_POLL_INTERVAL_MS)
+                    duoViewModel.syncConversation()
+                }
+            }
+            ConversationScreen(
+                messages = conversation.messages,
+                connectionState = conversation.connectionState,
+                peerDisplayName = conversation.peerDisplayName,
+                isSending = conversation.isSending,
+                onBack = {
+                    duoViewModel.closeConversation()
+                    navController.popBackStack()
+                },
+                onSendText = duoViewModel::sendMessage,
+                onPickImage = { /* wired to the system photo picker below */ },
+                onPickVideo = { /* wired to the system photo picker below */ },
+                onOpenAttachment = { /* opens the viewer with the explicit Save-to-Gallery action */ },
+                onRetry = { message -> duoViewModel.retryMessage(message.messageIdHex) }
             )
         }
         composable("about") {
@@ -384,4 +465,71 @@ private fun AboutScreen(onBack: () -> Unit) {
             }
         }
     }
+}
+
+/** Default relay base URL. Loopback is allowed for adb-reverse development; a real deployment is wss. */
+private const val DEFAULT_RELAY_BASE_URL = "https://relay.duolink.invalid"
+
+/** How often the fallback poll runs while the chat screen is open. */
+private const val CONVERSATION_POLL_INTERVAL_MS = 5_000L
+
+/**
+ * Hosts the lock screen and performs the platform biometric prompt.
+ *
+ * The gate is a *screen-level* decision, not an overlay: while locked, the NavHost is never composed,
+ * so a screenshot or a deep link cannot reach the conversation.
+ */
+@Composable
+private fun AppLockGate(
+    lockState: AppLockUiState,
+    activity: FragmentActivity?,
+    onPinSubmitted: (String) -> Unit,
+    onBiometricUnlocked: () -> Unit
+) {
+    var biometricError by remember { mutableStateOf<String?>(null) }
+    val mode = when {
+        lockState.isCreating && lockState.awaitingConfirmation -> LockScreenMode.CONFIRM
+        lockState.isCreating -> LockScreenMode.CREATE
+        !lockState.isConfigured -> LockScreenMode.CREATE
+        else -> LockScreenMode.UNLOCK
+    }
+
+    // Ticks the cooling-off countdown so the number on screen actually decreases.
+    var remaining by remember { mutableStateOf(lockState.lockoutRemainingSeconds) }
+    LaunchedEffect(lockState.lockoutRemainingSeconds) {
+        remaining = lockState.lockoutRemainingSeconds
+        while (remaining > 0) {
+            kotlinx.coroutines.delay(1000)
+            remaining = (remaining - 1).coerceAtLeast(0)
+        }
+    }
+
+    AppLockScreen(
+        mode = mode,
+        errorMessage = biometricError ?: lockState.errorPersian,
+        lockoutRemainingSeconds = remaining,
+        biometricAvailable = lockState.biometricAvailable && mode == LockScreenMode.UNLOCK,
+        onPinSubmitted = { pin ->
+            biometricError = null
+            onPinSubmitted(pin)
+        },
+        onBiometricRequested = {
+            val host = activity
+            if (host == null) {
+                biometricError = "ورود بیومتریک در این دستگاه در دسترس نیست."
+                return@AppLockScreen
+            }
+            BiometricUnlockGate(host).authenticate(
+                activity = host,
+                title = "باز کردن دوولینک",
+                subtitle = "برای ورود، هویت خود را تأیید کنید.",
+                negativeButton = "استفاده از رمز",
+                onSuccess = {
+                    biometricError = null
+                    onBiometricUnlocked()
+                },
+                onFailure = { reason -> biometricError = reason }
+            )
+        }
+    )
 }

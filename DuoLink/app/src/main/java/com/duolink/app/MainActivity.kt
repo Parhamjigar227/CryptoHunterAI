@@ -205,6 +205,12 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
                     duoViewModel.syncConversation()
                 }
             }
+            // System picker: one-item grant, no media permission requested at all.
+            val pickers = rememberAttachmentPickers(
+                onPicked = { uri -> duoViewModel.attachPickedMedia(uri) },
+                onCancelled = { /* user backed out; nothing to report */ }
+            )
+
             ConversationScreen(
                 messages = conversation.messages,
                 connectionState = conversation.connectionState,
@@ -215,10 +221,36 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
                     navController.popBackStack()
                 },
                 onSendText = duoViewModel::sendMessage,
-                onPickImage = { /* wired to the system photo picker below */ },
-                onPickVideo = { /* wired to the system photo picker below */ },
-                onOpenAttachment = { /* opens the viewer with the explicit Save-to-Gallery action */ },
+                onPickImage = pickers.pickImage,
+                onPickVideo = pickers.pickVideo,
+                onOpenAttachment = { message ->
+                    duoViewModel.openAttachment(message.messageIdHex)
+                    navController.navigate("attachment")
+                },
                 onRetry = { message -> duoViewModel.retryMessage(message.messageIdHex) }
+            )
+        }
+        composable("attachment") {
+            val viewer by duoViewModel.viewerState.collectAsState()
+            AttachmentViewerScreen(
+                state = viewer,
+                onBack = {
+                    duoViewModel.closeAttachmentViewer()
+                    navController.popBackStack()
+                },
+                onRequestExport = duoViewModel::requestGalleryExport,
+                onConfirmExport = { duoViewModel.confirmGalleryExport() },
+                onDismissExportDialog = duoViewModel::dismissGalleryExportDialog,
+                exportDialogVisible = viewer.exportDialogVisible,
+                exportResultPersian = viewer.exportResultPersian,
+                onRemoveFromDevice = duoViewModel::removeAttachmentFromDevice,
+                videoContent = {
+                    PrivateVideoPlayer(
+                        plaintext = viewer.plaintext,
+                        mimeType = viewer.mimeType,
+                        onError = { duoViewModel.reportAttachmentError(it) }
+                    )
+                }
             )
         }
         composable("about") {

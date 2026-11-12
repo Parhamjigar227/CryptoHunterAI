@@ -72,6 +72,20 @@ data class AppLockUiState(
     val awaitingConfirmation: Boolean = false
 )
 
+/** State of the full-screen attachment viewer, including the explicit Gallery-export dialog. */
+data class AttachmentViewerUiState(
+    val messageIdHex: String = "",
+    val isLoading: Boolean = false,
+    val plaintext: ByteArray? = null,
+    val mimeType: String = "application/octet-stream",
+    val digestHex: String = "",
+    val isVideo: Boolean = false,
+    val errorPersian: String? = null,
+    val exportDialogVisible: Boolean = false,
+    val isExporting: Boolean = false,
+    val exportResultPersian: String? = null
+)
+
 /** Everything the chat screen needs. */
 data class ConversationUiState(
     val messages: List<ChatMessage> = emptyList(),
@@ -116,6 +130,9 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
 
     private val _lockState = MutableStateFlow(AppLockUiState())
     val lockState: StateFlow<AppLockUiState> = _lockState.asStateFlow()
+
+    private val _viewer = MutableStateFlow(AttachmentViewerUiState())
+    val viewerState: StateFlow<AttachmentViewerUiState> = _viewer.asStateFlow()
 
     private val _conversation = MutableStateFlow(ConversationUiState())
     val conversation: StateFlow<ConversationUiState> = _conversation.asStateFlow()
@@ -716,6 +733,179 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
     /** Runs once the gate opens, so nothing heavy happens while the lock screen is up. */
     private fun onUnlocked() {
         refreshIdentityAndState()
+    }
+
+
+    // =====================================================================================
+    // Attachments
+    // =====================================================================================
+
+    /**
+     * Seals a picked image/video into the private vault and sends the message that references it.
+     *
+     * The media bytes never travel inside the message envelope: only the digest, MIME type, size and
+     * duration do. The sealed blob stays on this device, so the transport never carries plaintext media.
+     */
+    fun attachPickedMedia(uri: android.net.Uri) {
+        val vault = mediaVault ?: run {
+            _conversation.value = _conversation.value.copy(
+                errorPersian = "حافظهٔ امن رسانه در دسترس نیست. برنامه را دوباره باز کنید."
+            )
+            return
+        }
+        val engine = conversationEngine ?: return
+        val app = getApplication<Application>()
+
+        viewModelScope.launch {
+            _conversation.value = _conversation.value.copy(isSending = true, errorPersian = null)
+            val outcome = withContext(Dispatchers.IO) {
+                com.duolink.app.ui.AttachmentIngest.ingest(app, uri, vault)
+            }
+            when (outcome) {
+                is com.duolink.app.ui.AttachmentIngest.Result.Rejected -> {
+                    _conversation.value = _conversation.value.copy(
+                        isSending = false,
+                        errorPersian = outcome.persianMessage
+                    )
+                }
+                is com.duolink.app.ui.AttachmentIngest.Result.Stored -> {
+                    val ref = outcome.ref
+                    val result = withContext(Dispatchers.IO) {
+                        engine.sendAttachment(
+                            kind = if (ref.kind.isVideo) MessageType.VIDEO else MessageType.IMAGE,
+                            mediaDigestSha256 = ref.sha256,
+                            mediaFileName = ref.sealedFileName,
+                            mediaMimeType = ref.mimeType,
+                            mediaSizeBytes = ref.sizeBytes,
+                            mediaDurationMs = ref.durationMs
+                        )
+                    }
+                    _conversation.value = _conversation.value.copy(
+                        isSending = false,
+                        errorPersian = result.exceptionOrNull()?.let { "ارسال پیوست ناموفق بود." }
+                    )
+                }
+            }
+        }
+    }
+
+    /** Loads one attachment's sealed bytes into the viewer. */
+    fun openAttachment(messageIdHex: String) {
+        val vault = mediaVault
+        val message = _conversation.value.messages.firstOrNull { it.messageIdHex == messageIdHex }
+        val digest = message?.payload?.mediaDigestSha256
+        if (vault == null || message == null || digest == null) {
+            _viewer.value = AttachmentViewerUiState(
+                messageIdHex = messageIdHex,
+                isLoading = false,
+                errorPersian = "این پیوست در دسترس نیست."
+            )
+            return
+        }
+        _viewer.value = AttachmentViewerUiState(
+            messageIdHex = messageIdHex,
+            isLoading = true,
+            mimeType = message.payload.mediaMimeType ?: "application/octet-stream",
+            digestHex = com.duolink.app.crypto.ByteEncoding.toHexLower(digest),
+            isVideo = message.payload.type == MessageType.VIDEO
+        )
+        viewModelScope.launch {
+            val bytes = withContext(Dispatchers.IO) {
+                runCatching { vault.open(digest, kindOf(message)) }.getOrNull()
+            }
+            _viewer.value = _viewer.value.copy(
+                isLoading = false,
+                plaintext = bytes,
+                errorPersian = when {
+                    bytes != null -> null
+                    // A missing blob and a failed integrity check are different problems and are
+                    // reported differently, so the user can tell "not synced" from "tampered".
+                    !vault.contains(digest) -> "این پیوست روی این دستگاه ذخیره نشده است."
+                    else -> "این پیوست قابل اعتماد نیست و باز نشد."
+                }
+            )
+        }
+    }
+
+    private fun kindOf(message: ChatMessage): com.duolink.app.media.MediaKind =
+        if (message.payload.type == MessageType.VIDEO) {
+            com.duolink.app.media.MediaKind.VIDEO
+        } else {
+            com.duolink.app.media.MediaKind.IMAGE
+        }
+
+    fun closeAttachmentViewer() {
+        _viewer.value = AttachmentViewerUiState()
+    }
+
+    fun requestGalleryExport() {
+        if (_viewer.value.plaintext == null) return
+        _viewer.value = _viewer.value.copy(exportDialogVisible = true, exportResultPersian = null)
+    }
+
+    fun dismissGalleryExportDialog() {
+        _viewer.value = _viewer.value.copy(exportDialogVisible = false)
+    }
+
+    /**
+     * Performs the explicit, confirmed Gallery export for exactly one attachment.
+     *
+     * This is the only place in the app that writes to shared storage, and it only runs from this
+     * user-confirmed path. The sealed private copy is left in place.
+     */
+    fun confirmGalleryExport() {
+        val state = _viewer.value
+        val plaintext = state.plaintext ?: return
+        val message = _conversation.value.messages.firstOrNull { it.messageIdHex == state.messageIdHex }
+        val mime = state.mimeType
+        val app = getApplication<Application>()
+        val exporter = com.duolink.app.media.MediaExporter(app)
+        val kind = if (state.isVideo) com.duolink.app.media.MediaKind.VIDEO
+        else com.duolink.app.media.MediaKind.IMAGE
+
+        _viewer.value = state.copy(exportDialogVisible = false, isExporting = true)
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                exporter.exportToGallery(
+                    plaintext = plaintext,
+                    kind = kind,
+                    mimeType = mime,
+                    displayName = message?.payload?.mediaFileName ?: "duolink-export",
+                    takenAtEpochSec = (message?.payload?.createdAtEpochMs ?: System.currentTimeMillis()) / 1000
+                )
+            }
+            _viewer.value = _viewer.value.copy(
+                isExporting = false,
+                exportResultPersian = when (result) {
+                    is com.duolink.app.media.MediaExporter.Result.Saved -> "در گالری ذخیره شد."
+                    is com.duolink.app.media.MediaExporter.Result.Failed -> result.persianMessage
+                }
+            )
+        }
+    }
+
+    /**
+     * Deletes this device's sealed copy of an attachment.
+     *
+     * Deliberately local-only: it does not ask the peer to delete anything, and the message bubble
+     * remains so the conversation history is not silently rewritten.
+     */
+    fun removeAttachmentFromDevice() {
+        val vault = mediaVault ?: return
+        val state = _viewer.value
+        if (state.digestHex.isEmpty()) return
+        viewModelScope.launch {
+            val digest = com.duolink.app.crypto.ByteEncoding.fromHexStrict(state.digestHex)
+            withContext(Dispatchers.IO) { vault.delete(digest) }
+            _viewer.value = _viewer.value.copy(
+                plaintext = null,
+                errorPersian = "این پیوست از این دستگاه حذف شد."
+            )
+        }
+    }
+
+    fun reportAttachmentError(message: String) {
+        _viewer.value = _viewer.value.copy(errorPersian = message)
     }
 
 }

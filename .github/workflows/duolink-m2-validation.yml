@@ -528,8 +528,33 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          ASSET=$(gh release view v0.4.0 --json assets --jq '.assets[] | select(.name=="DuoLink-v0.4.0.apk") | .url')
-          echo "asset api url: $ASSET"
-          test -n "$ASSET" || { echo "asset not attached"; exit 1; }
-          gh api "$ASSET" --jq '.name, .size, .state' 
-          echo "Browser download URL: https://github.com/Parhamjigar227/CryptoHunterAI/releases/download/v0.4.0/DuoLink-v0.4.0.apk"
+          # Check the ASSET METADATA rather than calling `gh api "$ASSET"` on the browser download URL.
+          # The previous version resolved `.url`, which is the human download link, and then passed it to
+          # `gh api` - which expects an API endpoint. That made a job whose releasing work had already
+          # SUCCEEDED report failure purely because of how it verified itself.
+          gh release view v0.4.0 --json assets \
+            --jq '.assets[] | "attached: \(.name)  \(.size) bytes  state=\(.state)"'
+
+          NAME=$(gh release view v0.4.0 --json assets --jq '.assets[0].name')
+          SIZE=$(gh release view v0.4.0 --json assets --jq '.assets[0].size')
+          STATE=$(gh release view v0.4.0 --json assets --jq '.assets[0].state')
+
+          test "$NAME" = "DuoLink-v0.4.0.apk" || { echo "unexpected asset name: $NAME"; exit 1; }
+          test "$STATE" = "uploaded" || { echo "asset state is $STATE, expected uploaded"; exit 1; }
+          # An APK this project builds is ~20 MB. A tiny asset would mean the upload truncated.
+          test "$SIZE" -gt 10000000 || { echo "asset is implausibly small ($SIZE bytes)"; exit 1; }
+
+          # Prove the browser download URL actually serves bytes, not just that an asset row exists.
+          # GitHub redirects release downloads to a CDN, so follow redirects and inspect what comes back.
+          URL="https://github.com/Parhamjigar227/CryptoHunterAI/releases/download/v0.4.0/DuoLink-v0.4.0.apk"
+          CODE=$(curl -sS -L -o /tmp/downloaded.apk -w '%{http_code}' "$URL")
+          echo "download HTTP status: $CODE"
+          test "$CODE" = "200" || { echo "download URL did not return 200"; exit 1; }
+          DL_SIZE=$(stat -c '%s' /tmp/downloaded.apk)
+          echo "downloaded $DL_SIZE bytes"
+          test "$DL_SIZE" = "$SIZE" || { echo "downloaded size $DL_SIZE != published $SIZE"; exit 1; }
+          DL_SHA=$(sha256sum /tmp/downloaded.apk | cut -d' ' -f1)
+          echo "downloaded sha256: $DL_SHA"
+          grep -q "$DL_SHA" /tmp/release/SHA256.txt || { echo "downloaded APK does not match the built SHA-256"; exit 1; }
+          echo "VERIFIED: the public download URL serves the exact APK that was built and tested."
+          echo "Download URL: $URL"

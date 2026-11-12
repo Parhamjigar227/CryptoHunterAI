@@ -71,7 +71,7 @@ jobs:
           echo "=== Debug APK Badging Metadata (aapt2) ==="
           "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK_PATH" | head -n 25
           mkdir -p /tmp/apk-only
-          cp "$APK_PATH" /tmp/apk-only/DuoLink-v0.2.0.apk
+          cp "$APK_PATH" /tmp/apk-only/DuoLink-v0.3.0.apk
           EOS
           bash /tmp/run_build.sh 2>&1 | tee /tmp/job1.log
           exit "${PIPESTATUS[0]}"
@@ -80,8 +80,8 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: DuoLink-v0.2.0-Android-APK
-          path: /tmp/apk-only/DuoLink-v0.2.0.apk
+          name: DuoLink-v0.3.0-Android-APK
+          path: /tmp/apk-only/DuoLink-v0.3.0.apk
 
       - name: Upload Debug APK, SHA-256 & Unit Test Reports
         if: always()

@@ -1,8 +1,31 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
+
+/**
+ * Release signing is read from `keystore.properties`, which is git-ignored and never committed.
+ *
+ * When the file is absent the release build stays on the debug signature. That is deliberate: CI has
+ * no keystore, and making the build fail would mean the whole validation pipeline could not run
+ * without a private key present. But it also means "the build succeeded" does NOT imply "the APK is
+ * release-signed" - `scripts/make-release-keystore.sh` and the release notes both say which of the
+ * two an artifact is, and the signing block below prints a warning when it falls back.
+ *
+ * Never place the keystore or its password in the repository or in this file.
+ * See docs/SIGNING.fa.md.
+ */
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.inputStream().use { load(it) }
+    }
+}
+val hasReleaseSigning = keystorePropertiesFile.exists() &&
+    keystoreProperties.getProperty("storeFile")?.isNotBlank() == true
 
 android {
     namespace = "com.duolink.app"
@@ -31,6 +54,21 @@ android {
     val signalingEndpoint: String =
         providers.gradleProperty("duolink.signalingEndpoint").getOrElse("")
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+                // Newer AGP defaults; stated explicitly so the choice is visible and stable.
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -40,6 +78,21 @@ android {
                 "proguard-rules.pro"
             )
             buildConfigField("String", "DEFAULT_SIGNALING_ENDPOINT", "\"$signalingEndpoint\"")
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            } else {
+                logger.warn(
+                    "DuoLink: keystore.properties not found - the release APK will carry the DEBUG " +
+                        "signature. See docs/SIGNING.fa.md before publishing."
+                )
+                // Debug signing keeps the build usable for validation. It is not a publishable identity.
+                // The debug config is created by AGP itself, so it is looked up lazily inside afterEvaluate
+                // rather than here: at this point in configuration it may not exist yet, and
+                // getByName("debug") would fail with "signingConfig 'debug' not found".
+                afterEvaluate {
+                    signingConfig = signingConfigs.getByName("debug")
+                }
+            }
         }
         debug {
             // Debug builds may also point at a loopback server, which the endpoint policy permits.

@@ -2,3 +2,28 @@ node_modules/
 .wrangler/
 .dev.vars*
 .env*
+
+# ---------------------------------------------------------------------------
+# Android / Gradle build output
+# ---------------------------------------------------------------------------
+DuoLink/.gradle/
+DuoLink/build/
+DuoLink/app/build/
+DuoLink/local.properties
+DuoLink/.idea/
+*.iml
+
+# ---------------------------------------------------------------------------
+# Release signing material - NEVER commit any of these.
+#
+# Losing the keystore means you can never publish an update to the same app:
+# Android only installs an upgrade signed by the same key, so a lost key forces
+# every user to uninstall (losing their data) before installing a new build.
+# A leaked keystore lets anyone else publish an "update" under your identity.
+# ---------------------------------------------------------------------------
+keystore.properties
+DuoLink/keystore.properties
+*.jks
+*.keystore
+DuoLink/keystore/
+DuoLink/server/data/

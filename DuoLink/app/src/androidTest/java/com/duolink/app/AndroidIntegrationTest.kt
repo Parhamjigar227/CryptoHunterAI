@@ -330,7 +330,26 @@ class AndroidIntegrationTest {
 
         val t0 = 1_735_000_500L
         val offer = coordA.startInitiatorOffer(t0).getOrThrow()
-        val offerBitmap = QrBitmapCodec.renderQrBitmap(offer.qrString, sizePx = 420)
+
+        // KNOWN FLAKINESS - DIAGNOSED, NOT FIXED. Read this before changing the size back.
+        //
+        // This test passed on four consecutive CI runs and then failed on a fifth with identical
+        // QR code. The cause is not a regression: `offer.qrString` embeds freshly generated ECDSA public
+        // keys and variable-length DER signatures, so its LENGTH varies per run (observed 590 and 654
+        // characters in the two failing runs, versus shorter payloads in the runs that passed). Certain
+        // payload lengths produce a rendered matrix that ZXing's decoder returns null for.
+        //
+        // What I verified: the failure is length-dependent and reproducible offline against the ZXing
+        // JavaScript port, and it does NOT go away by enlarging the render (tested 420/480/512/600/640/
+        // 720/840px) - so "make the image bigger" is not the fix. What I could NOT verify: the exact
+        // boundary in ZXing Core 3.5.4 (Java), because Maven Central is unreachable from the environment
+        // where this was diagnosed. Do not guess at a fix here; reproduce against the real library first.
+        //
+        // The assertion below is deliberately left exactly as strict as before. Weakening it to "just
+        // check decode is non-null" would hide a real interop risk: a QR code that a real camera cannot
+        // read is a broken pairing flow, not a test artefact.
+        val renderSizePx = 420
+        val offerBitmap = QrBitmapCodec.renderQrBitmap(offer.qrString, sizePx = renderSizePx)
 
         // Simulate CameraX ImageProxy YUV_420_888 plane with interleaved stride + ISP row padding
         val width = offerBitmap.width
@@ -356,13 +375,21 @@ class AndroidIntegrationTest {
             pixelStride = pixelStride
         )
         val decodedOfferText = QrBitmapCodec.decodeLuminance(contiguousY, width, height)
+        // Explicit message: on failure the old assertion printed two enormous opaque strings, which made
+        // this look like a payload mismatch rather than "the decoder returned null".
+        assertTrue(
+            "QR decode returned null for a ${offer.qrString.length}-char payload rendered at " +
+                "${offerBitmap.width}px (module size ${offerBitmap.width / 101}). " +
+                "A null result here means the rendered matrix was not readable, not that the payload differed.",
+            decodedOfferText != null
+        )
         assertEquals(offer.qrString, decodedOfferText)
 
         val responderStep = coordB.processScannedQr(decodedOfferText!!, t0 + 2)
                 as PairingCoordinator.QrProcessResult.ResponderReadyToConfirm
 
         // Render & scan ACCEPT QR through padded Y-plane (pixelStride = 1, rowStride = width + 64)
-        val acceptBmp = QrBitmapCodec.renderQrBitmap(responderStep.acceptQrToDisplay, sizePx = 420)
+        val acceptBmp = QrBitmapCodec.renderQrBitmap(responderStep.acceptQrToDisplay, sizePx = renderSizePx)
         val acceptRowStride = acceptBmp.width + 64
         val acceptBuffer = ByteBuffer.allocateDirect(acceptRowStride * acceptBmp.height)
         for (y in 0 until acceptBmp.height) {

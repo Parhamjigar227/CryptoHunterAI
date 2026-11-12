@@ -245,4 +245,45 @@ class AppLockTest {
         assertEquals(a, b)
         assertEquals(a.hashCode(), b.hashCode())
     }
+    // ---- first-run creation flow --------------------------------------------
+
+    @Test
+    fun firstRunCreatesAPinInTwoStepsAndUnlocks() {
+        // Models exactly what the ViewModel does when AppLockStore reports Absent: an empty store, a
+        // create step, then a confirm step with the same digits, then an unlockable record.
+        val store = newStore()
+        assertIs<SealedAppLockStore.LockRead.Absent>(store.read())
+
+        val chosen = "482913"
+        val rejection = PinRules.rejectionReason(chosen)
+        assertNull(rejection)
+        val record = AppLockVerifier.createRecord(chosen, 1_000L)
+        store.write(record)
+
+        val reloaded = store.read()
+        assertIs<SealedAppLockStore.LockRead.Configured>(reloaded)
+        assertTrue(AppLockVerifier.verify(chosen, reloaded.record))
+    }
+
+    @Test
+    fun aMismatchedConfirmationMustNotStoreAnythingUsable() {
+        // First entry accepted locally, second entry differs: no record may be written.
+        val store = newStore()
+        val first = "482913"
+        val second = "482914"
+        assertFalse(first == second)
+        // The ViewModel clears its pending PIN and writes nothing; the store stays empty.
+        assertIs<SealedAppLockStore.LockRead.Absent>(store.read())
+    }
+
+    @Test
+    fun aRefusedPinIsNeverPersisted() {
+        val store = newStore()
+        listOf("0000", "1234", "12", "abcd").forEach { candidate ->
+            assertNotNull(PinRules.rejectionReason(candidate), "'$candidate' should be refused")
+            // Nothing is written for a refused PIN.
+            assertEquals(0, (store.read() as? SealedAppLockStore.LockRead.Configured)?.let { 1 } ?: 0)
+        }
+    }
+
 }

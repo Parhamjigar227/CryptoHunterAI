@@ -445,7 +445,11 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
     /** Submits a PIN for unlock, or collects the two-step creation flow. */
     fun submitPin(pin: String) {
         val state = _lockState.value
+        // First run (no record yet) and the two-step creation flow both go through creation. Without
+        // the !isConfigured branch a brand-new user could never set a PIN at all: handlePinCreation
+        // alone would store a pending PIN but the screen would still be in UNLOCK mode.
         if (state.isCreating || !state.isConfigured) {
+            _lockState.value = state.copy(isCreating = true)
             handlePinCreation(pin)
             return
         }
@@ -540,7 +544,8 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
                 isCreating = false,
                 awaitingConfirmation = false,
                 errorPersian = null,
-                storageCorrupted = false
+                storageCorrupted = false,
+                lockoutRemainingSeconds = 0L
             )
             withContext(Dispatchers.Main) { onUnlocked() }
         }

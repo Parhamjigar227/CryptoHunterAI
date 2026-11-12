@@ -523,9 +523,10 @@ private fun AppLockGate(
 ) {
     var biometricError by remember { mutableStateOf<String?>(null) }
     val mode = when {
-        lockState.isCreating && lockState.awaitingConfirmation -> LockScreenMode.CONFIRM
-        lockState.isCreating -> LockScreenMode.CREATE
-        !lockState.isConfigured -> LockScreenMode.CREATE
+        // Confirm step wins: the user has already chosen a PIN and must retype it.
+        lockState.awaitingConfirmation -> LockScreenMode.CONFIRM
+        // No record on disk yet => first run, or a creation flow in progress.
+        !lockState.isConfigured || lockState.isCreating -> LockScreenMode.CREATE
         else -> LockScreenMode.UNLOCK
     }
 

@@ -55,7 +55,8 @@ fun ServerSettingsScreen(
     onBack: () -> Unit,
     onSave: (String) -> Unit,
     onClear: () -> Unit,
-    onRefresh: () -> Unit
+    onRefresh: () -> Unit,
+    onTest: () -> Unit
 ) {
     // Ask the ViewModel for a fresh snapshot whenever the screen is shown, so a value saved in a
     // previous visit (or a build-time default) is reflected without the caller wiring an init call.
@@ -123,6 +124,26 @@ fun ServerSettingsScreen(
                 enabled = draft.isNotBlank(),
                 modifier = Modifier.fillMaxWidth()
             ) { Text("ذخیره و استفاده") }
+
+            // Saving only proves the URL parses. This button makes a real request, which is what tells
+            // the user whether the two phones can actually reach a server that speaks this protocol.
+            OutlinedButton(
+                onClick = onTest,
+                enabled = !state.isTesting && state.currentUrl != null,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text(if (state.isTesting) "در حال آزمایش…" else "آزمایش اتصال به سرور") }
+
+            state.testResult?.let { result ->
+                Text(
+                    text = result,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (result.startsWith("اتصال موفق")) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.error
+                    }
+                )
+            }
 
             if (!state.isFromBuild && state.currentUrl != null) {
                 OutlinedButton(onClick = onClear, modifier = Modifier.fillMaxWidth()) {

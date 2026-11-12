@@ -205,7 +205,8 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
                 onBack = { navController.popBackStack() },
                 onSave = { url -> duoViewModel.saveServerEndpoint(url) },
                 onClear = { duoViewModel.clearServerEndpoint() },
-                onRefresh = { duoViewModel.refreshServerSettings() }
+                onRefresh = { duoViewModel.refreshServerSettings() },
+                onTest = { duoViewModel.testServerConnection() }
             )
         }
 

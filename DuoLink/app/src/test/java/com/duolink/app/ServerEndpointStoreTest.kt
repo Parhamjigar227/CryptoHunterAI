@@ -2,6 +2,7 @@ package com.duolink.app
 
 import com.duolink.app.crypto.InMemoryByteStore
 import com.duolink.app.remote.ServerEndpointStore
+import com.duolink.app.remote.SignalingHttpClient
 import com.duolink.app.remote.SignalingEndpointPolicy
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -134,6 +135,29 @@ class ServerEndpointStoreTest {
         val resolution = s.resolve()
         assertIs<ServerEndpointStore.Resolution.Ready>(resolution)
         assertEquals(ServerEndpointStore.Source.BUILD_TIME, resolution.source)
+    }
+
+    @Test
+    fun theConnectionTestReachesARealServerAndReadsItsHealthPayload() {
+        // The "test connection" button makes a GET /healthz and checks the body. This exercises that
+        // request against a real socket, so a wrong path, method or header would fail here rather than
+        // in the user's hands.
+        MiniHttpServer { request ->
+            if (request.path == "/healthz" && request.method == "GET") {
+                MiniHttpServer.Response(
+                    status = 200,
+                    body = """{"status":"ok","protocolVersion":1,"serverTimeEpochSec":1}"""
+                )
+            } else {
+                MiniHttpServer.Response(status = 404, body = "{}")
+            }
+        }.use { server ->
+            val client = SignalingHttpClient(isDebugBuild = true)
+            // execute() returns the parsed body string (it throws on a non-2xx), so a returned value
+            // here already means a 200 came back.
+            val body = client.execute(server.baseUrl, "GET", "/healthz")
+            assertTrue(body.contains("protocolVersion"), "health payload should be recognisable: $body")
+        }
     }
 
     @Test

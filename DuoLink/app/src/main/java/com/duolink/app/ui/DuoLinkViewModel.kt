@@ -195,6 +195,54 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
         refreshServerSettings()
     }
 
+    /**
+     * Actually contacts the configured server and reports what came back.
+     *
+     * Saving a URL only proves it parses. This makes a real request to `/healthz` and inspects the
+     * body, which is the difference between "I typed something" and "the two phones can reach a
+     * server that speaks this protocol". Runs off the main thread; the result is published to
+     * [serverSettings] so the screen can show it without holding a coroutine of its own.
+     */
+    fun testServerConnection() {
+        val base = currentServerBaseUrl() ?: run {
+            _serverSettings.value = _serverSettings.value.copy(
+                lastError = "ابتدا آدرس سرور را ذخیره کنید",
+                isTesting = false,
+                testResult = null
+            )
+            return
+        }
+        _serverSettings.value = _serverSettings.value.copy(isTesting = true, testResult = null)
+        viewModelScope.launch {
+            val outcome = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching {
+                    val client = com.duolink.app.remote.SignalingHttpClient(
+                        isDebugBuild = com.duolink.app.BuildConfig.DEBUG
+                    )
+                    // execute() returns the body and throws RemotePairingException on a non-2xx status,
+                    // so reaching this line already means the request succeeded. What still needs
+                    // checking is whether the response came from *this* protocol rather than some
+                    // other service that happens to answer 200 on /healthz.
+                    val body = client.execute(base, "GET", "/healthz")
+                    if (!body.contains("protocolVersion") && !body.contains("duolink")) {
+                        "سرور پاسخ داد اما پاسخ مربوط به DuoLink نیست"
+                    } else {
+                        null
+                    }
+                }.getOrElse { error ->
+                    // Distinguish "cannot reach it" from "reached something that is not this server";
+                    // the user's next action is different in each case.
+                    val detail = error.message ?: error::class.simpleName ?: "خطای نامشخص"
+                    "اتصال به سرور برقرار نشد: $detail"
+                }
+            }
+            _serverSettings.value = _serverSettings.value.copy(
+                isTesting = false,
+                testResult = outcome ?: "اتصال موفق — سرور پاسخ درست داد"
+            )
+        }
+    }
+
     /** The base URL to use for remote pairing, or null when the user must configure one first. */
     fun currentServerBaseUrl(): String? = when (val r = endpointStore.resolve()) {
         is ServerEndpointStore.Resolution.Ready -> r.baseUrl
@@ -205,7 +253,11 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
     data class ServerSettingsUiState(
         val currentUrl: String? = null,
         val isFromBuild: Boolean = false,
-        val lastError: String? = null
+        val lastError: String? = null,
+        /** True while a connection test is in flight, so the button can show progress. */
+        val isTesting: Boolean = false,
+        /** Human-readable result of the last connection test: success or the specific failure. */
+        val testResult: String? = null
     )
 
     /** Expiry of the live invitation, so the UI can drive the countdown from the server's own value. */

@@ -120,12 +120,40 @@ jobs:
           sha_path = pathlib.Path("DuoLink/app/build/outputs/apk/debug/app-debug.apk.sha256")
           sha_line = sha_path.read_text().strip() if sha_path.exists() else "APK not produced"
 
+          # Per-suite TOTALS first, then the raw XML. The raw block is capped below, and when it was
+          # the only thing in the summary the last suites fell off the end: reading the summary gave 10
+          # classes and 177 tests for a run whose real totals were 12 classes and 195. Anyone auditing
+          # the release from that summary would have seen a number that looked authoritative and was
+          # simply truncated. The totals are computed from every file before any truncation happens.
+          import xml.etree.ElementTree as ET
+
           xml_texts = []
+          suite_lines = []
+          total = failed = errored = 0
           for p in sorted(pathlib.Path("DuoLink/app/build/test-results/testDebugUnitTest").glob("TEST-*.xml")):
-              xml_texts.append(p.read_text(errors="replace"))
+              raw_xml = p.read_text(errors="replace")
+              xml_texts.append(raw_xml)
+              try:
+                  root = ET.fromstring(raw_xml)
+              except Exception:
+                  suite_lines.append(f"- {p.stem}: unparseable")
+                  continue
+              t = int(root.get("tests", 0))
+              f = int(root.get("failures", 0))
+              e = int(root.get("errors", 0))
+              total += t
+              failed += f
+              errored += e
+              suite_lines.append(f"- {root.get('name', p.stem)}: {t} tests, {f} failures, {e} errors")
+          suite_lines.append(f"- **TOTAL: {total} tests, {failed} failures, {errored} errors**")
+
           xml_block = "\n".join(xml_texts)
 
-          summary = f"Outcome: `{conclusion}`\nDebug APK SHA-256: `{sha_line}`\n\n### Unit Test XML\n```xml\n{xml_block[:25000]}\n```"
+          summary = (
+              f"Outcome: `{conclusion}`\nDebug APK SHA-256: `{sha_line}`\n\n"
+              f"### Unit test totals\n" + "\n".join(suite_lines) + "\n\n"
+              f"### Unit Test XML (truncated; totals above are complete)\n```xml\n{xml_block[:20000]}\n```"
+          )
           text = f"```text\n{raw[-55000:]}\n```"
 
           payload = {

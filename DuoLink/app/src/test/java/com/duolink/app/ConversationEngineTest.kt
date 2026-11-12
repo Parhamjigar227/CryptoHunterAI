@@ -124,7 +124,7 @@ class ConversationEngineTest {
     // ---- happy path ------------------------------------------------------
 
     @Test
-    fun textMessageTravelsFromAliceToBob() = runBlocking {
+    fun textMessageTravelsFromAliceToBob(): Unit = runBlocking {
         val pair = buildPair()
 
         val result = pair.alice.sendText("سلام نسرین، این پیام تست است.")
@@ -144,7 +144,7 @@ class ConversationEngineTest {
     }
 
     @Test
-    fun outgoingMessageIsPersistedBeforeTheNetworkCall() = runBlocking {
+    fun outgoingMessageIsPersistedBeforeTheNetworkCall(): Unit = runBlocking {
         val pair = buildPair()
         pair.transport.failNextSend = true
 
@@ -159,7 +159,7 @@ class ConversationEngineTest {
     }
 
     @Test
-    fun failedMessageCanBeRetriedSuccessfully() = runBlocking {
+    fun failedMessageCanBeRetriedSuccessfully(): Unit = runBlocking {
         val pair = buildPair()
         pair.transport.failNextSend = true
         pair.alice.sendText("دوباره تلاش کن")
@@ -175,7 +175,7 @@ class ConversationEngineTest {
     }
 
     @Test
-    fun bothDirectionsHaveIndependentSequencesAndKeys() = runBlocking {
+    fun bothDirectionsHaveIndependentSequencesAndKeys(): Unit = runBlocking {
         val pair = buildPair()
         pair.alice.sendText("از آلیس ۱")
         pair.alice.sendText("از آلیس ۲")
@@ -191,7 +191,7 @@ class ConversationEngineTest {
     }
 
     @Test
-    fun sequenceNumbersNeverRepeatAcrossRestarts() = runBlocking {
+    fun sequenceNumbersNeverRepeatAcrossRestarts(): Unit = runBlocking {
         val first = buildPair()
         first.alice.sendText("قبل از بستن برنامه")
         val before = first.alice.nextSequence()
@@ -217,7 +217,7 @@ class ConversationEngineTest {
     // ---- delivery & de-duplication ---------------------------------------
 
     @Test
-    fun duplicateEnvelopeIsIgnoredNotDisplayedTwice() = runBlocking {
+    fun duplicateEnvelopeIsIgnoredNotDisplayedTwice(): Unit = runBlocking {
         val pair = buildPair()
         pair.alice.sendText("یک پیام")
         val envelope = pair.transport.outbox.single()
@@ -230,7 +230,7 @@ class ConversationEngineTest {
     }
 
     @Test
-    fun overlappingPollAndPushDeliveryIsSafe() = runBlocking {
+    fun overlappingPollAndPushDeliveryIsSafe(): Unit = runBlocking {
         // The brief requires WebSocket with a polling fallback; those can deliver the same envelope.
         val pair = buildPair()
         pair.alice.sendText("پیام همزمان")
@@ -246,7 +246,7 @@ class ConversationEngineTest {
     }
 
     @Test
-    fun syncOnceReportsOnlyGenuinelyNewMessages() = runBlocking {
+    fun syncOnceReportsOnlyGenuinelyNewMessages(): Unit = runBlocking {
         val pair = buildPair()
         pair.alice.sendText("اول")
         pair.alice.sendText("دوم")
@@ -257,7 +257,7 @@ class ConversationEngineTest {
     }
 
     @Test
-    fun readStateMovesForwardAndIsNeverDowngraded() = runBlocking {
+    fun readStateMovesForwardAndIsNeverDowngraded(): Unit = runBlocking {
         val pair = buildPair()
         pair.alice.sendText("خوانده شود")
         val envelope = pair.transport.outbox.single()
@@ -278,7 +278,7 @@ class ConversationEngineTest {
     }
 
     @Test
-    fun markAllReadSendsReceiptsForIncomingOnly() = runBlocking {
+    fun markAllReadSendsReceiptsForIncomingOnly(): Unit = runBlocking {
         val pair = buildPair()
         pair.alice.sendText("دریافتی")
         pair.bob.ingest(pair.transport.outbox.single())
@@ -292,7 +292,7 @@ class ConversationEngineTest {
     // ---- negative security ----------------------------------------------
 
     @Test
-    fun envelopeFromAThirdDeviceIsRejected() = runBlocking {
+    fun envelopeFromAThirdDeviceIsRejected(): Unit = runBlocking {
         val pair = buildPair()
         val thirdDevice = ByteArray(16).also { random.nextBytes(it) }
         val impostorPayload = MessagePayload(
@@ -310,7 +310,7 @@ class ConversationEngineTest {
     }
 
     @Test
-    fun envelopeAddressedToAnotherDeviceIsRejected() = runBlocking {
+    fun envelopeAddressedToAnotherDeviceIsRejected(): Unit = runBlocking {
         val pair = buildPair()
         val someoneElse = ByteArray(16).also { random.nextBytes(it) }
         val payload = MessagePayload(
@@ -326,7 +326,7 @@ class ConversationEngineTest {
     }
 
     @Test
-    fun reflectedMessageCannotBeAcceptedAsIncoming() = runBlocking {
+    fun reflectedMessageCannotBeAcceptedAsIncoming(): Unit = runBlocking {
         // Alice's own outgoing envelope, replayed back to her, must not appear as a message from Bob.
         val pair = buildPair()
         pair.alice.sendText("پیام خودم")
@@ -335,7 +335,7 @@ class ConversationEngineTest {
     }
 
     @Test
-    fun tamperedEnvelopeIsRecordedAsUnreadableRatherThanDropped() = runBlocking {
+    fun tamperedEnvelopeIsRecordedAsUnreadableRatherThanDropped(): Unit = runBlocking {
         val pair = buildPair()
         pair.alice.sendText("پیام اصلی")
         val envelope = pair.transport.outbox.single()
@@ -377,7 +377,7 @@ class ConversationEngineTest {
     // ---- storage ---------------------------------------------------------
 
     @Test
-    fun transcriptIsSealedAtRestAndSurvivesReload() = runBlocking {
+    fun transcriptIsSealedAtRestAndSurvivesReload(): Unit = runBlocking {
         val backing = InMemoryByteStore()
         val store = ConversationStore(backing, aliceSealer, "conv-persist")
         val engine = ConversationEngine(
@@ -454,14 +454,14 @@ class ConversationEngineTest {
     }
 
     @Test
-    fun emptyMessageIsRefused() = runBlocking {
+    fun emptyMessageIsRefused(): Unit = runBlocking {
         val pair = buildPair()
         assertTrue(pair.alice.sendText("   ").isFailure)
         assertEquals(0, pair.transport.outbox.size)
     }
 
     @Test
-    fun attachmentMessageCarriesTheDigestAndOpens() = runBlocking {
+    fun attachmentMessageCarriesTheDigestAndOpens(): Unit = runBlocking {
         val pair = buildPair()
         val digest = ByteArray(32).also { random.nextBytes(it) }
         val result = pair.alice.sendAttachment(

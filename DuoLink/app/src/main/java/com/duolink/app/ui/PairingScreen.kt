@@ -580,7 +580,7 @@ fun SafetyNumberBox(safetyNumber: String) {
 }
 
 @Composable
-private fun KeyChangeWarningBox(previousDeviceIdHex: String?) {
+internal fun KeyChangeWarningBox(previousDeviceIdHex: String?) {
     Column(
         modifier = Modifier
             .fillMaxWidth()

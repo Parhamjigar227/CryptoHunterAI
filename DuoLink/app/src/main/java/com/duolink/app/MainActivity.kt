@@ -69,6 +69,12 @@ import com.duolink.app.ui.GoldMuted
 import com.duolink.app.ui.GoldPrimary
 import com.duolink.app.ui.ObsidianBackground
 import com.duolink.app.ui.PairingScreen
+import com.duolink.app.ui.ConnectMethodPickerScreen
+import com.duolink.app.ui.NumericCodeOwnerScreen
+import com.duolink.app.ui.NumericCodeJoinScreen
+import com.duolink.app.ui.RemoteApprovalScreen
+import com.duolink.app.ui.RemoteRoleChooserScreen
+import com.duolink.app.remote.RemotePairingController
 import com.duolink.app.ui.SecurityIdentityScreen
 import com.duolink.app.ui.SuccessEmerald
 import com.duolink.app.ui.SurfaceCharcoal
@@ -159,11 +165,121 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
         composable("home") {
             HomeScreen(
                 uiState = uiState,
-                onOpenPairing = { navController.navigate("pairing") },
+                onOpenPairing = { navController.navigate("connect") },
                 onOpenSecurity = { navController.navigate("security") },
                 onOpenAbout = { navController.navigate("about") }
             )
         }
+        // Method picker: the two options required by the brief. QR keeps its existing screen
+        // untouched; the numeric flow gets its own screens so neither can regress the other.
+        composable("connect") {
+            ConnectMethodPickerScreen(
+                onBack = { navController.popBackStack() },
+                onChooseQr = { navController.navigate("pairing") { launchSingleTop = true } },
+                onChooseNumeric = {
+                    duoViewModel.resetRemotePairing()
+                    navController.navigate("remote-select-role") { launchSingleTop = true }
+                }
+            )
+        }
+
+        composable("remote-select-role") {
+            RemoteRoleChooserScreen(
+                onBack = { navController.popBackStack() },
+                onGenerate = {
+                    duoViewModel.startRemoteInvitation(DEFAULT_RELAY_BASE_URL)
+                    navController.navigate("remote-owner") { launchSingleTop = true }
+                },
+                onEnterCode = {
+                    navController.navigate("remote-join") { launchSingleTop = true }
+                }
+            )
+        }
+
+        composable("remote-owner") {
+            val remote by duoViewModel.remoteState.collectAsState()
+            // Drive the visible countdown from the SERVER's expiry, once per second. Cheap: no network.
+            LaunchedEffect(Unit) {
+                while (true) {
+                    kotlinx.coroutines.delay(1_000)
+                    duoViewModel.tickRemoteCountdown()
+                }
+            }
+            // Once an owner has a live code, wait for redemption in the background. This is the blocking
+            // protocol call, so it runs on the ViewModel's IO dispatcher, never on the composition thread.
+            LaunchedEffect(remote.step) {
+                if (remote.step == RemotePairingController.Step.OWNER_SHOWING_CODE) {
+                    duoViewModel.awaitRemoteRedemption(DEFAULT_RELAY_BASE_URL)
+                }
+            }
+            // When the Safety Number exists, move to the mutual-approval screen.
+            LaunchedEffect(remote.step) {
+                if (remote.step == RemotePairingController.Step.AWAITING_APPROVAL) {
+                    navController.navigate("remote-approve") { launchSingleTop = true }
+                }
+            }
+            NumericCodeOwnerScreen(
+                state = remote,
+                onCopyCode = {},
+                onCancel = {
+                    duoViewModel.cancelRemotePairing(isOwner = true)
+                    navController.popBackStack("connect", inclusive = false)
+                },
+                onGenerateNew = { duoViewModel.startRemoteInvitation(DEFAULT_RELAY_BASE_URL) },
+                onDismissFailure = { duoViewModel.resetRemotePairing() },
+                onBack = {
+                    duoViewModel.cancelRemotePairing(isOwner = true)
+                    navController.popBackStack()
+                }
+            )
+        }
+
+        composable("remote-join") {
+            val remote by duoViewModel.remoteState.collectAsState()
+            LaunchedEffect(remote.step) {
+                if (remote.step == RemotePairingController.Step.AWAITING_APPROVAL) {
+                    navController.navigate("remote-approve") { launchSingleTop = true }
+                }
+            }
+            NumericCodeJoinScreen(
+                state = remote,
+                onCodeChanged = { },
+                onSubmit = { code -> duoViewModel.joinWithRemoteCode(DEFAULT_RELAY_BASE_URL, code) },
+                onRetry = { duoViewModel.resetRemotePairing() },
+                onCancel = {
+                    duoViewModel.cancelRemotePairing(isOwner = false)
+                    navController.popBackStack()
+                },
+                onBack = {
+                    duoViewModel.cancelRemotePairing(isOwner = false)
+                    navController.popBackStack()
+                }
+            )
+        }
+
+        composable("remote-approve") {
+            val remote by duoViewModel.remoteState.collectAsState()
+            // Only after BOTH sides approved and the mutual receipt is confirmed does the conversation
+            // become reachable. A one-sided approval leaves this LaunchedEffect dormant by design.
+            LaunchedEffect(remote.step) {
+                if (remote.step == RemotePairingController.Step.COMPLETED) {
+                    duoViewModel.refreshIdentityAndState()
+                }
+            }
+            RemoteApprovalScreen(
+                state = remote,
+                onApprove = { compared, ack ->
+                    duoViewModel.approveRemotePairing(compared, ack)
+                    duoViewModel.completeRemotePairing()
+                },
+                onCancel = {
+                    duoViewModel.cancelRemotePairing(isOwner = false)
+                    navController.popBackStack("connect", inclusive = false)
+                },
+                onBack = { navController.popBackStack() }
+            )
+        }
+
         composable("pairing") {
             PairingScreen(
                 uiState = uiState,
@@ -189,7 +305,7 @@ fun DuoLinkAppRoot(duoViewModel: DuoLinkViewModel = viewModel()) {
                 onUnpairRotateIdentity = { duoViewModel.unpairAndPrepareRePairing(rotateDeviceIdentity = true) },
                 onRecoverCorruptedStorage = duoViewModel::recoverFromCorruptedStorage,
                 onGoToPairing = {
-                    navController.navigate("pairing") {
+                    navController.navigate("connect") {
                         launchSingleTop = true
                     }
                 }

@@ -1,6 +1,7 @@
 package com.duolink.app.ui
 
 import android.app.Application
+import com.duolink.app.BuildConfig
 import com.duolink.app.crypto.ByteEncoding
 import com.duolink.app.lock.AppLockPolicy
 import com.duolink.app.lock.AppLockRecord
@@ -34,6 +35,10 @@ import com.duolink.app.crypto.KeyProtectionReport
 import com.duolink.app.pairing.PairingCoordinator
 import com.duolink.app.pairing.PairingStateSnapshot
 import com.duolink.app.pairing.PeerTrustStore
+import com.duolink.app.remote.RemotePairingController
+import com.duolink.app.remote.RemotePendingSessionStore
+import com.duolink.app.remote.SignalingApi
+import com.duolink.app.remote.SignalingHttpClient
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -127,6 +132,25 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
     /** The live conversation engine, present only while paired and unlocked. */
     private var conversationEngine: ConversationEngine? = null
     private var relayTransport: RelayMessageTransport? = null
+
+    /**
+     * Method B ("اتصال از راه دور با کد"). Created lazily on first use rather than in a field initialiser,
+     * so a user who only ever uses QR pairing never pays for a second pending-session store, and so a
+     * failure to construct the ACK key provider cannot break app start-up.
+     */
+    private val remotePendingStore by lazy {
+        RemotePendingSessionStore(store = byteStore, sealer = sealer)
+    }
+    private var remoteController: RemotePairingController? = null
+
+    /** The ACK key pair for the current invitation: regenerated per invitation, never the identity key. */
+    private var remoteAckKeyPair: java.security.KeyPair? = null
+
+    private val _remoteState = MutableStateFlow(RemotePairingController.RemotePairingState())
+    val remoteState: StateFlow<RemotePairingController.RemotePairingState> = _remoteState.asStateFlow()
+
+    /** Expiry of the live invitation, so the UI can drive the countdown from the server's own value. */
+    private var remoteExpiresAtEpochSec: Long? = null
 
     private val _lockState = MutableStateFlow(AppLockUiState())
     val lockState: StateFlow<AppLockUiState> = _lockState.asStateFlow()
@@ -315,6 +339,198 @@ class DuoLinkViewModel(application: Application) : AndroidViewModel(application)
                 }
             )
         }
+    }
+
+    // =============================================================================================
+    // Method B — remote pairing by numeric invitation code
+    //
+    // Every security decision lives in RemotePairingController (unit-tested). This section only:
+    //   - constructs the controller with the production vault / trust store,
+    //   - moves the blocking protocol calls onto Dispatchers.IO,
+    //   - mirrors the controller's state into a StateFlow for Compose.
+    // No key material, no verification and no "paired" decision is made here.
+    // =============================================================================================
+
+    /**
+     * Builds (once) the remote controller wired to the real Keystore-backed vault.
+     *
+     * The ACK key provider mints a fresh P-256 key pair per invitation, in software JCA, and never touches
+     * the long-term identity key. That separation is deliberate: the ACK key signs the final mutual
+     * receipt, so a receipt key that outlived the pairing would let a compromise of it forge receipts for
+     * pairings it was never part of.
+     */
+    private fun remoteController(serverBaseUrl: String): RemotePairingController {
+        remoteController?.let { return it }
+        val ackProvider = object : com.duolink.app.remote.RemotePairingCoordinator.LocalAckKeyProvider {
+            override fun currentAckPublicSpki(): ByteArray =
+                (remoteAckKeyPair ?: java.security.KeyPairGenerator.getInstance("EC").run {
+                    initialize(java.security.spec.ECGenParameterSpec("secp256r1"))
+                    generateKeyPair()
+                }.also { remoteAckKeyPair = it }).public.encoded
+
+            override fun signAck(transcript: ByteArray): ByteArray? =
+                runCatching {
+                    val keyPair = remoteAckKeyPair
+                        ?: throw IllegalStateException("ACK key not initialised")
+                    java.security.Signature.getInstance("SHA256withECDSA").run {
+                        initSign(keyPair.private)
+                        update(transcript)
+                        sign()
+                    }
+                }.getOrNull()
+
+            override fun rotateAckKey() {
+                remoteAckKeyPair = java.security.KeyPairGenerator.getInstance("EC").run {
+                    initialize(java.security.spec.ECGenParameterSpec("secp256r1"))
+                    generateKeyPair()
+                }
+            }
+
+            override val isHardwareBacked: Boolean = false
+        }
+
+        val coordinator = com.duolink.app.remote.RemotePairingCoordinator(
+            keyVault = keyVault,
+            trustStore = trustStore,
+            pendingStore = remotePendingStore,
+            localAckKeyProvider = ackProvider
+        )
+        val api = SignalingApi(SignalingHttpClient(isDebugBuild = BuildConfig.DEBUG))
+        return RemotePairingController(
+            coordinator = coordinator,
+            api = api,
+            isDebugBuild = BuildConfig.DEBUG
+        ).also { remoteController = it }
+    }
+
+    /** Publishes a controller state into the flow. */
+    private fun publishRemote(state: RemotePairingController.RemotePairingState) {
+        _remoteState.value = state
+    }
+
+    /** Owner: mint a numeric invitation and start showing the code. */
+    fun startRemoteInvitation(serverBaseUrl: String) {
+        viewModelScope.launch {
+            val expiry = withContext(Dispatchers.IO) {
+                runCatching {
+                    val controller = remoteController(serverBaseUrl)
+                    val state = controller.startAsOwner(serverBaseUrl)
+                    publishRemote(state)
+                    // The controller derives the countdown from the snapshot's expiry; remember it so the
+                    // one-second UI tick keeps using the SAME server value rather than re-deriving it.
+                    state
+                }.getOrElse { error ->
+                    publishRemote(
+                        RemotePairingController.RemotePairingState(
+                            step = RemotePairingController.Step.FAILED,
+                            failurePersian = error.message ?: "ساخت کد اتصال ممکن نشد"
+                        )
+                    )
+                    null
+                }
+            }
+            expiry?.let { onRemoteStateChanged(it) }
+        }
+    }
+
+    /** Keeps the server expiry in sync with whatever the controller just produced. */
+    private fun onRemoteStateChanged(state: RemotePairingController.RemotePairingState) {
+        if (state.secondsRemaining > 0L) {
+            remoteExpiresAtEpochSec = System.currentTimeMillis() / 1000L + state.secondsRemaining
+        }
+    }
+
+    /** The server-reported expiry of the live invitation, or null when no invitation is running. */
+    val remoteExpiryEpochSec: Long? get() = remoteExpiresAtEpochSec
+
+    /** One-second tick for the visible countdown. Cheap: no network, no crypto, no allocation churn. */
+    fun tickRemoteCountdown() {
+        val expiry = remoteExpiresAtEpochSec ?: return
+        val controller = remoteController ?: return
+        publishRemote(controller.tick(expiry))
+    }
+
+    /** Owner: block until the other phone redeems, then derive keys. Call from a background dispatcher. */
+    fun awaitRemoteRedemption(serverBaseUrl: String) {
+        viewModelScope.launch {
+            val state = withContext(Dispatchers.IO) {
+                runCatching { remoteController(serverBaseUrl).awaitRedemption(serverBaseUrl) }
+                    .getOrElse { error ->
+                        RemotePairingController.RemotePairingState(
+                            step = RemotePairingController.Step.FAILED,
+                            failurePersian = error.message ?: "انتظار برای دستگاه مقابل ناموفق بود"
+                        )
+                    }
+            }
+            publishRemote(state)
+        }
+    }
+
+    /** Joiner: resolve then redeem the typed code. */
+    fun joinWithRemoteCode(serverBaseUrl: String, code: String) {
+        viewModelScope.launch {
+            val state = withContext(Dispatchers.IO) {
+                runCatching { remoteController(serverBaseUrl).joinWithCode(serverBaseUrl, code) }
+                    .getOrElse { error ->
+                        RemotePairingController.RemotePairingState(
+                            step = RemotePairingController.Step.JOINER_ENTERING_CODE,
+                            failurePersian = error.message ?: "اتصال با کد ناموفق بود"
+                        )
+                    }
+            }
+            publishRemote(state)
+        }
+    }
+
+    /** Both sides: record this user's explicit approval after comparing all 60 digits. */
+    fun approveRemotePairing(fullSafetyNumberCompared: Boolean, acknowledgeKeyChange: Boolean) {
+        viewModelScope.launch {
+            val state = withContext(Dispatchers.IO) {
+                runCatching {
+                    val controller = remoteController ?: return@runCatching null
+                    controller.approve(fullSafetyNumberCompared, acknowledgeKeyChange)
+                }.getOrNull()
+            }
+            state?.let { publishRemote(it) }
+        }
+    }
+
+    /** Both sides: publish the encrypted commit, then verify the peer's and persist trust. */
+    fun completeRemotePairing() {
+        viewModelScope.launch {
+            val state = withContext(Dispatchers.IO) {
+                runCatching {
+                    val controller = remoteController ?: return@runCatching null
+                    controller.sendCommit()
+                    controller.verifyPeerAndFinish()
+                }.getOrElse { error ->
+                    RemotePairingController.RemotePairingState(
+                        step = RemotePairingController.Step.FAILED,
+                        failurePersian = error.message ?: "تکمیل اتصال ناموفق بود"
+                    )
+                }
+            }
+            state?.let { publishRemote(it) }
+        }
+    }
+
+    /** Cancel the remote attempt. The owner revokes server-side so a cancelled code is truly dead. */
+    fun cancelRemotePairing(isOwner: Boolean) {
+        viewModelScope.launch {
+            val state = withContext(Dispatchers.IO) {
+                val controller = remoteController ?: return@withContext RemotePairingController.RemotePairingState()
+                controller.cancel(revokeOnServer = isOwner)
+            }
+            remoteExpiresAtEpochSec = null
+            publishRemote(state)
+        }
+    }
+
+    /** Back to the method picker. */
+    fun resetRemotePairing() {
+        remoteExpiresAtEpochSec = null
+        remoteController?.reset()
+        publishRemote(RemotePairingController.RemotePairingState())
     }
 
     fun cancelPendingHandshake() {

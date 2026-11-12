@@ -1,6 +1,7 @@
 package com.duolink.app.remote
 
 import com.duolink.app.crypto.KeyValueByteStore
+import com.duolink.app.crypto.RawStoreRead
 
 /**
  * Resolves which signaling server the app should talk to, and remembers an override the user typed.
@@ -104,7 +105,7 @@ class ServerEndpointStore(
     fun readSavedOverride(): String? {
         val raw = runCatching {
             when (val state = store.readState(KEY_OVERRIDE)) {
-                is KeyValueByteStore.RawStoreRead.Present -> String(state.bytes, Charsets.UTF_8)
+                is RawStoreRead.Present -> String(state.bytes, Charsets.UTF_8)
                 else -> return null
             }
         }.getOrNull() ?: return null

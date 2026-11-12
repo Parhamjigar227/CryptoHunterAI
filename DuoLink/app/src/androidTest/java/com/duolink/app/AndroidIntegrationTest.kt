@@ -339,23 +339,21 @@ class AndroidIntegrationTest {
         val renderSizePx = 420
         val offerBitmap = QrBitmapCodec.renderQrBitmap(offer.qrString, sizePx = renderSizePx)
 
-        // WHY THE FIXED RNG HELPS, AND WHAT IT DOES NOT DO.
+        // ROOT CAUSE, NOW ESTABLISHED (was recorded here as "known flakiness" before).
         //
-        // The payload embeds a 32-byte offerNonce and a 16-byte sessionId drawn from the coordinator's
-        // SecureRandom, plus identity keys and DER-encoded ECDSA signatures from the Android KeyStore.
-        // Measured payload lengths across CI runs: 590, 651, 654 chars. A minority of lengths render a
-        // matrix that ZXing cannot read back at 420px, so this test passed or failed depending on the
-        // draw - on run bff5811, API 33 and 34 passed while API 29 failed on identical code.
+        // This test used to fail on roughly one CI job in four with a null decode. The payload embeds a
+        // nonce, a session id and DER-encoded signatures, so its length varies per run (590/651/654
+        // observed), and the failure looked random because only some lengths failed.
         //
-        // Seeding the RNG pins the nonce and session id. It does NOT pin the KeyStore keys or their DER
-        // signature lengths, so the payload length can still move by a few bytes between runs. This
-        // therefore REDUCES the flake rather than eliminating it. That is a real limitation, stated here
-        // so nobody mistakes this for a complete fix.
+        // The real cause was in the renderer, not the test: QRCodeWriter stretches the symbol to fill
+        // the requested pixel width, so when the module count does not divide 420 the modules come out
+        // fractional pixels wide and the writer rounds row by row. Against ZXing Core 3.5.4, 9 of 141
+        // payload lengths fail to round trip that way. `renderQrBitmap` now asks for the natural module
+        // count and renders at a whole number of pixels per module, so this is fixed at the source.
         //
-        // The assertion below is untouched and exactly as strict as before: the full payload must
-        // round-trip byte-for-byte. It was deliberately not relaxed to "decoded is non-null", because a
-        // QR a real camera cannot read is a broken pairing flow, not a test artefact. The actual fix is
-        // to make the renderer produce a readable matrix at every payload length.
+        // `QrRenderDecodeRoundTripTest` (JVM, every length in the window, every run) is the guard that
+        // keeps it fixed. The assertions below are unchanged and still require the full payload to
+        // round-trip byte-for-byte.
 
         // Simulate CameraX ImageProxy YUV_420_888 plane with interleaved stride + ISP row padding
         val width = offerBitmap.width

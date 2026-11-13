@@ -197,6 +197,13 @@ export function createApp({ store, serverKeys, clock = () => Date.now(), limits 
             // can verify it. It does not and cannot attest it itself.
             relaysSpkSignatureWithoutVerification: true,
             verifiesSpkSignature: false,
+            // The owner signs an absolute invitation transcript covering the invitation id, the code
+            // hash, every public key, both nonces and the expiry. The server cannot verify it (it never
+            // holds a plaintext code and is not a party to either identity), but it now relays every
+            // field the *joining device* needs to verify it end-to-end. A server that forges an
+            // invitation is therefore detected by the client, not trusted by omission.
+            relaysFieldsForOwnerInvitationVerification: true,
+            verifiesOwnerInvitationSignature: false,
           },
         });
       }
@@ -234,6 +241,10 @@ export function createApp({ store, serverKeys, clock = () => Date.now(), limits 
               ownerToken,
               owner,
               ttlSeconds: request.body.ttlSeconds ?? INVITATION_TTL_SECONDS,
+              // Absolute, owner-signed expiry. Relayed unchanged so the joining device can rebuild the
+              // transcript the owner actually signed; see store.createInvitation for why the server
+              // must not substitute its own clock here.
+              requestedExpiresAtEpochSec: request.body.expiresAtEpochSec ?? null,
             });
             break;
           } catch (error) {
@@ -317,6 +328,7 @@ export function createApp({ store, serverKeys, clock = () => Date.now(), limits 
               ? {
                   deviceIdB64u: b64u(view.peer.deviceId),
                   identitySpkiB64u: b64u(view.peer.identitySpki),
+                  ackSpkiB64u: b64u(view.peer.ackSpki),
                   spkSpkiB64u: b64u(view.peer.spkSpki),
                   ephemeralSpkiB64u: view.peer.ephemeralSpki ? b64u(view.peer.ephemeralSpki) : null,
                   nonceB64u: view.peer.nonce ? b64u(view.peer.nonce) : null,

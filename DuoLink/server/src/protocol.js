@@ -57,6 +57,16 @@ export const LIMITS = Object.freeze({
 export const INVITATION_TTL_SECONDS = 10 * 60;
 
 /**
+ * Absolute ceiling on an invitation's lifetime, regardless of what a client asks for.
+ *
+ * The owner signs an absolute `expiresAtEpochSec` because the joining device must rebuild that exact
+ * value to verify the signature, and the owner's clock -- not the server's -- is what the signature
+ * covers. Honouring a client-supplied expiry is therefore necessary; letting it be unbounded would let
+ * a client mint invitations that never expire, which the TTL policy exists to prevent.
+ */
+export const MAX_INVITATION_TTL_SECONDS = 15 * 60;
+
+/**
  * Server-side invitation state machine. `commit_quorum_reached` is the serialisation barrier at
  * which both commit ciphertexts exist and neither side may be delivered before it.
  */

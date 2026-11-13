@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createPublicKey, verify } from 'node:crypto';
 import test from 'node:test';
 import {
   b64u,
@@ -9,7 +10,18 @@ import {
   sha256,
   TestClient,
 } from './helpers.js';
-import { InvitationState } from '../src/protocol.js';
+import { InvitationState, invitationTranscript } from '../src/protocol.js';
+import { hashActivationCode } from '../src/crypto.js';
+
+/**
+ * The hash bound into the owner's invitation transcript.
+ *
+ * For the 16-symbol form this is a plain, unpeppered SHA-256 -- deliberately, because the joining
+ * device has to recompute it and has no pepper. (`hashActivationCode` is only peppered for the
+ * *numeric* form; there the transcript hash is a separate, plain function on the client.) This helper
+ * pins that equivalence so a change to either side fails loudly.
+ */
+const sha256CodeHash = (code) => hashActivationCode(code);
 
 const ok = (res, status = 200) => {
   assert.equal(res.status, status, `unexpected status ${res.status}: ${JSON.stringify(res.json)}`);
@@ -17,25 +29,46 @@ const ok = (res, status = 200) => {
 };
 
 /** Creates an invitation and returns everything a real client would hold. */
-async function createInvitation(app, owner = makeParticipant(), extra = {}) {
+/**
+ * Creates an invitation the way a real client does.
+ *
+ * The owner signs an *absolute* expiry (`now + ttl`, on its own clock) and uploads it next to the
+ * material. The server stores that exact value, because the joining device has to rebuild the signed
+ * transcript to verify the owner's signature -- a transcript containing the server's own
+ * `createdAt + ttl` would never verify.
+ *
+ * `wire()` also generates a fresh ephemeral key, nonce and SPK signature on every call, so the exact
+ * payload that was uploaded is captured and returned rather than re-derived later.
+ *
+ * `nowMs` is passed by callers that install a fake clock: the signed expiry has to be derived from the
+ * same clock the server uses, otherwise the two disagree by decades and the invitation is dead on
+ * arrival (which is exactly the bug these tests previously could not see).
+ */
+async function createInvitation(app, owner = makeParticipant(), extra = {}, nowMs = Date.now()) {
   const client = new TestClient(app);
+  const expiresAtEpochSec = extra.expiresAtEpochSec ?? Math.floor(nowMs / 1000) + 600;
+  const ownerWire = owner.wire({ expiresAtEpochSec });
   const created = ok(
-    await client.call('POST', '/v1/invitations', { body: { owner: owner.wire(), ...extra } }),
+    await client.call('POST', '/v1/invitations', {
+      body: { owner: ownerWire, expiresAtEpochSec, ...extra },
+    }),
     201
   );
-  return { client, owner, created };
+  owner.expiresAtEpochSec = expiresAtEpochSec;
+  return { client, owner, created, ownerWire };
 }
 
-async function redeemedInvitation(app, extra = {}) {
+async function redeemedInvitation(app, extra = {}, nowMs = Date.now()) {
   const owner = makeParticipant();
   const recipient = makeParticipant();
-  const { client, created } = await createInvitation(app, owner, extra);
+  const { client, created, ownerWire } = await createInvitation(app, owner, extra, nowMs);
+  const recipientWire = recipient.wire();
   const redeemed = ok(
     await client.call('POST', '/v1/invitations/redeem', {
-      body: { activationCode: created.activationCode, recipient: recipient.wire() },
+      body: { activationCode: created.activationCode, recipient: recipientWire },
     })
   );
-  return { client, owner, recipient, created, redeemed };
+  return { client, owner, recipient, created, redeemed, ownerWire, recipientWire };
 }
 
 async function atQuorum(app, clock) {
@@ -177,7 +210,7 @@ test('expired invitations cannot be redeemed and report 410', async () => {
   let now = 1_700_000_000_000;
   const clock = () => now;
   const { app } = createTestServer({ clock });
-  const { client, created } = await createInvitation(app);
+  const { client, created } = await createInvitation(app, makeParticipant(), {}, now);
   now += 16 * 60 * 1000;
   const res = await client.call('POST', '/v1/invitations/redeem', {
     body: { activationCode: created.activationCode, recipient: makeParticipant().wire() },
@@ -285,7 +318,8 @@ test('rate-limit budget survives a store reopen (durable, not in-memory)', async
 
 test('peer commit ciphertext is withheld until the quorum barrier is reached', async () => {
   const { app } = createTestServer();
-  const { client, created, redeemed, owner, recipient } = await redeemedInvitation(app);
+  const { client, created, redeemed, owner, recipient, ownerWire, recipientWire } =
+    await redeemedInvitation(app);
   const ownerCommit = fakeCommitCiphertext(Buffer.from('owner-1'));
   ok(
     await client.call('POST', `/v1/invitations/${created.invitationId}/commit`, {
@@ -336,12 +370,32 @@ test('peer commit ciphertext is withheld until the quorum barrier is reached', a
   assert.equal(ownerAfter.peerCommitDigestB64u, b64u(sha256(recipientCommit)));
   assert.equal(ownerAfter.peer.deviceIdB64u, recipient.deviceIdB64u);
   assert.equal(ownerAfter.peer.identitySpkiB64u, recipient.identitySpkiB64u);
+  // The peer's ACK key must be relayed in both directions: the joining device rebuilds the owner's
+  // signed invitation transcript from it, and without this field the owner's signature -- the one
+  // value a malicious server cannot forge -- would be unverifiable.
+  assert.equal(ownerAfter.peer.ackSpkiB64u, recipientWire.ackSpki);
+  assert.equal(ownerAfter.peer.spkSpkiB64u, recipientWire.spkSpki);
+  assert.equal(ownerAfter.peer.spkId, recipientWire.spkId);
+  assert.equal(ownerAfter.peer.spkCreatedAtEpochSec, recipientWire.spkCreatedAtEpochSec);
 
   const recipientAfter = ok(
     await client.call('GET', `/v1/invitations/${created.invitationId}`, { token: redeemed.recipientToken })
   );
   assert.equal(recipientAfter.peerCommitCiphertextB64u, b64u(ownerCommit));
   assert.equal(recipientAfter.peer.deviceIdB64u, owner.deviceIdB64u);
+  // Everything the recipient needs to verify the owner's invitation signature itself.
+  assert.equal(recipientAfter.peer.ackSpkiB64u, ownerWire.ackSpki);
+  assert.equal(recipientAfter.peer.identitySpkiB64u, ownerWire.identitySpki);
+  assert.equal(recipientAfter.peer.spkSignatureB64u, ownerWire.spkSignature);
+  assert.equal(recipientAfter.peer.identitySignatureB64u, ownerWire.identitySignature);
+  // This value is inside the owner's signature. If the server relayed a different expiry than the
+  // one the owner signed, the joiner's rebuilt transcript would not verify -- so pin it exactly.
+  assert.equal(
+    recipientAfter.expiresAtEpochSec,
+    owner.expiresAtEpochSec,
+    'relayed expiry must equal the expiry the owner signed'
+  );
+  assert.equal(recipientAfter.invitationId, created.invitationId);
 });
 
 test('the owner never receives the recipient commit before the recipient has committed', async () => {
@@ -792,11 +846,132 @@ test('rejection by the recipient is terminal and cannot be performed by the owne
 // Expiry, retention and restart recovery
 // ---------------------------------------------------------------------------------------------
 
+test('the owner invitation signature is verifiable by the joiner from relayed fields alone', async () => {
+  // This is the end-to-end version of the gap that made server-forged invitations undetectable: every
+  // field below is what the *server* relayed back, and the joiner must be able to rebuild the exact
+  // transcript the owner signed without any secret the server holds.
+  const clock = () => 1_700_000_000_000;
+  const { app } = createTestServer({ clock });
+  const client = new TestClient(app);
+  const owner = makeParticipant();
+  const recipient = makeParticipant();
+  const code = 'ABCD-EFGH-JKMN-PQRS';
+  const invitationId = 'inv_verifiable_000001';
+  const expiresAt = Math.floor(clock() / 1000) + 600;
+
+  const ownerWire = owner.wire({ invitationId, activationCode: code, expiresAtEpochSec: expiresAt });
+  ok(
+    await client.call('POST', '/v1/invitations', {
+      body: { invitationId, activationCode: code, owner: ownerWire, expiresAtEpochSec: expiresAt },
+    }),
+    201
+  );
+  const redeemed = ok(
+    await client.call('POST', '/v1/invitations/redeem', {
+      body: { activationCode: code, recipient: recipient.wire() },
+    })
+  );
+  const view = ok(
+    await client.call('GET', `/v1/invitations/${invitationId}`, { token: redeemed.recipientToken })
+  );
+  const peer = view.peer;
+
+  // Rebuild from relayed fields only -- no access to the owner's private key or the server's pepper.
+  const rebuilt = invitationTranscript({
+    invitationId: view.invitationId,
+    activationCodeHash: sha256CodeHash(code),
+    deviceId: Buffer.from(peer.deviceIdB64u, 'base64url'),
+    spkId: peer.spkId,
+    spkCreatedAtEpochSec: peer.spkCreatedAtEpochSec,
+    spkSignature: Buffer.from(peer.spkSignatureB64u, 'base64url'),
+    identitySpki: Buffer.from(peer.identitySpkiB64u, 'base64url'),
+    ackSpki: Buffer.from(peer.ackSpkiB64u, 'base64url'),
+    spkSpki: Buffer.from(peer.spkSpkiB64u, 'base64url'),
+    ephemeralSpki: Buffer.from(peer.ephemeralSpkiB64u, 'base64url'),
+    nonce: Buffer.from(peer.nonceB64u, 'base64url'),
+    expiresAtEpochSec: view.expiresAtEpochSec,
+  });
+  const ownerKey = createPublicKey({
+    key: Buffer.from(peer.identitySpkiB64u, 'base64url'),
+    format: 'der',
+    type: 'spki',
+  });
+  assert.equal(
+    verify('sha256', rebuilt, { key: ownerKey, dsaEncoding: 'der' }, Buffer.from(peer.identitySignatureB64u, 'base64url')),
+    true,
+    'the joiner must be able to verify the owner signature from relayed fields alone'
+  );
+
+  // A substituted code must break it: that is what stops a server swapping the code in transit.
+  const wrongCode = invitationTranscript({
+    invitationId: view.invitationId,
+    activationCodeHash: sha256CodeHash('ZZZZ-ZZZZ-ZZZZ-ZZZZ'),
+    deviceId: Buffer.from(peer.deviceIdB64u, 'base64url'),
+    spkId: peer.spkId,
+    spkCreatedAtEpochSec: peer.spkCreatedAtEpochSec,
+    spkSignature: Buffer.from(peer.spkSignatureB64u, 'base64url'),
+    identitySpki: Buffer.from(peer.identitySpkiB64u, 'base64url'),
+    ackSpki: Buffer.from(peer.ackSpkiB64u, 'base64url'),
+    spkSpki: Buffer.from(peer.spkSpkiB64u, 'base64url'),
+    ephemeralSpki: Buffer.from(peer.ephemeralSpkiB64u, 'base64url'),
+    nonce: Buffer.from(peer.nonceB64u, 'base64url'),
+    expiresAtEpochSec: view.expiresAtEpochSec,
+  });
+  assert.equal(
+    verify('sha256', wrongCode, { key: ownerKey, dsaEncoding: 'der' }, Buffer.from(peer.identitySignatureB64u, 'base64url')),
+    false,
+    'a substituted activation code must invalidate the owner signature'
+  );
+});
+
+test('the server stores the owner-signed absolute expiry, not its own clock', async () => {
+  // The joining device rebuilds the invitation transcript to verify the owner's signature, and that
+  // transcript contains `expiresAtEpochSec` as an absolute number. If the server stored
+  // `createdAt + ttl` instead, the rebuilt transcript would differ from the signed one on every
+  // invitation -- device/server clock skew alone guarantees it -- and the owner's signature would
+  // never verify. This test pins the behaviour that makes the signature check possible at all.
+  const now = 1_700_000_000_000;
+  const clock = () => now;
+  const { app } = createTestServer({ clock });
+  const owner = makeParticipant();
+  const ownerExpiry = Math.floor(now / 1000) + 300; // deliberately not the default 600
+  const { created } = await createInvitation(app, owner, { expiresAtEpochSec: ownerExpiry }, now);
+  assert.equal(created.expiresAtEpochSec, ownerExpiry);
+});
+
+test('a client cannot extend an invitation beyond the absolute TTL ceiling', async () => {
+  const now = 1_700_000_000_000;
+  const clock = () => now;
+  const { app } = createTestServer({ clock });
+  const owner = makeParticipant();
+  const tooFar = Math.floor(now / 1000) + 60 * 60; // one hour: far past MAX_INVITATION_TTL_SECONDS
+  const client = new TestClient(app);
+  const res = await client.call('POST', '/v1/invitations', {
+    body: { owner: owner.wire({ expiresAtEpochSec: tooFar }), expiresAtEpochSec: tooFar },
+  });
+  assert.equal(res.status, 400);
+  assert.equal(res.json.error, 'malformed_payload');
+});
+
+test('a client cannot supply an expiry in the past', async () => {
+  const now = 1_700_000_000_000;
+  const clock = () => now;
+  const { app } = createTestServer({ clock });
+  const owner = makeParticipant();
+  const past = Math.floor(now / 1000) - 10;
+  const client = new TestClient(app);
+  const res = await client.call('POST', '/v1/invitations', {
+    body: { owner: owner.wire({ expiresAtEpochSec: past }), expiresAtEpochSec: past },
+  });
+  assert.equal(res.status, 400);
+  assert.equal(res.json.error, 'malformed_payload');
+});
+
 test('lazy expiry transitions overdue invitations and reports 410 to clients', async () => {
   let now = 1_700_000_000_000;
   const clock = () => now;
   const { app, store } = createTestServer({ clock });
-  const { client, created } = await redeemedInvitation(app);
+  const { client, created } = await redeemedInvitation(app, {}, now);
   now += 901 * 1000;
   const res = await client.call('GET', `/v1/invitations/${created.invitationId}`, { token: created.ownerToken });
   assert.equal(res.status, 410);
@@ -809,7 +984,7 @@ test('the retention sweeper deletes terminal rows after the tombstone window', a
   let now = 1_700_000_000_000;
   const clock = () => now;
   const { app, store } = createTestServer({ clock, retentionSecondsAfterTerminal: 60 });
-  const { client, created } = await redeemedInvitation(app);
+  const { client, created } = await redeemedInvitation(app, {}, now);
   ok(await client.call('POST', `/v1/invitations/${created.invitationId}/revoke`, { token: created.ownerToken }));
   assert.ok(store.rawRow(created.invitationId));
   now += 61 * 1000;
@@ -887,6 +1062,11 @@ test('server-info advertises exactly what the server can and cannot verify', asy
     // verify it, and states plainly that it does not verify that signature itself.
     relaysSpkSignatureWithoutVerification: true,
     verifiesSpkSignature: false,
+    // The owner's invitation signature is verified by the *joining device*, not here. What the server
+    // must now guarantee is that it relays every field that verification needs -- including the peer's
+    // ACK key and the owner-signed absolute expiry, both of which were previously missing.
+    relaysFieldsForOwnerInvitationVerification: true,
+    verifiesOwnerInvitationSignature: false,
   });
   assert.equal(Buffer.from(info.receiptPublicKeySpkiB64u, 'base64url').length, 91);
 });

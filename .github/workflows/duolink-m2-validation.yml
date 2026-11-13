@@ -13,7 +13,7 @@ permissions:
 # Single source of truth for the release version in this workflow. Bump it here and everywhere -
 # artifact names, the release tag, the download URL and the verification assertion - follows.
 env:
-  VERSION: "0.5.0"
+  VERSION: "0.6.0"
 
 jobs:
   gradle-build-and-unit-tests:

@@ -280,7 +280,10 @@ class RemotePairingCoordinator(
             invitationId = invitationId,
             owner = material,
             activationCode = activationCode.displayForm,
-            ttlSeconds = ttlSeconds
+            ttlSeconds = ttlSeconds,
+            // The signed absolute expiry, not a duration. The server must store exactly this so the
+            // joining device can rebuild the transcript the owner signed (see the transcript note).
+            expiresAtEpochSec = expiresAtEpochSec
         )
         val code = ActivationCode.parse(created.activationCode)
             ?: run {
@@ -681,6 +684,20 @@ class RemotePairingCoordinator(
         if (ByteEncoding.constantTimeEquals(peer.deviceId, identity.deviceId)) {
             ephemeral.destroy()
             throw failWith(RemoteFailure.SELF_PAIRING_FORBIDDEN)
+        }
+
+        // Decision B — the owner's invitation signature is the *only* value here the server cannot
+        // forge. Verify it before trusting a single byte of the owner's material.
+        try {
+            verifyOwnerInvitationSignature(
+                owner = peer,
+                invitationId = redeemed.invitationId,
+                activationCode = code.displayForm,
+                expiresAtEpochSec = redeemed.expiresAtEpochSec
+            )
+        } catch (e: Exception) {
+            ephemeral.destroy()
+            throw e
         }
 
         // Decision A — verify the owner's SPK self-signature with the owner's identity key.
@@ -1102,6 +1119,69 @@ class RemotePairingCoordinator(
                 RemoteFailure.PEER_MATERIAL_INVALID,
                 "امضای درخواست پذیرش طرف مقابل با محتوای دریافتی مطابقت ندارد"
             )
+        }
+    }
+
+    /**
+     * Verifies the **owner's** signed invitation transcript (Decision B) before any of its material is
+     * trusted.
+     *
+     * Why this matters more than any other check in this file: every field the recipient receives
+     * arrives *through the server*. `verifyPeerSpkSignature` only proves the SPK is self-consistent
+     * with the identity key the server handed over — a malicious server simply generates its own
+     * identity, its own SPK, and a matching self-signature. Nothing binds that key to the human who
+     * actually created the invitation.
+     *
+     * The owner's `identitySignature` is the only value in the whole flow that the server cannot
+     * forge, because producing it requires the owner's private identity key. Verifying it turns
+     * "the server told me who the owner is" into "the holder of the owner's identity key signed
+     * exactly this invitation, this code, these keys and this expiry".
+     *
+     * The transcript binds [activationCodeHash] — recomputed here from the code the user typed
+     * (a plain SHA-256, per [ActivationCodeDigest.sha256], not the server's peppered storage hash),
+     * so a server that swaps the code between the owner's upload and this redeem produces a
+     * signature mismatch instead of a silent pairing with the wrong peer.
+     */
+    internal fun verifyOwnerInvitationSignature(
+        owner: SignalingApi.PeerMaterial,
+        invitationId: String,
+        activationCode: String,
+        expiresAtEpochSec: Long
+    ) {
+        val signature = owner.identitySignature
+            ?: throw failWith(
+                RemoteFailure.PEER_MATERIAL_INVALID,
+                "امضای دعوت‌نامه صاحب دعوت موجود نیست و هویت او قابل تأیید نیست"
+            )
+        val ownerNonce = owner.nonce
+            ?: throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "نانس دستگاه صاحب دعوت در پیام موجود نیست")
+        val ownerEphemeral = owner.ephemeralSpki
+            ?: throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "کلید موقت دستگاه صاحب دعوت موجود نیست")
+        val spkId = owner.spkId
+            ?: throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "شناسه کلید پیش‌اعزامی صاحب دعوت موجود نیست")
+        val createdAt = owner.spkCreatedAtEpochSec
+            ?: throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "زمان ساخت کلید پیش‌اعزامی صاحب دعوت موجود نیست")
+        if (ByteEncoding.constantTimeEquals(owner.ackSpki, owner.identitySpki)) {
+            // The server rejects this too (`invalid_ack_key`); checked here as well so a modified or
+            // non-conforming server cannot silently collapse the two keys into one.
+            throw failWith(RemoteFailure.PEER_MATERIAL_INVALID, "کلید ACK صاحب دعوت با کلید هویت او یکسان است")
+        }
+        val transcript = RemoteTranscripts.invitationTranscript(
+            invitationId = invitationId,
+            activationCodeHash = ActivationCodeDigest.sha256(activationCode),
+            deviceId = owner.deviceId,
+            spkId = spkId,
+            spkCreatedAtEpochSec = createdAt,
+            spkSignature = peerSignatureFor(owner),
+            identityPublicSpki = owner.identitySpki,
+            ackPublicSpki = owner.ackSpki,
+            spkPublicSpki = owner.spkSpki,
+            ephemeralPublicSpki = ownerEphemeral,
+            nonce = ownerNonce,
+            expiresAtEpochSec = expiresAtEpochSec
+        )
+        if (!EcP256Crypto.verifySha256Ecdsa(owner.identitySpki, transcript, signature)) {
+            throw failWith(RemoteFailure.INVALID_PEER_IDENTITY_SIGNATURE)
         }
     }
 

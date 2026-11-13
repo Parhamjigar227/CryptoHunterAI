@@ -21,6 +21,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
   INVITATION_TTL_SECONDS,
+  MAX_INVITATION_TTL_SECONDS,
   InvitationState,
   LIMITS,
   PROTOCOL_VERSION,
@@ -330,12 +331,35 @@ export class InvitationStore {
     ownerToken,
     owner,
     ttlSeconds = INVITATION_TTL_SECONDS,
+    requestedExpiresAtEpochSec = null,
   }) {
     if (typeof invitationId !== 'string' || !/^inv_[A-Za-z0-9_-]{16,32}$/.test(invitationId)) {
       throw new ProtocolError('invalid_invitation_id', 'invitationId must match inv_[A-Za-z0-9_-]{16,32}');
     }
     const createdAt = nowSec(this.#clock);
-    const expiresAt = createdAt + ttlSeconds;
+    // The owner's invitation signature covers an *absolute* expiry, computed with the owner's own
+    // clock. Defaulting to `createdAt + ttlSeconds` (the server's clock) would make the signed value
+    // and the stored value differ by the device/server skew plus network delay -- which is to say,
+    // essentially always -- and the joining device's signature check would then fail on every single
+    // invitation. So a client-supplied expiry is honoured, and only sanity-bounded here: it must be in
+    // the future and no further out than the maximum TTL. Supplying it cannot extend an invitation
+    // beyond policy, and it cannot shorten one below the point where the owner signed it.
+    let expiresAt = createdAt + ttlSeconds;
+    if (requestedExpiresAtEpochSec !== null && requestedExpiresAtEpochSec !== undefined) {
+      if (!Number.isInteger(requestedExpiresAtEpochSec)) {
+        throw new ProtocolError('malformed_payload', 'expiresAtEpochSec must be an integer');
+      }
+      if (requestedExpiresAtEpochSec <= createdAt) {
+        throw new ProtocolError('malformed_payload', 'expiresAtEpochSec must be in the future');
+      }
+      if (requestedExpiresAtEpochSec > createdAt + MAX_INVITATION_TTL_SECONDS) {
+        throw new ProtocolError(
+          'malformed_payload',
+          `expiresAtEpochSec must not exceed ${MAX_INVITATION_TTL_SECONDS} seconds from now`
+        );
+      }
+      expiresAt = requestedExpiresAtEpochSec;
+    }
     const normalised = {
       deviceId: owner.deviceId,
       identitySpki: owner.identitySpki,
@@ -878,6 +902,11 @@ export class InvitationStore {
           ? {
               deviceId: Buffer.from(peerDeviceId),
               identitySpki: Buffer.from(peerIdentity),
+              // Relayed so the joining device can rebuild the owner's signed invitation transcript and
+              // verify `identitySignature` itself. Without the peer's ACK key the recipient cannot
+              // reconstruct the transcript, and the owner's signature stays unverifiable -- which is
+              // exactly the gap that let a malicious server forge an invitation undetected.
+              ackSpki: Buffer.from(isOwner ? row.recipient_ack_spki : row.owner_ack_spki),
               spkSpki: Buffer.from(peerSpk),
               ephemeralSpki: peerEphemeral ? Buffer.from(peerEphemeral) : null,
               nonce: peerNonce ? Buffer.from(peerNonce) : null,

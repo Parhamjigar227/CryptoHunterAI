@@ -130,20 +130,21 @@ class SignalingApi(private val client: SignalingHttpClient) {
      * signature must exist before anything is uploaded, and the recipient must be able to bind the same
      * id from the QR code alone (so it travels in the QR as well).
      */
+    /**
+     * Creates an invitation, uploading the owner's material and the code it signed.
+     *
+     * [expiresAtEpochSec] is the absolute expiry the owner signed into `identitySignature` and must be
+     * uploaded verbatim: the joining device rebuilds the invitation transcript to verify that
+     * signature, and the transcript contains this exact number. Letting the server pick its own
+     * `createdAt + ttl` would put a different value in the transcript than the one that was signed,
+     * and verification would fail for every invitation.
+     */
     fun createInvitation(
         baseUrl: String,
         invitationId: String,
         owner: ParticipantMaterial,
         activationCode: String,
         ttlSeconds: Long? = null,
-        /**
-         * The absolute expiry the owner signed into `identitySignature`.
-         *
-         * Must be uploaded verbatim: the joining device rebuilds the invitation transcript to verify
-         * that signature, and the transcript contains this exact number. Letting the server pick its
-         * own `createdAt + ttl` would put a different value in the transcript than the one that was
-         * signed, and verification would fail for every invitation.
-         */
         expiresAtEpochSec: Long? = null
     ): CreatedInvitation {
         val body = SignalingHttpClient.jsonObject(
